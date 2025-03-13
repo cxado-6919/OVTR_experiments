@@ -52,7 +52,7 @@ python test.py
 ```
 
 
-## Data
+## 💽 Data
 
 You should put the unzipped TAO and Lvis datasets into the `data/`. And then generate the ground truth files by running the corresponding script: [./process/lvis_filter.ipynb](./process/lvis_filter.ipynb). 
 
