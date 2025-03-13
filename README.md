@@ -50,7 +50,7 @@ pip install -r requirements.txt
 # Different installation versions may lead to changes in evaluation scores.
 ```
 
-compile the Deformable Attention CUDA ops:
+ - Compile the Deformable Attention CUDA ops:
 
 ```shell
 # from https://github.com/fundamentalvision/Deformable-DETR
@@ -99,7 +99,9 @@ data/
 
 ## Training
 First, place the pre-trained [detection weights](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder.
+
 Additionally, prepare the [Clip text embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) and [Clip image embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder. The prompts for `Clip text embeddings` come from [DetPro](https://github.com/dyabel/detpro).
+
 You can also generate the `Clip image embeddings` yourself by using [gen_clip_image_embeds.py](./process/gen_clip_image_embeds.py) for preprocessing.
 
  - **Train a complete OVTR**
@@ -116,6 +118,7 @@ sh tools/ovtr_multi_frame_lite_train.sh
 
 ### Detection Pre-training
 You can also choose to pre-train the detection perception from scratch:
+
 First, obtain the [DINO dual-branch weights](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) by using [modify_dino_weight.py](./process/modify_dino_weight.py) to convert the DINO weights [dino_ep33_4scale.pth](https://github.com/IDEA-Research/DINO) for compatibility with the dual-branch structure.
 
 ```shell
@@ -124,6 +127,9 @@ sh tools/ovtr_detection_pretrain.sh
 ```
 
 ## Evaluation
+
+Place the weights [ovtr_5_frame.pth](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) and [ovtr_lite.pth](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder.
+
 ### Evaluate the performance of OVTR in open-vocabulary multi-object tracking (OVMOT).
  - **Evaluate OVTR on the TAO validation set using the TETA metric.**
 ```shell
