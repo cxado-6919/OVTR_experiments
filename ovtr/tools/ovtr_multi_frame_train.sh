@@ -1,6 +1,6 @@
-CUDA_DEVICES="2,3"
-MASTER_PORT=9988
-NPROC_GPU=2
+CUDA_DEVICES="0, 1, 2, 3"
+MASTER_PORT=9982
+NPROC_GPU=4
 
 PRETRAIN_MODEL="../model_zoo/ovtr_det_pretrain.pth"
 OUTPUT="./weights"
