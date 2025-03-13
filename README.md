@@ -13,7 +13,7 @@
 - We propose the category information propagation (CIP) strategy to enhance the stability of tracking and classification, along with the attention isolation strategies that ensure open-vocabulary perception and tracking operate in harmony.
 - We propose a dual-branch decoder guided by an alignment mechanism, empowering the model with strong open-vocabulary perception and multimodal interaction capabilities while eliminating the need for time-consuming preprocessing.
 
-<p align="center"><img src="assets/Overview.png" width="800"/></p>
+<p align="center"><img src="assets/Overview_ovtr.png" width="800"/></p>
 
 ## 💡 News
 * We release the code, scripts and checkpoints on TAO
