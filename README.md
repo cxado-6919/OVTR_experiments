@@ -13,7 +13,7 @@
 - We propose the category information propagation (CIP) strategy to enhance the stability of tracking and classification, along with the attention isolation strategies that ensure open-vocabulary perception and tracking operate in harmony.
 - We propose a dual-branch decoder guided by an alignment mechanism, empowering the model with strong open-vocabulary perception and multimodal interaction capabilities while eliminating the need for time-consuming preprocessing.
 
-<p align="center"><img src="assets/Overview_ovtr.png" width="800"/></p>
+<p align="center"><img src="assets/Overview_ovtr.png" width="700"/></p>
 
 ## 💡 News
 * We release the code, scripts and checkpoints on TAO
@@ -50,6 +50,26 @@ cd .ovtr_det_bs2_pretrain/models/ops/
 sh make.sh
 python test.py
 ```
+
+
+## Data
+
+You should put the unzipped TAO and Lvis datasets into the `data/`. And then generate the ground truth files by running the corresponding script: [./process/lvis_filter.ipynb](./process/lvis_filter.ipynb). 
+
+Finally, you should get the following structure of Dataset and Annotations:
+```
+data/
+  ├── TAO/
+  │ ├── val/
+  │ ├── test/
+  ├── Lvis/
+  │ ├── train/
+  ├── 
+  ├── 
+  ├── 
+  ├── 
+ 
+
 
 ## 🎬 Demo
 <img src="ovtr/results/track_demo.gif" width="800"/>
