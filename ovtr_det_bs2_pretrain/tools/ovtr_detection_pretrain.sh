@@ -1,6 +1,6 @@
-CUDA_DEVICES="1,2"
-MASTER_PORT=9889
-NPROC_GPU=2
+CUDA_DEVICES="0, 1, 2, 3"
+MASTER_PORT=9987
+NPROC_GPU=4
 
 PRETRAIN_MODEL="../model_zoo/dino_ep33_4scale_double_feedforward.pth"
 PRETRAIN_OUTPUT="./det_pretrain_weights"
