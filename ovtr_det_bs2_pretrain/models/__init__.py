@@ -1,0 +1,4 @@
+from .ovtr_det import build 
+
+def build_model(args, cfgs):
+    return build(args, cfgs)
