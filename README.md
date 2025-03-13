@@ -54,7 +54,10 @@ python test.py
 
 ## 💽 Data
 
-You should put the unzipped TAO and Lvis datasets into the `data/`. And then generate the ground truth files by running the corresponding script: [./process/lvis_filter.ipynb](./process/lvis_filter.ipynb). 
+You should put the unzipped TAO and Lvis datasets into the `data/`. 
+
+从[[google]](https://drive.google.com/drive/folders/167IGC0Hkpnmpw7C95-AaPmWuVJZtC-q5?usp=drive_link)
+And then generate the ground truth files by running the corresponding script: [./process/lvis_filter.ipynb](./process/lvis_filter.ipynb). 
 
 Finally, you should get the following structure of Dataset and Annotations:
 ```
