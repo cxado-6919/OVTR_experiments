@@ -817,8 +817,8 @@ class OVTR(nn.Module):
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res, is_first)
         else:
-            # if self.train_with_artificial_img_seqs:
-            track_instances, _track_discard = protect_track_preds(track_instances, num_queries=self.num_queries, miss_tolerance=self.track_base.miss_tolerance, ious_thresh=self.ious_thresh) 
+            if self.train_with_artificial_img_seqs:
+                track_instances, _track_discard = protect_track_preds(track_instances, num_queries=self.num_queries, miss_tolerance=self.track_base.miss_tolerance, ious_thresh=self.ious_thresh) 
             track_instances = self.post_process_pre(track_instances, frame_res['select_id'], is_first)
             # each track will be assigned an unique global id by the track base.
             if is_first:
