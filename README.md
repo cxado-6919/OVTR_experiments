@@ -139,3 +139,20 @@ sh tools/ovtr_ovmot_eval_lite_test.sh
 cd ovtr/
 sh tools/ovtr_demo.sh
 ```
+
+## Citation
+```bibtex
+@inproceedings{liovtr,
+  title={OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer},
+  author={Li, Jinyang and Yu, En and Chen, Sijia and Tao, Wenbing},
+  booktitle={The Thirteenth International Conference on Learning Representations}
+}
+```
+
+## Acknowledgement
+
+- [MOTR](https://github.com/megvii-research/MOTR)
+- [OVTrack](https://github.com/SysCV/ovtrack)
+- [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
+
+
