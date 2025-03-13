@@ -94,22 +94,23 @@ sh tools/ovtr_detection_pretrain.sh
 ```
 
 ## Evaluation
- - **Evaluate OVTR on the TAO validation set using the OVMOT metric (TETA).**
+### Evaluate the performance of OVTR in open-vocabulary multi-object tracking (OVMOT).
+ - **Evaluate OVTR on the TAO validation set using the TETA metric.**
 ```shell
 cd ovtr/
 sh tools/ovtr_ovmot_eval_e15_val.sh
 ```
- - **Evaluate OVTR on the TAO test set using the OVMOT metric (TETA).**
+ - **Evaluate OVTR on the TAO test set using the TETA metric.**
 ```shell
 cd ovtr/
 sh tools/ovtr_ovmot_eval_e15_test.sh
 ```
- - **Evaluate OVTR-Lite on the TAO validation set using the OVMOT metric (TETA).**
+ - **Evaluate OVTR-Lite on the TAO validation set using the TETA metric.**
 ```shell
 cd ovtr/
 sh tools/ovtr_ovmot_eval_lite_val.sh
 ```
- - **Evaluate OVTR-Lite on the TAO test set using the OVMOT metric (TETA).**
+ - **Evaluate OVTR-Lite on the TAO test set using the TETA metric.**
 ```shell
 cd ovtr/
 sh tools/ovtr_ovmot_eval_lite_test.sh
