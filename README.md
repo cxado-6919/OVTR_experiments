@@ -117,7 +117,7 @@ sh tools/ovtr_multi_frame_lite_train.sh
 ```
 
 ### Detection Pre-training
-You can also choose to pre-train the detection perception from scratch:
+You can also choose to pre-train the detection perception part from scratch:
 
 First, obtain the [DINO dual-branch weights](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) by using [modify_dino_weight.py](./process/modify_dino_weight.py) to convert the DINO weights [dino_ep33_4scale.pth](https://github.com/IDEA-Research/DINO) for compatibility with the dual-branch structure.
 
