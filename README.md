@@ -17,7 +17,7 @@
 * We release the code, scripts and checkpoints on TAO
 * Our paper is accepted by ICLR 2025!
 
-## Installation
+## 🔧 Installation
 
 ```shell
 # create a virtual env
@@ -25,9 +25,12 @@ conda create -n OVTR python=3.9
 # activate the env
 conda activate OVTR
 
+# install OVTR
+git clone https://github.com/jinyanglii/OVTR.git
+cd OVTR
 conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 pytorch-cuda=11.1 -c pytorch -c nvidia
-
 pip install -r requirements.txt
+# Different installation versions may lead to changes in inference scores.
 ```
 
 You also need to compile the Deformable Attention CUDA ops:
