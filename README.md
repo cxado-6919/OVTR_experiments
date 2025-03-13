@@ -49,7 +49,7 @@ conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 pytorch-cud
 pip install -r requirements.txt
 # Different installation versions may lead to changes in evaluation scores.
 
-# create the model zoo folder
+# create a model_zoo folder
 mkdir model_zoo
 ```
 
