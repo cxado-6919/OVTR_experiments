@@ -72,9 +72,24 @@ data/
   ├── lvis_clear_75_60.json
   ├── lvis_classes_v1.txt
   ├── validation_ours_v1.json # From OVTrack
-  ├── tao_test_burst_v1.json
-
+  └── tao_test_burst_v1.json
  ```
+
+## Main results
+
+### Open-Vocabulary Multiple Object Tracking on the TAO validation set
+| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
+| OVTR [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
+| **OVTR-Lite** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
+
+### Open-Vocabulary Multiple Object Tracking on the TAO validation set
+| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
+| OVTR [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
+| **OVTR-Lite** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
 
 ## Training
  - **Train a complete OVTR**
