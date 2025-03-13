@@ -119,7 +119,7 @@ sh tools/ovtr_multi_frame_lite_train.sh
 ### Detection Pre-training
 You can also choose to pre-train the detection perception part from scratch:
 
-First, obtain the [DINO dual-branch weights](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) by using [modify_dino_weight.py](./process/modify_dino_weight.py) to convert the DINO weights [dino_ep33_4scale.pth](https://github.com/IDEA-Research/DINO) for compatibility with the dual-branch structure.
+Obtain the [DINO dual-branch weights](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) by using [modify_dino_weight.py](./process/modify_dino_weight.py) to convert `dino_ep33_4scale.pth` from [DINO](https://github.com/IDEA-Research/DINO) for compatibility with the dual-branch structure.
 
 ```shell
 cd ovtr_det_bs2_pretrain/
@@ -177,6 +177,7 @@ sh tools/ovtr_demo.sh
 - [OVTrack](https://github.com/SysCV/ovtrack)
 - [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
 - [DetPro](https://github.com/dyabel/detpro)
+- [DINO](https://github.com/IDEA-Research/DINO)
 - [TETA](https://github.com/SysCV/tet)
 
 
