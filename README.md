@@ -39,14 +39,14 @@ compile the Deformable Attention CUDA ops:
 
 ```shell
 # from https://github.com/fundamentalvision/Deformable-DETR
-cd .ovtr/models/ops/
+cd ovtr/models/ops/
 sh make.sh
 # You can test this ops if you need:
 python test.py
 
 # for the detection pretraining
 cd ../../..
-cd .ovtr_det_bs2_pretrain/models/ops/
+cd ovtr_det_bs2_pretrain/models/ops/
 sh make.sh
 python test.py
 ```
@@ -71,10 +71,28 @@ data/
   ├── lvis_image_v1.json
   ├── lvis_clear_75_60.json
   ├── lvis_classes_v1.txt
-  ├── validation_ours_v1.json
+  ├── validation_ours_v1.json # From OVTrack
   ├── tao_test_burst_v1.json
 
  ```
+
+## Training
+**Train a complete OVTR**
+```shell
+cd ovtr/
+sh tools/ovtr_multi_frame_train.sh
+```
+**Train Lite version (recommended)**
+```shell
+cd ovtr/
+sh tools/ovtr_multi_frame_lite_train.sh
+```
+### Detection Pre-training
+```shell
+cd ovtr_det_bs2_pretrain/
+sh tools/ovtr_detection_pretrain.sh
+```
+## Evaluation
 
 
 ## 🎬 Demo
