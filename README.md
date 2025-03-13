@@ -19,6 +19,21 @@
 * We release the code, scripts and checkpoints on TAO
 * Our paper is accepted by ICLR 2025!
 
+## 🌞 Main results
+
+### Open-Vocabulary Multiple Object Tracking on the TAO validation set
+| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
+| **OVTR** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
+| **OVTR-Lite** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
+
+### Open-Vocabulary Multiple Object Tracking on the TAO test set
+| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1           | 24.1           | 28.7            | 1.8           | 32.6           | 35.4           | **16.9** |
+| **OVTR** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **27.1** | **32.1**  | **2.1** | **34.5** | **37.5** | 14.9       |
+
 ## 🔧 Installation
 
 ```shell
@@ -80,20 +95,7 @@ data/
   └── tao_test_burst_v1.json
  ```
 
-## Main results
 
-### Open-Vocabulary Multiple Object Tracking on the TAO validation set
-| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
-| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
-| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
-| **OVTR** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
-| **OVTR-Lite** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
-
-### Open-Vocabulary Multiple Object Tracking on the TAO test set
-| **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
-| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
-| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1           | 24.1           | 28.7            | 1.8           | 32.6           | 35.4           | **16.9** |
-| **OVTR** [[google]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **27.1** | **32.1**  | **2.1** | **34.5** | **37.5** | 14.9           |
 
 ## Training
  - **Train a complete OVTR**
