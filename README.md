@@ -30,16 +30,22 @@ git clone https://github.com/jinyanglii/OVTR.git
 cd OVTR
 conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 pytorch-cuda=11.1 -c pytorch -c nvidia
 pip install -r requirements.txt
-# Different installation versions may lead to changes in inference scores.
+# Different installation versions may lead to changes in evaluation scores.
 ```
 
-You also need to compile the Deformable Attention CUDA ops:
+compile the Deformable Attention CUDA ops:
 
 ```shell
-# From https://github.com/fundamentalvision/Deformable-DETR
-cd ./models/ops/
+# from https://github.com/fundamentalvision/Deformable-DETR
+cd .ovtr/models/ops/
 sh make.sh
 # You can test this ops if you need:
+python test.py
+
+# for the detection pretraining
+cd ../../..
+cd .ovtr_det_bs2_pretrain/models/ops/
+sh make.sh
 python test.py
 ```
 
