@@ -77,12 +77,12 @@ data/
  ```
 
 ## Training
-**Train a complete OVTR**
+ - **Train a complete OVTR**
 ```shell
 cd ovtr/
 sh tools/ovtr_multi_frame_train.sh
 ```
-**Train Lite version (recommended)**
+ - **Train Lite version (recommended)**
 ```shell
 cd ovtr/
 sh tools/ovtr_multi_frame_lite_train.sh
@@ -92,8 +92,35 @@ sh tools/ovtr_multi_frame_lite_train.sh
 cd ovtr_det_bs2_pretrain/
 sh tools/ovtr_detection_pretrain.sh
 ```
-## Evaluation
 
+## Evaluation
+ - **Evaluate OVTR on the TAO validation set using the OVMOT metric (TETA).**
+```shell
+cd ovtr/
+sh tools/ovtr_ovmot_eval_e15_val.sh
+```
+ - **Evaluate OVTR on the TAO test set using the OVMOT metric (TETA).**
+```shell
+cd ovtr/
+sh tools/ovtr_ovmot_eval_e15_test.sh
+```
+ - **Evaluate OVTR-Lite on the TAO validation set using the OVMOT metric (TETA).**
+```shell
+cd ovtr/
+sh tools/ovtr_ovmot_eval_lite_val.sh
+```
+ - **Evaluate OVTR-Lite on the TAO test set using the OVMOT metric (TETA).**
+```shell
+cd ovtr/
+sh tools/ovtr_ovmot_eval_lite_test.sh
+```
 
 ## 🎬 Demo
 <img src="ovtr/results/track_demo.gif" width="800"/>
+
+
+ - **Run a demo of OVTR.**
+```shell
+cd ovtr/
+sh tools/ovtr_demo.sh
+```
