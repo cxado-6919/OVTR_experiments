@@ -1,7 +1,7 @@
 # OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer
 
 
-<p align="center"><img src="assets/sota.png" width="500"/></p>
+<p align="center"><img src="assets/Overview.png" width="500"/></p>
 
 > **[ICLR 2025] OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer**
 > 
