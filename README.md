@@ -1,7 +1,7 @@
 # OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer
 
 
-<p align="center"><img src="assets/Overview.png" width="500"/></p>
+<p align="center"><img src="assets/Method.png" width="600"/></p>
 
 > **[ICLR 2025] OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer**
 > 
@@ -12,6 +12,8 @@
 - We propose the first end-to-end open-vocabulary multi-object tracking algorithm, introducing a novel perspective to the OVMOT field, achieving faster inference speeds, and possessing strong scalability with potential for further improvement.
 - We propose the category information propagation (CIP) strategy to enhance the stability of tracking and classification, along with the attention isolation strategies that ensure open-vocabulary perception and tracking operate in harmony.
 - We propose a dual-branch decoder guided by an alignment mechanism, empowering the model with strong open-vocabulary perception and multimodal interaction capabilities while eliminating the need for time-consuming preprocessing.
+
+<p align="center"><img src="assets/Overview.png" width="800"/></p>
 
 ## 💡 News
 * We release the code, scripts and checkpoints on TAO
