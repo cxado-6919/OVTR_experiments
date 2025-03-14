@@ -34,6 +34,8 @@
 | OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1           | 24.1           | 28.7            | 1.8           | 32.6           | 35.4           | **16.9** |
 | **OVTR** [[weights]](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link)                  | LVIS        | 1,732 |    | **3.4**        | **27.1** | **32.1**  | **2.1** | **34.5** | **37.5** | 14.9       |
 
+Speed tests are performed on a single NVIDIA GeForce RTX 3090 GPU.
+
 ## 🔧 Installation
 
 ```shell
