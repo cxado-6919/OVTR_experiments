@@ -104,9 +104,9 @@ data/
 ## Training
 First, place [ovtr_det_pretrain.pth](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder.
 
-Additionally, prepare the [Clip text embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) and [Clip image embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder. The prompts for `Clip text embeddings` come from [DetPro](https://github.com/dyabel/detpro).
+Additionally, prepare the [CLIP text embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) and [CLIP image embeddings](https://drive.google.com/drive/folders/1Ta_duIe_SZx_MXuyUIBu8BZWV8dnXRqi?usp=drive_link) in the `model_zoo/` folder. The prompts for `CLIP text embeddings` come from [DetPro](https://github.com/dyabel/detpro).
 
-You can also generate the `Clip image embeddings` yourself by using [gen_clip_image_embeds.py](./process/gen_clip_image_embeds.py) for the preprocessing.
+You can also generate the `CLIP image embeddings` yourself by using [gen_clip_image_embeds.py](./process/gen_clip_image_embeds.py) for the preprocessing.
 
  - **Train a complete OVTR**
 ```shell
