@@ -3,7 +3,7 @@
 
 <p align="center"><img src="assets/Method.png" width="600"/></p>
 
-> **[ICLR 2025] OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer**
+> [**OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer**](https://arxiv.org/abs/2503.10616)
 > 
 > Jinyang Li, En Yu, Sijia Chen, Wenbing Tao
 > 
