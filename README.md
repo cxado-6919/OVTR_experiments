@@ -84,7 +84,7 @@ Finally, you should get the following structure of Dataset and Annotations:
 data/
   ├── Lvis_v1/
   │ ├── train2017/
-  │ └──  annotations/
+  │ └── annotations/
   │   └── lvis_v1_train.json
   ├── lvis_filtered_train_images.h5 # Filter out images that only contain rare category targets
   ├── TAO/
