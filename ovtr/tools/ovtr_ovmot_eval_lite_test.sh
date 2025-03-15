@@ -4,8 +4,8 @@ NPROC_GPU=1
 
 PRETRAIN_MODEL="../model_zoo/ovtr_lite.pth"
 OUTPUT="./results"
-VIS_OUTPUT="./results/vis_output_track_lite_val"
-RESULT_PATH="./results/teta_results_lite_val"
+VIS_OUTPUT="./results/vis_output_track_lite_test"
+RESULT_PATH="./results/teta_results_lite_test"
 
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
