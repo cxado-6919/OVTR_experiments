@@ -47,14 +47,14 @@ conda activate OVTR
 # install OVTR
 git clone https://github.com/jinyanglii/OVTR.git
 cd OVTR
-conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 pytorch-cuda=11.1 -c pytorch -c nvidia
+pip install torch==1.10.1+cu111 torchvision==0.11.2+cu111 torchaudio==0.10.1 -f https://download.pytorch.org/whl/cu111/torch_stable.html
 pip install -r requirements.txt
 # Different installation versions may lead to changes in evaluation scores.
 
 # create a model_zoo folder
 mkdir model_zoo
 ```
-
+ - Please install [CLIP](https://github.com/openai/CLIP) package following its official installation guide.
  - Compile the Deformable Attention CUDA ops:
 
 ```shell
