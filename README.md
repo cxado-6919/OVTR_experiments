@@ -24,7 +24,7 @@
 ### Open-Vocabulary Multiple Object Tracking on the TAO validation set
 | **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
-| OVTrack                 | G-LVIS,LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
+| OVTrack                 | G-LVIS, LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
 | **OVTR** [[weights]](https://drive.google.com/file/d/10GKAIBxAseTiXnJXV1MnxnJBTmOHVFh5/view?usp=sharing)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
 | **OVTR-Lite** [[weights]](https://drive.google.com/file/d/1x6DciXsRIOzT24typcuryqmtdVJKnXZI/view?usp=sharing)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
 
@@ -62,12 +62,6 @@ mkdir model_zoo
 cd ovtr/models/ops
 sh make.sh
 # You can test this ops if you need:
-python test.py
-
-# for the detection pretraining
-cd ../../..
-cd ovtr_det_bs2_pretrain/models/ops
-sh make.sh
 python test.py
 ```
 
