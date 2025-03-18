@@ -30,7 +30,6 @@ from util.slconfig import SLConfig
 from util.tool import load_model
 from main import get_args_parser
 from detectron2.structures import Instances
-from detectron2.utils.visualizer import Visualizer
 from datasets import build_dataset
 import datasets.samplers as samplers
 import util.misc as utils
@@ -56,11 +55,6 @@ def plot_one_box(x, img, color=None, label=None, score=None, line_thickness=None
                     tl / 3.5, [225, 255, 255],
                     thickness=tf,
                     lineType=cv2.LINE_AA)
-
-    if mask is not None:
-        v = Visualizer(img, scale=1)
-        vis_mask = v.draw_binary_mask(mask[0].cpu().numpy(), color="blue")
-        img = vis_mask.get_image()
     return img
 
 def draw_bboxes(ori_img, bbox, identities=None, mask=None, offset=(0, 0)):
