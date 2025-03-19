@@ -1,11 +1,9 @@
 CUDA_DEVICES="0"
 MASTER_PORT=9980
 NPROC_GPU=1
-
 PRETRAIN_MODEL="../model_zoo/ovtr_5_frame.pth"
 OUTPUT="./results"
 VIS_OUTPUT="./results"
-
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./track_demo.py \
@@ -35,6 +33,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --ious_thresh 0.3 \
     --miss_tolerance 5 \
     --maximum_quantity 50 \
-    --vis_output ${VIS_OUTPUT} \
-
-    
+    --vis_output ${VIS_OUTPUT}
