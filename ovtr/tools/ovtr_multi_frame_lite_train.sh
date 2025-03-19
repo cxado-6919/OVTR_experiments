@@ -1,10 +1,8 @@
 CUDA_DEVICES="0, 1, 2, 3"
 MASTER_PORT=9981
 NPROC_GPU=4
-
 PRETRAIN_MODEL="../model_zoo/ovtr_det_pretrain.pth"
 OUTPUT="./weights"
-
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./main.py \
@@ -29,9 +27,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --track_query_iteration CIP \
     --calculate_negative_samples \
     --max_len 250 \
-    --output_dir ${OUTPUT} \
-
-
+    --output_dir ${OUTPUT}
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./main.py \
@@ -56,4 +52,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --track_query_iteration CIP \
     --calculate_negative_samples \
     --max_len 250 \
-    --output_dir ${OUTPUT} \
+    --output_dir ${OUTPUT}
