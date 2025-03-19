@@ -435,14 +435,12 @@ class OVTR_det(nn.Module):
         uniq_labels = uniq_labels[torch.randperm(len(uniq_labels))] # detection:random
         if len(uniq_labels) < self.max_pad_len:
             pad_len = self.max_pad_len - len(uniq_labels)
-            if self.distribution_based_sampling:
-                sampled_labels = self._distribution_based_sampling(pad_len, uniq_labels=uniq_labels)
-                extra_labels = torch.tensor([e_label for e_label in sampled_labels if e_label not in uniq_labels])
-                select_id = uniq_labels.tolist() + extra_labels.tolist()
+            if self.distribution_based_sampling: # Sample negative categories based on the distribution.
+                extra_labels = self._distribution_based_sampling(pad_len, uniq_labels=uniq_labels)
             else:
                 extra_list = torch.tensor([i for i in self.all_ids if i not in uniq_labels])
                 extra_labels = extra_list[torch.randperm(len(extra_list))][:pad_len]
-                select_id = uniq_labels.tolist() + extra_labels.tolist()
+            select_id = uniq_labels.tolist() + extra_labels.tolist()
         else:
             select_id = uniq_labels.tolist()
 
