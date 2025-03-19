@@ -14,10 +14,7 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
-try:
-    from .ops.modules.groundingdino import _C
-except:
-    warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
+import MultiScaleDeformableAttention as MSDA
 
 
 # helpers
@@ -39,7 +36,7 @@ class MultiScaleDeformableAttnFunction(Function):
         im2col_step,
     ):
         ctx.im2col_step = im2col_step
-        output = _C.ms_deform_attn_forward(
+        output = MSDA.ms_deform_attn_forward(
             value,
             value_spatial_shapes,
             value_level_start_index,
@@ -66,7 +63,7 @@ class MultiScaleDeformableAttnFunction(Function):
             sampling_locations,
             attention_weights,
         ) = ctx.saved_tensors
-        grad_value, grad_sampling_loc, grad_attn_weight = _C.ms_deform_attn_backward(
+        grad_value, grad_sampling_loc, grad_attn_weight = MSDA.ms_deform_attn_backward(
             value,
             value_spatial_shapes,
             value_level_start_index,
