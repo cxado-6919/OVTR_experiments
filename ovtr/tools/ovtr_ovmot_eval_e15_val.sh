@@ -1,12 +1,10 @@
 CUDA_DEVICES="0"
 MASTER_PORT=9984
 NPROC_GPU=1
-
 PRETRAIN_MODEL="../model_zoo/ovtr_5_frame.pth"
 OUTPUT="./results"
 VIS_OUTPUT=".results/vis_output_track_5_frame_val"
 RESULT_PATH="./results/teta_results_5_frame_val"
-
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./eval.py \
@@ -37,5 +35,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --miss_tolerance 5 5 5 5 5 5 5 \
     --maximum_quantity 180 \
     --result_path_track ${RESULT_PATH} \
-    --vis_output ${VIS_OUTPUT} \
-    
+    --vis_output ${VIS_OUTPUT}
