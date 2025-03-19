@@ -676,35 +676,27 @@ class OVTR(nn.Module):
             if len(uniq_labels) < max_pad_len:
                 pad_len = max_pad_len - len(uniq_labels)
                 if self.distribution_based_sampling: # Sample negative categories based on the distribution.
-                    extra_labels = []
-                    while len(extra_labels) != pad_len:
-                        sampled_labels = self._distribution_based_sampling(pad_len, uniq_labels=uniq_labels)
-                        extra_labels = torch.tensor([e_label for e_label in sampled_labels if e_label not in uniq_labels])
-                    select_id = uniq_labels.tolist() + extra_labels.tolist()
+                    extra_labels = self._distribution_based_sampling(pad_len, uniq_labels=uniq_labels)
                 else:
                     extra_list = torch.tensor([i for i in self.all_ids if i not in uniq_labels])
                     extra_labels = extra_list[torch.randperm(len(extra_list))][:pad_len]
-                    select_id = uniq_labels.tolist() + extra_labels.tolist()
+                select_id = uniq_labels.tolist() + extra_labels.tolist()
             else:
                 select_id = uniq_labels.tolist()
                 extra_labels = torch.LongTensor([])
-        else: # subsequent tracking
+        else: # subsequent frame tracking
             extra_label_notin = torch.isin(extra_labels, uniq_labels, invert=True)
             extra_labels_cur = extra_labels[extra_label_notin]
             select_id = uniq_labels.tolist() + extra_labels_cur.tolist()
-            if len(select_id)!=max_pad_len:
-                while len(select_id) < max_pad_len: # Supplement negative categories based on the distribution.
-                    sampled_labels = self._distribution_based_sampling(max_pad_len-len(select_id), uniq_labels=torch.tensor(select_id))
-                    if extra_labels is not None:
-                        extra_labels = torch.cat([extra_labels_cur, torch.tensor([e_label for e_label in sampled_labels if e_label not in uniq_labels])])
-                    else:
-                        extra_labels = torch.tensor([e_label for e_label in sampled_labels if e_label not in uniq_labels])
-                    if len(uniq_labels.tolist() + torch.unique(extra_labels).tolist()) < max_pad_len:
-                        continue
-                    else:
-                        select_id = uniq_labels.tolist() + extra_labels.tolist()
-                if len(select_id)>max_pad_len:
-                    select_id = select_id[:max_pad_len]
+            if len(select_id) < max_pad_len:
+                sampled_labels = self._distribution_based_sampling(max_pad_len-len(select_id), uniq_labels=torch.tensor(select_id))
+                if extra_labels is not None:
+                    extra_labels = torch.cat([extra_labels_cur, sampled_labels])
+                else:
+                    extra_labels = sampled_labels
+                select_id = uniq_labels.tolist() + extra_labels.tolist()
+            elif len(select_id)>max_pad_len:
+                select_id = select_id[:max_pad_len]
         return select_id, extra_labels
     
     def _forward_single_image(self, samples, track_instances: Instances, targets=None, extra_labels=None ,is_first=True, cls_num=0):
