@@ -1,10 +1,8 @@
 CUDA_DEVICES="0, 1, 2, 3"
 MASTER_PORT=9987
 NPROC_GPU=4
-
 PRETRAIN_MODEL="../model_zoo/dino_ep33_4scale_double_feedforward.pth"
 PRETRAIN_OUTPUT="./det_pretrain_weights"
-
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./main.py \
@@ -20,9 +18,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --batch_size 2 \
     --calculate_negative_samples \
     --max_len 13 \
-    --output_dir ${PRETRAIN_OUTPUT} \
-
-
+    --output_dir ${PRETRAIN_OUTPUT}
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
     --use_env \
     ./main.py \
@@ -38,4 +34,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --batch_size 2 \
     --calculate_negative_samples \
     --max_len 13 \
-    --output_dir ${PRETRAIN_OUTPUT} \
+    --output_dir ${PRETRAIN_OUTPUT}
