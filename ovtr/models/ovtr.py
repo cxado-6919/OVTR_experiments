@@ -695,7 +695,7 @@ class OVTR(nn.Module):
                 else:
                     extra_labels = sampled_labels
                 select_id = uniq_labels.tolist() + extra_labels.tolist()
-            elif len(select_id)>max_pad_len:
+            elif len(select_id) > max_pad_len:
                 select_id = select_id[:max_pad_len]
         return select_id, extra_labels
     
