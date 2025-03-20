@@ -16,7 +16,7 @@
 <p align="center"><img src="assets/Overview_ovtr.png" width="700"/></p>
 
 ## 💡 News
-* We update the files to resolve environment configuration and code execution issues. (2025-03-20)
+* We update the files to resolve environment configuration and code execution issues. **(2025-03-20)**
 * We release the code, scripts and checkpoints on TAO
 * Our paper is accepted by ICLR 2025!
 
@@ -62,8 +62,6 @@ mkdir model_zoo
 # from https://github.com/fundamentalvision/Deformable-DETR
 cd ovtr/models/ops
 sh make.sh
-# You can test this ops if you need:
-python test.py
 ```
 
 
