@@ -790,7 +790,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm1(tgt)
         tgt_aligned = tgt # aligned queries
 
-        # text cross-attention in the CIT branch
+        # text cross-attention in the CTI branch
         if self.use_text_cross_attention:
             tgt2 = self.ca_text(
                 self.with_pos_embed(tgt, tgt_query_pos),
@@ -801,7 +801,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
             tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
 
-        # ffn in the CIT branch
+        # ffn in the CTI branch
         tgt_cti  = self.forward_ffn(tgt)
 
         # image ffn in the OFA branch
