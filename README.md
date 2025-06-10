@@ -7,7 +7,7 @@
 > 
 > Jinyang Li, En Yu, Sijia Chen, Wenbing Tao
 > 
-> *[arXiv 2503.10616](https://arxiv.org/abs/2503.10616)*
+> [![Paper](https://img.shields.io/badge/arXiv-2503.10616-brightgreen.svg?style=flat-square)](https://arxiv.org/abs/2503.10616)
 
 - We propose the first end-to-end open-vocabulary multi-object tracking algorithm, introducing a novel perspective to the OVMOT field, achieving faster inference speeds, and possessing strong scalability with potential for further improvement.
 - We propose the category information propagation (CIP) strategy to enhance the stability of tracking and classification, along with the attention isolation strategies that ensure open-vocabulary perception and tracking operate in harmony.
