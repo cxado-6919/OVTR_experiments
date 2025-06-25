@@ -26,7 +26,7 @@
 | **Method** | Data  |  Embeds  | ${\text{Prop}}_{\text{novel}}$ | **FPS**  | TETA↑(novel)  | AssocA↑(novel) | ClsA↑(novel) | TETA↑(base)   | AssocA↑(base) | ClsA↑(base)    |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
 | OVTrack                 | G-LVIS, LVIS | 99.4M | ✓   | 3.1            | 27.8           | 33.6           | 1.5           | 35.5           | 36.9           | **20.2** |
-| **OVTR** [[weights]](https://drive.google.com/file/d/10GKAIBxAseTiXnJXV1MnxnJBTmOHVFh5/view?usp=sharing)                  | LVIS        | 1,732 |    | **3.4**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
+| **OVTR** [[weights]](https://drive.google.com/file/d/10GKAIBxAseTiXnJXV1MnxnJBTmOHVFh5/view?usp=sharing)                  | LVIS        | 1,732 |    | **3.4(12.4)**        | **31.4**       | **34.5**       | **5.4**       | **36.6**       | **37.6**       | 20.1     |    
 | **OVTR-Lite** [[weights]](https://drive.google.com/file/d/1x6DciXsRIOzT24typcuryqmtdVJKnXZI/view?usp=sharing)           | LVIS        | 1,732 |    | **12.4**       | **30.1**       | **34.4**       | **3.1**       | **35.6**       | **37.0**       | 18.6     |
 
 ### Open-Vocabulary Multiple Object Tracking on the TAO test set
@@ -161,10 +161,11 @@ sh tools/ovtr_demo.sh
 
 ## Citation
 ```bibtex
-@inproceedings{liovtr,
+@article{li2025ovtr,
   title={OVTR: End-to-End Open-Vocabulary Multiple Object Tracking with Transformer},
   author={Li, Jinyang and Yu, En and Chen, Sijia and Tao, Wenbing},
-  booktitle={The Thirteenth International Conference on Learning Representations}
+  journal={arXiv preprint arXiv:2503.10616},
+  year={2025}
 }
 ```
 
