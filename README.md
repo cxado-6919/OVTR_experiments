@@ -97,7 +97,7 @@ data/
 ## Training
 Place [ovtr_det_pretrain.pth](https://drive.google.com/file/d/1x5RQ5m6XlLYB_iOPDnbeEKSYQeT4HVwo/view?usp=sharing) in the `model_zoo/` folder.
 
-Also, download the [CLIP text embeddings](https://drive.google.com/file/d/1OYvyCQ_y65oq6SDJQKrVm3syzvXStL-0/view?usp=sharing) and [CLIP image embeddings](https://drive.google.com/file/d/1j5l-BPv-f43fb953hmIijxQ4gSUduWWe/view?usp=sharing) and place them in the `model_zoo/` folder. The prompts for `CLIP text embeddings` are sourced from [DetPro](https://github.com/dyabel/detpro).
+Also, download the [CLIP text embeddings ('iou_neg5_ens.pth')](https://drive.google.com/file/d/1OYvyCQ_y65oq6SDJQKrVm3syzvXStL-0/view?usp=sharing) and [CLIP image embeddings](https://drive.google.com/file/d/1j5l-BPv-f43fb953hmIijxQ4gSUduWWe/view?usp=sharing) and place them in the `model_zoo/` folder. The prompts for `CLIP text embeddings` are sourced from [DetPro](https://github.com/dyabel/detpro).
 
 You can also generate the `CLIP image embeddings` yourself by using [gen_clip_image_embeds.py](./process/gen_clip_image_embeds.py) for the preprocessing.
 
