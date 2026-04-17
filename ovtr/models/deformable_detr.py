@@ -19,7 +19,8 @@ from detectron2.structures import Boxes, matched_boxlist_iou
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, is_dist_avail_and_initialized, inverse_sigmoid)
+                       accuracy, get_world_size, is_dist_avail_and_initialized, inverse_sigmoid,
+                       all_reduce_tensor)
 
 from .backbone import build_backbone
 from .matcher import build_matcher
@@ -420,8 +421,10 @@ class SetCriterion(nn.Module):
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+            num_boxes = all_reduce_tensor(num_boxes, average=True)
+        else:
+            num_boxes = num_boxes / get_world_size()
+        num_boxes = torch.clamp(num_boxes, min=1).item()
 
         # Compute all the requested losses
         losses = {}

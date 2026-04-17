@@ -1,0 +1,7 @@
+# ninja log v5
+0	3315	1776056816885426524	/home/pjh/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjh/clone_repo/OVTR/ovtr/models/ops/src/cpu/ms_deform_attn_cpu.o	2239ef8b39f7aa9
+0	10133	1776056823666582133	/home/pjh/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjh/clone_repo/OVTR/ovtr/models/ops/src/vision.o	b5b57beaf9059455
+0	12629	1776056826217640716	/home/pjh/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjh/clone_repo/OVTR/ovtr/models/ops/src/cuda/ms_deform_attn_cuda.o	31c5555a2f0c56c6
+4	3333	1776394591342867711	/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cpu/ms_deform_attn_cpu.o	c70811bf99f766ef
+5	10404	1776394598377085925	/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/vision.o	566e8bc3405aacc4
+4	12818	1776394600845162311	/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cuda/ms_deform_attn_cuda.o	48214651e55a4320

@@ -1,10 +1,12 @@
-CUDA_DEVICES="0, 1, 2, 3"
-MASTER_PORT=9987
-NPROC_GPU=4
-PRETRAIN_MODEL="../model_zoo/dino_ep33_4scale_double_feedforward.pth"
-PRETRAIN_OUTPUT="./det_pretrain_weights"
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+#!/usr/bin/env bash
+set -euo pipefail
+
+CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+MASTER_PORT="${MASTER_PORT:-9987}"
+NPROC_GPU="${NPROC_GPU:-4}"
+PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/dino_ep33_4scale_double_feedforward.pth}"
+PRETRAIN_OUTPUT="${PRETRAIN_OUTPUT:-./det_pretrain_weights}"
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./main.py \
     --config_file ./config/ovtr_det_bs2_pretrain.py \
     --dataset_file lvis \
@@ -19,8 +21,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --calculate_negative_samples \
     --max_len 13 \
     --output_dir ${PRETRAIN_OUTPUT}
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./main.py \
     --config_file ./config/ovtr_det_bs2_pretrain.py \
     --dataset_file lvis \

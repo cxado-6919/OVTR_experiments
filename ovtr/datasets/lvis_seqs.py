@@ -196,6 +196,38 @@ class LVIS_seqs_Dataset(TaoDataset):
             gt_instances.update({'filename': filename})
             # pdb.set_trace()
             return gt_instances
+
+    def _rand_another(self, idx):
+        """Resample another dataset index when the current sample is unusable.
+
+        `idx` is the real dataset index in `self.data_infos`, not the repeated
+        sampler index. Prefer the repeated pool so rare-category upsampling is
+        preserved during fallback sampling.
+        """
+        if hasattr(self, "flag") and self.flag is not None and len(self.flag) == len(self.data_infos):
+            pool = np.where(self.flag == self.flag[idx])[0]
+            if len(pool) > 0:
+                return int(np.random.choice(pool))
+
+        if getattr(self, "repeat_indices", None):
+            if len(self.repeat_indices) == 1:
+                return int(self.repeat_indices[0])
+
+            new_idx = idx
+            while new_idx == idx:
+                new_idx = int(np.random.choice(self.repeat_indices))
+            return new_idx
+
+        if len(self.data_infos) == 0:
+            raise RuntimeError("LVIS_seqs_Dataset has no data to resample from.")
+
+        if len(self.data_infos) == 1:
+            return 0
+
+        new_idx = idx
+        while new_idx == idx:
+            new_idx = int(np.random.randint(0, len(self.data_infos)))
+        return new_idx
         
     def category_unique(self, results):
         unique = True

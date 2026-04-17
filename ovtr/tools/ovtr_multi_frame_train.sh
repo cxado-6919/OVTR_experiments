@@ -1,10 +1,14 @@
-CUDA_DEVICES="0, 1, 2, 3"
-MASTER_PORT=9982
-NPROC_GPU=4
-PRETRAIN_MODEL="../model_zoo/ovtr_det_pretrain.pth"
-OUTPUT="./weights"
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+#!/bin/sh
+set -eu
+
+CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+MASTER_PORT="${MASTER_PORT:-9982}"
+NPROC_GPU="${NPROC_GPU:-4}"
+PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_det_pretrain.pth}"
+OUTPUT="${OUTPUT:-./weights}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./main.py \
     --config_file ./config/ovtr_5_frame_train_val.py \
     --dataset_file lvis_generated_img_seqs \
@@ -14,9 +18,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --lr 2e-4 \
     --lr_backbone 2e-5 \
     --lr_drop 13 \
-    --pretrain ${PRETRAIN_MODEL} \
+    --pretrain "${PRETRAIN_MODEL}" \
     --num_workers 4 \
-    --batch_size 1 \
+    --batch_size 8 \
     --sample_mode random_interval \
     --sample_interval 1 \
     --sampler_steps 4 7 14 \
@@ -27,9 +31,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --track_query_iteration CIP \
     --calculate_negative_samples \
     --max_len 250 \
-    --output_dir ${OUTPUT}
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+    --output_dir "${OUTPUT}"
+
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./main.py \
     --config_file ./config/ovtr_5_frame_train_val.py \
     --dataset_file lvis_generated_img_seqs \
@@ -39,9 +43,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --lr 4e-5 \
     --lr_backbone 4e-6 \
     --lr_drop 13 \
-    --resume ${OUTPUT}/checkpoint0000.pth \
+    --resume "${OUTPUT}/checkpoint0000.pth" \
     --num_workers 4 \
-    --batch_size 1 \
+    --batch_size 8 \
     --sample_mode random_interval \
     --sample_interval 1 \
     --sampler_steps 4 7 14 \
@@ -52,4 +56,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --mast
     --track_query_iteration CIP \
     --calculate_negative_samples \
     --max_len 250 \
-    --output_dir ${OUTPUT}
+    --output_dir "${OUTPUT}"

@@ -1,0 +1,39 @@
+ninja_required_version = 1.3
+cxx = /home/pjhtest/miniconda3/envs/OVTR/bin/x86_64-conda-linux-gnu-g++
+nvcc = /home/pjhtest/miniconda3/envs/OVTR/bin/nvcc
+
+cflags = -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/pjhtest/miniconda3/envs/OVTR/include -fPIC -O2 -isystem /home/pjhtest/miniconda3/envs/OVTR/include -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/pjhtest/miniconda3/envs/OVTR/include -I/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/include -L/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/lib -L/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/lib/stubs -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/pjhtest/miniconda3/envs/OVTR/include -I/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/include -L/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/lib -L/home/pjhtest/miniconda3/envs/OVTR/targets/x86_64-linux/lib/stubs -fPIC -DWITH_CUDA -I/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src -I/home/pjhtest/miniconda3/envs/OVTR/lib/python3.11/site-packages/torch/include -I/home/pjhtest/miniconda3/envs/OVTR/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/home/pjhtest/miniconda3/envs/OVTR/include -I/home/pjhtest/miniconda3/envs/OVTR/include/python3.11 -c
+post_cflags = -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=_C -D_GLIBCXX_USE_CXX11_ABI=1
+cuda_cflags = -DWITH_CUDA -I/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src -I/home/pjhtest/miniconda3/envs/OVTR/lib/python3.11/site-packages/torch/include -I/home/pjhtest/miniconda3/envs/OVTR/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/home/pjhtest/miniconda3/envs/OVTR/include -I/home/pjhtest/miniconda3/envs/OVTR/include/python3.11 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 --use_fast_math -std=c++17 -lineinfo -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=_C -D_GLIBCXX_USE_CXX11_ABI=1 -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -ccbin /home/pjhtest/miniconda3/envs/OVTR/bin/x86_64-conda-linux-gnu-gcc
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cpu/ms_deform_attn_cpu.o: compile /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cpu/ms_deform_attn_cpu.cpp
+build /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cuda/ms_deform_attn_cuda.o: cuda_compile /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/cuda/ms_deform_attn_cuda.cu
+build /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/build/temp.linux-x86_64-cpython-311/home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/vision.o: compile /home/pjhtest/clone_repo/OVTR/ovtr/models/ops/src/vision.cpp
+
+
+
+
+
+
+
+

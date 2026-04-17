@@ -6,11 +6,27 @@ import os
 
 import torch
 import torch.nn as nn
-from clip import clip
 
 from .coco_categories import COCO_CATEGORIES
 from .lvis_v1_categories import LVIS_CATEGORIES
 import torch.nn.functional as F
+
+
+def _get_clip_backend():
+    try:
+        from clip import clip as clip_backend
+
+        return "openai", clip_backend
+    except ImportError:
+        try:
+            import open_clip
+
+            return "open_clip", open_clip
+        except ImportError as exc:
+            raise ImportError(
+                "CLIP is only needed to regenerate text/image embeddings. "
+                "Install `open-clip-torch` or OpenAI CLIP if you need that workflow."
+            ) from exc
 
 def article(name):
     return "an" if name[0] in "aeiou" else "a"
@@ -95,21 +111,22 @@ multiple_templates = [
 
 
 def load_clip_to_cpu(visual_backbone):
-    backbone_name = visual_backbone
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, os.path.expanduser("~/.cache/clip"))
+    backend_name, backend = _get_clip_backend()
+    if backend_name == "openai":
+        backbone_name = visual_backbone
+        url = backend._MODELS[backbone_name]
+        model_path = backend._download(url, os.path.expanduser("~/.cache/clip"))
 
-    try:
-        # loading JIT archive
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
+        try:
+            model = torch.jit.load(model_path, map_location="cpu").eval()
+            state_dict = None
+        except RuntimeError:
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
 
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
+        return backend.build_model(state_dict or model.state_dict())
 
-    model = clip.build_model(state_dict or model.state_dict())
-
-    return model
+    model_name = visual_backbone.replace("/", "-")
+    return backend.create_model(model_name, pretrained="openai").cpu().eval()
 
 
 class TextEncoder(nn.Module):
@@ -139,16 +156,33 @@ class TextEncoder(nn.Module):
 
 
 def load_embeddings(Clip_text_embeddings, Clip_image_embeddings):
-    text_embedding = torch.load(Clip_text_embeddings, map_location=lambda storage, loc: storage)
-    image_embedding = torch.load(Clip_image_embeddings, map_location=lambda storage, loc: storage)
-    return text_embedding.cuda(), image_embedding.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    text_embedding = torch.load(
+        Clip_text_embeddings,
+        map_location="cpu",
+        weights_only=False,
+    )
+    image_embedding = torch.load(
+        Clip_image_embeddings,
+        map_location="cpu",
+        weights_only=False,
+    )
+    return text_embedding.to(device), image_embedding.to(device)
+
 
 def build_text_embedding_lvis():
     categories = LVIS_CATEGORIES
-    model, _ = clip.load("ViT-B/32")
+    backend_name, backend = _get_clip_backend()
+    if backend_name == "openai":
+        model, _ = backend.load("ViT-B/32")
+        tokenize = backend.tokenize
+    else:
+        model = backend.create_model("ViT-B-32", pretrained="openai")
+        tokenize = backend.get_tokenizer("ViT-B-32")
     templates = multiple_templates
 
-    run_on_gpu = torch.cuda.is_available()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     with torch.no_grad():
         all_text_embeddings = []
@@ -163,18 +197,14 @@ def build_text_embedding_lvis():
                 "This is " + text if text.startswith("a") or text.startswith("the") else text
                 for text in texts
             ]
-            texts = clip.tokenize(texts)  # tokenize
-            if run_on_gpu:
-                texts = texts.cuda()
-                model = model.cuda()
+            texts = tokenize(texts).to(device)
             text_embeddings = model.encode_text(texts)
             text_embeddings /= text_embeddings.norm(dim=-1, keepdim=True)
             text_embedding = text_embeddings.mean(dim=0)
             text_embedding /= text_embedding.norm()
             all_text_embeddings.append(text_embedding)
         all_text_embeddings = torch.stack(all_text_embeddings, dim=1)
-        if run_on_gpu:
-            all_text_embeddings = all_text_embeddings.cuda()
+        all_text_embeddings = all_text_embeddings.to(device)
 
     all_text_embeddings = all_text_embeddings.t()
     return all_text_embeddings

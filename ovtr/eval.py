@@ -345,7 +345,7 @@ def eval(args, cfg):
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     cfg.data.test.test_mode = True
-    cfg.device = "cuda" #if not cpu_only else "cpu"
+    cfg.device = args.device
     torch.manual_seed(args.seed)
 
     # load model and weights
@@ -355,7 +355,7 @@ def eval(args, cfg):
 
     model = load_model(model, args.pretrained)
     model.eval()
-    model = model.cuda()
+    model = model.to(torch.device(args.device))
 
     dataset_val = build_dataset(image_set='val', args=args, cfg=cfg.data.test)
     if args.distributed:

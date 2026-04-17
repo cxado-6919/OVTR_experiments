@@ -10,7 +10,7 @@ from mmdet.datasets.samplers import (DistributedGroupSampler, GroupSampler, Dist
                                      DistributedSampler, GroupSampler, InfiniteBatchSampler,InfiniteGroupBatchSampler)
 from torch.utils.data import DataLoader
 from mmdet.datasets import DATASETS
-# from .samplers import DistributedVideoSampler
+from .samplers_ovtrack import DistributedVideoSampler
 from .seq_multi_image_mix_dataset import SeqMultiImageMixDataset
 
 if platform.system() != 'Windows':

@@ -189,29 +189,19 @@ class Transformer(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, 4)
 
-    def forward(self, srcs, masks, pos_embeds, query_pos=None, query_tgt=None, ref_pts=None, text_dict=None, cache=None):
-    
-        """
-        Input:
-            - srcs: List of multi features [bs, ci, hi, wi]
-            - masks: List of multi masks [bs, hi, wi]
-            - refpoint_embed: [bs, num_dn, 4]. None in infer
-            - pos_embeds: List of multi pos embeds [bs, ci, hi, wi]
-            - tgt: [bs, num_dn, d_model]. None in infer
-
-        """
-        # prepare input for encoder
+    def _prepare_encoder_inputs(self, srcs, masks, pos_embeds):
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
+
         for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
-            src = src.flatten(2).transpose(1, 2)  # bs, hw, c
-            mask = mask.flatten(1)  # bs, hw
-            pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
+            src = src.flatten(2).transpose(1, 2)
+            mask = mask.flatten(1)
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
             if self.num_feature_levels > 1 and self.level_embed is not None:
                 lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             else:
@@ -219,9 +209,10 @@ class Transformer(nn.Module):
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
-        src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
-        mask_flatten = torch.cat(mask_flatten, 1)  # bs, \sum{hxw}
-        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
+
+        src_flatten = torch.cat(src_flatten, 1)
+        mask_flatten = torch.cat(mask_flatten, 1)
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(
             spatial_shapes, dtype=torch.long, device=src_flatten.device
         )
@@ -230,16 +221,52 @@ class Transformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
-        text_features = text_dict["text_features"]
-        text_attention_mask = text_dict["text_token_mask"]
+        return {
+            "src_flatten": src_flatten,
+            "mask_flatten": mask_flatten,
+            "lvl_pos_embed_flatten": lvl_pos_embed_flatten,
+            "spatial_shapes": spatial_shapes,
+            "level_start_index": level_start_index,
+            "valid_ratios": valid_ratios,
+        }
 
-        ###### Begin Encoder ######
-        memory, memory_text_all = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten, text_features, ~text_attention_mask)
-        # prepare input for decoder
-        memory_text = memory_text_all[-1]
-        bs, _, c = memory.shape
-        text_dict["encoded_text"] = memory_text
-        text_dict["encoded_text_all"] = memory_text_all
+    def encode_image(self, srcs, masks, pos_embeds):
+        encoder_inputs = self._prepare_encoder_inputs(srcs, masks, pos_embeds)
+        memory, _ = self.encoder(
+            encoder_inputs["src_flatten"],
+            encoder_inputs["spatial_shapes"],
+            encoder_inputs["level_start_index"],
+            encoder_inputs["valid_ratios"],
+            encoder_inputs["lvl_pos_embed_flatten"],
+            encoder_inputs["mask_flatten"],
+        )
+        encoder_inputs["memory"] = memory
+        return encoder_inputs
+
+    def _ensure_encoded_text(self, text_dict):
+        if "encoded_text" in text_dict:
+            return text_dict
+
+        text_dict = dict(text_dict)
+        text_dict["encoded_text"] = text_dict["text_features"]
+        text_dict["encoded_text_all"] = text_dict["text_features"].unsqueeze(0)
+        return text_dict
+
+    def decode_from_memory(
+        self,
+        memory,
+        mask_flatten,
+        lvl_pos_embed_flatten,
+        spatial_shapes,
+        level_start_index,
+        valid_ratios,
+        query_pos=None,
+        query_tgt=None,
+        ref_pts=None,
+        text_dict=None,
+    ):
+        text_dict = self._ensure_encoded_text(text_dict)
+        bs, _, _ = memory.shape
 
         if self.two_stage_type == "standard":
             output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
@@ -251,71 +278,104 @@ class Transformer(nn.Module):
                 enc_outputs_class_unselected = self.decoder.advance_enc_class_embed(output_memory)
 
             topk_logits = enc_outputs_class_unselected.max(-1)[0]
-            enc_outputs_coord_unselected = (
-                self.enc_out_bbox_embed(output_memory) + output_proposals
-            ) 
+            enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals
             topk = self.num_queries
 
-            topk_proposals = torch.topk(topk_logits, topk, dim=1)[1]  # bs, nq
-
-            # gather boxes
-            topk_coords_unact_undetach = torch.gather(enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))# unsigmoid
+            topk_proposals = torch.topk(topk_logits, topk, dim=1)[1]
+            topk_coords_unact_undetach = torch.gather(
+                enc_outputs_coord_unselected,
+                1,
+                topk_proposals.unsqueeze(-1).repeat(1, 1, 4),
+            )
             topk_coords_unact = topk_coords_unact_undetach.detach()
             reference_points = topk_coords_unact.sigmoid()
 
             if self.embed_init_tgt:
-                tgt = query_tgt[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+                tgt = query_tgt[:, None, :].repeat(1, bs, 1).transpose(0, 1)
             else:
-                # gather tgt
                 tgt_undetach = torch.gather(
                     output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model)
                 )
                 tgt = tgt_undetach.detach()
 
-            # concatenate detect and track queries
             if len(query_tgt) != self.num_queries:
-                reference_points_track = ref_pts[self.num_queries:].unsqueeze(0).repeat(bs, 1, 1).sigmoid() 
+                reference_points_track = ref_pts[self.num_queries:].unsqueeze(0).repeat(bs, 1, 1).sigmoid()
                 reference_points = torch.cat([reference_points, reference_points_track], dim=1)
             init_reference_out = reference_points
         else:
             query_embed = query_pos.unsqueeze(0).expand(bs, -1, -1)
             tgt = query_tgt.unsqueeze(0).expand(bs, -1, -1)
-            
+
             if ref_pts is None:
                 reference_points = self.reference_points(query_embed).sigmoid()
             else:
                 reference_points = ref_pts.unsqueeze(0).repeat(bs, 1, 1).sigmoid()
             init_reference_out = reference_points
-        
-        isolation_mask = None
-        # Content Isolation Strategy
-        # if self.attention_protection and (len(query_tgt) > self.num_queries):    
-        #     cur_num = len(query_tgt)
-        #     isolation_mask = (torch.ones(cur_num, cur_num, device=query_tgt.device,)* float("-inf"))
-        #     isolation_mask[: self.num_queries, : self.num_queries] = 0
-        #     isolation_mask[self.num_queries: , self.num_queries: ] = 0
 
-        ###### Begin Decoder ######
+        isolation_mask = None
         hs_cti, hs_ofa, inter_references, pre_outputs_classes, query_pos_track = self.decoder(
-            tgt.transpose(0, 1), 
-            reference_points.transpose(0, 1), 
+            tgt.transpose(0, 1),
+            reference_points.transpose(0, 1),
             memory.transpose(0, 1),
-            spatial_shapes, 
-            level_start_index, 
-            valid_ratios, 
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
             mask_flatten,
-            tgt_mask=isolation_mask, 
+            tgt_mask=isolation_mask,
             text_dict=text_dict,
             pos=lvl_pos_embed_flatten.transpose(0, 1),
             num=self.num_queries,
-            enc_output_undetach=None
-            ) 
+            enc_output_undetach=None,
+        )
 
         inter_references_out = inter_references
         if self.two_stage_type == "standard":
             return (hs_cti, hs_ofa, init_reference_out, inter_references_out, pre_outputs_classes, query_pos_track)
 
         return (hs_cti, hs_ofa, init_reference_out, pre_outputs_classes, query_pos_track)
+
+    def forward(self, srcs, masks, pos_embeds, query_pos=None, query_tgt=None, ref_pts=None, text_dict=None, cache=None):
+    
+        """
+        Input:
+            - srcs: List of multi features [bs, ci, hi, wi]
+            - masks: List of multi masks [bs, hi, wi]
+            - refpoint_embed: [bs, num_dn, 4]. None in infer
+            - pos_embeds: List of multi pos embeds [bs, ci, hi, wi]
+            - tgt: [bs, num_dn, d_model]. None in infer
+
+        """
+        encoder_inputs = self._prepare_encoder_inputs(srcs, masks, pos_embeds)
+
+        text_features = text_dict["text_features"]
+        text_attention_mask = text_dict["text_token_mask"]
+
+        ###### Begin Encoder ######
+        memory, memory_text_all = self.encoder(
+            encoder_inputs["src_flatten"],
+            encoder_inputs["spatial_shapes"],
+            encoder_inputs["level_start_index"],
+            encoder_inputs["valid_ratios"],
+            encoder_inputs["lvl_pos_embed_flatten"],
+            encoder_inputs["mask_flatten"],
+            text_features,
+            ~text_attention_mask,
+        )
+        memory_text = memory_text_all[-1]
+        text_dict["encoded_text"] = memory_text
+        text_dict["encoded_text_all"] = memory_text_all
+        return self.decode_from_memory(
+            memory,
+            encoder_inputs["mask_flatten"],
+            encoder_inputs["lvl_pos_embed_flatten"],
+            encoder_inputs["spatial_shapes"],
+            encoder_inputs["level_start_index"],
+            encoder_inputs["valid_ratios"],
+            query_pos=query_pos,
+            query_tgt=query_tgt,
+            ref_pts=ref_pts,
+            text_dict=text_dict,
+        )
 
 
 class TransformerEncoder(nn.Module):
@@ -378,6 +438,7 @@ class TransformerEncoder(nn.Module):
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
                 torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device),
+                indexing="ij",
             )
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
@@ -409,7 +470,7 @@ class TransformerEncoder(nn.Module):
 
         output = src
         memory_text = text_feature
-        memory_text_all =[]
+        memory_text_all = []
 
         # preparation and reshape
         if self.num_layers > 0:
@@ -420,6 +481,8 @@ class TransformerEncoder(nn.Module):
         # main process
         for layer_id, layer in enumerate(self.layers):
             if self.fusion_layers:
+                if memory_text is None or text_attention_mask is None:
+                    raise ValueError("text_feature and text_attention_mask are required when fusion layers are enabled")
                 if self.use_checkpoint:
                     output, memory_text = checkpoint.checkpoint(
                         self.fusion_layers[layer_id],
@@ -435,8 +498,9 @@ class TransformerEncoder(nn.Module):
                         attention_mask_v=padding_mask,
                         attention_mask_l=text_attention_mask,
                     )
-                
-            memory_text_all.append(memory_text)
+
+            if memory_text is not None:
+                memory_text_all.append(memory_text)
 
             # main process
             if self.use_transformer_ckpt:
@@ -459,6 +523,8 @@ class TransformerEncoder(nn.Module):
                     key_padding_mask=padding_mask,
                 )
 
+        if not memory_text_all:
+            return output, None
         return output, torch.stack(memory_text_all)
 
 
@@ -782,14 +848,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, tgt):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
         return tgt
     
     def forward_ffn_align(self, tgt):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             tgt2 = self.linear4(self.dropout6(self.activation(self.linear3(tgt))))
         tgt = tgt + self.dropout7(tgt2)
         tgt = self.norm5(tgt)

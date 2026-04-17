@@ -14,7 +14,7 @@ from typing import List
 import copy
 from util import box_ops, checkpoint
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list, get_world_size,
-                       is_dist_avail_and_initialized, inverse_sigmoid,)
+                       is_dist_avail_and_initialized, inverse_sigmoid, all_reduce_tensor,)
 
 from detectron2.structures import Instances, Boxes, matched_boxlist_iou
 from .backbone import build_backbone
@@ -157,19 +157,48 @@ class OVFrameMatcher(SetCriterion):
 
     def initialize(self, gt_instances: List[Instances]):
         self.gt_instances = gt_instances
+        self.gt_instances_batch = None
+        self._current_frame_idx_batch = None
         self.num_samples = 0
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
 
-    def _step(self):
-        self._current_frame_idx += 1
+    def initialize_batch(self, gt_instances_batch: List[List[Instances]]):
+        self.gt_instances = None
+        self.gt_instances_batch = gt_instances_batch
+        self._current_frame_idx_batch = [0 for _ in gt_instances_batch]
+        self.num_samples = 0
+        self.sample_device = None
+        self._current_frame_idx = 0
+        self.losses_dict = {}
+
+    def _step(self, sample_idx=None):
+        if sample_idx is None:
+            self._current_frame_idx += 1
+        else:
+            self._current_frame_idx_batch[sample_idx] += 1
+
+    def _get_current_gt_instances(self, sample_idx=None):
+        if sample_idx is None:
+            return self.gt_instances[self._current_frame_idx]
+        return self.gt_instances_batch[sample_idx][self._current_frame_idx_batch[sample_idx]]
+
+    def _accumulate_losses(self, prefix, loss_dict):
+        for key, value in loss_dict.items():
+            loss_key = f"{prefix}{key}"
+            if loss_key in self.losses_dict:
+                self.losses_dict[loss_key] = self.losses_dict[loss_key] + value
+            else:
+                self.losses_dict[loss_key] = value
 
     def get_num_boxes(self, num_samples):
         num_boxes = torch.as_tensor(num_samples, dtype=torch.float, device=self.sample_device)
         if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+            num_boxes = all_reduce_tensor(num_boxes, average=True)
+        else:
+            num_boxes = num_boxes / get_world_size()
+        num_boxes = torch.clamp(num_boxes, min=1).item()
         return num_boxes
 
     def get_loss(self, loss, outputs, gt_instances, indices, num_boxes, **kwargs):
@@ -316,7 +345,7 @@ class OVFrameMatcher(SetCriterion):
         losses = {"loss_align_pre": loss_encoder_align}
         return losses
     
-    def match_for_single_frame(self, outputs: dict, is_first=None):
+    def match_for_single_frame(self, outputs: dict, is_first=None, sample_idx=None):
         outputs_without_aux = {k: v for k, v in outputs.items() if 
                                k != 'aux_outputs' and k != 'enc_outputs'}
 
@@ -327,7 +356,7 @@ class OVFrameMatcher(SetCriterion):
             unmatched_indexes = torch.as_tensor(list(unmatched_indexes_set), dtype=torch.long).to(matched_indexes)
             return unmatched_indexes
 
-        gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
+        gt_instances_i = self._get_current_gt_instances(sample_idx)  # gt instances of i-th image.
         track_instances_last: Instances = outputs_without_aux['track_instances']
 
         if self.train_with_artificial_img_seqs:
@@ -336,6 +365,7 @@ class OVFrameMatcher(SetCriterion):
             keep_indices[shielded_ids] = False
             track_instances = track_instances_last[keep_indices]
         else:
+            keep_indices = torch.ones(len(track_instances_last), dtype=torch.bool, device=track_instances_last.obj_idxes.device)
             track_instances = track_instances_last
 
         outputs_i = {
@@ -427,8 +457,7 @@ class OVFrameMatcher(SetCriterion):
                                            gt_instances=[gt_instances_i],
                                            indices=[(matched_indices[:, 0], matched_indices[:, 1])],
                                            num_boxes=1)
-            self.losses_dict.update(
-                {'frame_{}_{}'.format(self._current_frame_idx, key): value for key, value in new_track_loss.items()})
+            self._accumulate_losses(f'frame_{self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]}_', new_track_loss)
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -440,6 +469,7 @@ class OVFrameMatcher(SetCriterion):
                     _keep_indices_layer[_shielded_ids_layer] = False
                     track_instances_layer = track_instances_last[_keep_indices_layer]
                 else:
+                    _keep_indices_layer = torch.ones(len(track_instances_last), dtype=torch.bool, device=track_instances_last.obj_idxes.device)
                     track_instances_layer = track_instances_last
 
                 # step1*. inherit and update the previous tracks.
@@ -485,11 +515,10 @@ class OVFrameMatcher(SetCriterion):
                                            gt_instances=[gt_instances_i],
                                            indices=[(matched_indices_layer[:, 0], matched_indices_layer[:, 1])],
                                            num_boxes=1, )
-                    self.losses_dict.update(
-                        {'frame_{}_aux{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
-                         l_dict.items()})
+                    frame_idx = self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]
+                    self._accumulate_losses(f'frame_{frame_idx}_aux{i}_', l_dict)
             
-        self._step()
+        self._step(sample_idx)
         return track_instances
 
     def forward(self, outputs):
@@ -626,6 +655,7 @@ class OVTR(nn.Module):
         self.distribution_based_sampling = distribution_based_sampling
         self.criterion = criterion
         self.train_with_artificial_img_seqs = train_with_artificial_img_seqs
+        self.supports_mot_batch = (not use_checkpoint) and (len(self.transformer.encoder.fusion_layers) == 0)
 
     def _generate_empty_tracks(self, cls_pad_len=1203):
         track_instances = Instances((1, 1))
@@ -698,11 +728,9 @@ class OVTR(nn.Module):
             elif len(select_id) > max_pad_len:
                 select_id = select_id[:max_pad_len]
         return select_id, extra_labels
-    
-    def _forward_single_image(self, samples, track_instances: Instances, targets=None, extra_labels=None ,is_first=True, cls_num=0):
-        features, pos = self.backbone(samples)      
-        src, mask = features[-1].decompose()
-        assert mask is not None
+
+    def _extract_backbone_features(self, samples):
+        features, pos = self.backbone(samples)
         srcs = []
         masks = []
         for l, feat in enumerate(features):
@@ -712,18 +740,190 @@ class OVTR(nn.Module):
             assert mask is not None
 
         if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
-            for l in range(_len_srcs, self.num_feature_levels):
-                if l == _len_srcs:
+            num_srcs = len(srcs)
+            for l in range(num_srcs, self.num_feature_levels):
+                if l == num_srcs:
                     src = self.input_proj[l](features[-1].tensors)
                 else:
                     src = self.input_proj[l](srcs[-1])
-                m = samples.mask
-                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                mask = F.interpolate(samples.mask[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                 srcs.append(src)
                 masks.append(mask)
                 pos.append(pos_l)
+        return srcs, masks, pos
+
+    def _prepare_text_conditioning(self, targets, extra_labels, is_first, cls_num, batch_size):
+        if self.training:
+            labels_list = torch.cat([targets.labels])
+            select_id, extra_labels = self.get_select_id(cls_num, labels_list, extra_labels, is_first)
+        else:
+            select_id, extra_labels = self.select_id, None
+
+        text_query = self.text_embeddings[:, select_id].to(self.patch2query.weight.device).t()
+        image_align = self.image_embeddings[:, select_id].to(text_query.device).t()
+        image_feat_ori = image_align.float().detach()
+
+        dtype = self.patch2query.weight.dtype
+        text_query = self.patch2query(text_query.type(dtype))
+        select_id = torch.tensor(select_id, device=text_query.device)
+        text_dict = preprocess_for_masks(batch_size, select_id, text_query)
+        return text_dict, image_feat_ori, select_id, extra_labels
+
+    def _slice_encoder_cache(self, encoder_cache, sample_idx):
+        return {
+            'memory': encoder_cache['memory'][sample_idx:sample_idx + 1],
+            'mask_flatten': encoder_cache['mask_flatten'][sample_idx:sample_idx + 1],
+            'lvl_pos_embed_flatten': encoder_cache['lvl_pos_embed_flatten'][sample_idx:sample_idx + 1],
+            'spatial_shapes': encoder_cache['spatial_shapes'],
+            'level_start_index': encoder_cache['level_start_index'],
+            'valid_ratios': encoder_cache['valid_ratios'][sample_idx:sample_idx + 1],
+        }
+
+    def _transpose_batch_inputs(self, data):
+        frames = data['imgs']
+        targets = data['gt_instances']
+        if len(frames) == 0:
+            return [], [], 0
+        if isinstance(frames[0], list):
+            batch_size = len(frames)
+            num_frames = len(frames[0])
+            frames_by_time = [[frames[sample_idx][frame_idx] for sample_idx in range(batch_size)] for frame_idx in range(num_frames)]
+            targets_by_time = [[targets[sample_idx][frame_idx] for sample_idx in range(batch_size)] for frame_idx in range(num_frames)]
+            return frames_by_time, targets_by_time, batch_size
+        return [[frame] for frame in frames], [[target] for target in targets], 1
+
+    def _forward_single_image_from_memory(self, encoder_cache, sample_idx, track_instances: Instances, targets=None, extra_labels=None, is_first=True, cls_num=0):
+        text_dict, image_feat_ori, select_id, extra_labels = self._prepare_text_conditioning(
+            targets, extra_labels, is_first, cls_num, batch_size=1
+        )
+        sample_cache = self._slice_encoder_cache(encoder_cache, sample_idx)
+
+        (hs_cti, hs_ofa, init_reference, inter_references, pre_outputs_classes, query_pos_track) = self.transformer.decode_from_memory(
+            sample_cache['memory'],
+            sample_cache['mask_flatten'],
+            sample_cache['lvl_pos_embed_flatten'],
+            sample_cache['spatial_shapes'],
+            sample_cache['level_start_index'],
+            sample_cache['valid_ratios'],
+            query_pos=track_instances.query_pos,
+            query_tgt=track_instances.query_tgt,
+            ref_pts=track_instances.ref_pts,
+            text_dict=text_dict,
+        )
+
+        outputs_coords = []
+        outputs_embeds = []
+
+        for lvl in range(hs_cti.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            tmp = self.bbox_embed[lvl](hs_ofa[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_coords.append(outputs_coord)
+            outputs_embeds.append(self.feature_align[lvl](hs_ofa[lvl]))
+        outputs_class = pre_outputs_classes
+        outputs_coord = torch.stack(outputs_coords)
+        outputs_embed = torch.stack(outputs_embeds)
+
+        if init_reference.shape[-1] == 4:
+            ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :4]], dim=0)
+        else:
+            ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :2]], dim=0)
+
+        out = {
+            'pred_logits': outputs_class[-1],
+            'pred_boxes': outputs_coord[-1],
+            'ref_pts': ref_pts_all[-2],
+            'pred_embed': outputs_embed[-1],
+            'select_id': select_id,
+            'image_feat': image_feat_ori,
+            'extra_labels': extra_labels,
+        }
+
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_embed)
+            for temp in out['aux_outputs']:
+                temp['select_id'] = select_id
+                temp['image_feat'] = image_feat_ori
+
+        out['query_pos_track'] = query_pos_track.transpose(0, 1)
+        out['hs_ofa'] = hs_ofa[-1]
+        out['hs_cti'] = hs_cti[-1]
+        return out
+
+    def _forward_hybrid_batched(self, frames_by_time, targets_by_time):
+        batch_size = len(targets_by_time[0])
+        sample_gt_instances = [
+            [targets_by_time[frame_idx][sample_idx] for frame_idx in range(len(targets_by_time))]
+            for sample_idx in range(batch_size)
+        ]
+        cls_nums = [
+            max(len(torch.unique(gt_instance.labels)) for gt_instance in gt_instances_per_sample)
+            for gt_instances_per_sample in sample_gt_instances
+        ]
+        self.criterion.initialize_batch(sample_gt_instances)
+
+        outputs = {
+            'pred_logits': [],
+            'pred_boxes': [],
+            'track_instances': []
+        }
+        track_instances_batch = [self._generate_empty_tracks() for _ in range(batch_size)]
+        extra_labels_batch = [None] * batch_size
+
+        for frame_index, (frame_batch, targets_batch) in enumerate(zip(frames_by_time, targets_by_time)):
+            is_last = frame_index == len(frames_by_time) - 1
+            is_first = frame_index == 0
+            for frame in frame_batch:
+                frame.requires_grad = False
+
+            samples = nested_tensor_from_tensor_list(frame_batch)
+            srcs, masks, pos = self._extract_backbone_features(samples)
+            encoder_cache = self.transformer.encode_image(srcs, masks, pos)
+            next_extra_labels_batch = []
+
+            for sample_idx, (track_instances, targets) in enumerate(zip(track_instances_batch, targets_batch)):
+                frame_res = self._forward_single_image_from_memory(
+                    encoder_cache,
+                    sample_idx,
+                    track_instances,
+                    targets,
+                    extra_labels_batch[sample_idx],
+                    is_first,
+                    cls_nums[sample_idx],
+                )
+                frame_res = self._post_process_single_image(
+                    frame_res,
+                    track_instances,
+                    is_last,
+                    is_first=is_first,
+                    sample_idx=sample_idx,
+                )
+
+                track_instances_batch[sample_idx] = frame_res['track_instances']
+                next_extra_labels_batch.append(frame_res['extra_labels'])
+
+                if sample_idx == 0:
+                    outputs['pred_logits'].append(frame_res['pred_logits'])
+                    outputs['pred_boxes'].append(frame_res['pred_boxes'])
+                    outputs['track_instances'].append(frame_res['track_instances_pre'])
+
+            extra_labels_batch = next_extra_labels_batch
+
+        outputs['losses_dict'] = self.criterion.losses_dict
+        return outputs
+    
+    def _forward_single_image(self, samples, track_instances: Instances, targets=None, extra_labels=None ,is_first=True, cls_num=0):
+        srcs, masks, pos = self._extract_backbone_features(samples)
 
         # Get the selected category id
         if self.training:
@@ -793,7 +993,7 @@ class OVTR(nn.Module):
         out['hs_cti'] = hs_cti[-1]
         return out
      
-    def _post_process_single_image(self, frame_res, track_instances, is_last, is_repeat=None, is_first=False, target_size=None):
+    def _post_process_single_image(self, frame_res, track_instances, is_last, is_repeat=None, is_first=False, target_size=None, sample_idx=None):
         with torch.no_grad():
             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
 
@@ -807,7 +1007,7 @@ class OVTR(nn.Module):
         if self.training:
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
-            track_instances = self.criterion.match_for_single_frame(frame_res, is_first)
+            track_instances = self.criterion.match_for_single_frame(frame_res, is_first, sample_idx=sample_idx)
         else:
             if self.train_with_artificial_img_seqs:
                 track_instances, _track_discard = protect_track_preds(track_instances, num_queries=self.num_queries, miss_tolerance=self.track_base.miss_tolerance, ious_thresh=self.ious_thresh) 
@@ -871,6 +1071,15 @@ class OVTR(nn.Module):
         return ret
 
     def forward(self, data):
+        frames_by_time, targets_by_time, batch_size = self._transpose_batch_inputs(data)
+        if (
+            self.training
+            and batch_size > 1
+            and not self.use_checkpoint
+            and not self.transformer.encoder.fusion_layers
+        ):
+            return self._forward_hybrid_batched(frames_by_time, targets_by_time)
+
         if self.training:
             self.criterion.initialize(data['gt_instances'])
         frames = data['imgs']
@@ -913,7 +1122,7 @@ class OVTR(nn.Module):
                         *[aux['select_id'] for aux in frame_res['aux_outputs']],
                         *[aux['image_feat'] for aux in frame_res['aux_outputs']],
                     )
-                args = [frame] + [track_instances.get(k) for k in keys] 
+                args = [frame] + [track_instances.get(k) for k in keys]
                 params = tuple((p for p in self.parameters() if p.requires_grad))
                 tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
                 frame_res = {
@@ -939,7 +1148,7 @@ class OVTR(nn.Module):
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances, targets, extra_labels, is_first, cls_num)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last, is_first=is_first)
-            
+
             track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])

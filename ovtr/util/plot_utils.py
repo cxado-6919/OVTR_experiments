@@ -64,7 +64,7 @@ def plot_logs(logs, fields=('class_error', 'loss_bbox_unscaled', 'mAP'), ewm_col
     for df, color in zip(dfs, sns.color_palette(n_colors=len(logs))):
         for j, field in enumerate(fields):
             if field == 'mAP':
-                coco_eval = pd.DataFrame(pd.np.stack(df.test_coco_eval.dropna().values)[:, 1]).ewm(com=ewm_col).mean()
+                coco_eval = pd.DataFrame(np.stack(df.test_coco_eval.dropna().values)[:, 1]).ewm(com=ewm_col).mean()
                 axs[j].plot(coco_eval, c=color)
             else:
                 df.interpolate().ewm(com=ewm_col).mean().plot(
@@ -88,7 +88,7 @@ def plot_precision_recall(files, naming_scheme='iter'):
         raise ValueError(f'not supported {naming_scheme}')
     fig, axs = plt.subplots(ncols=2, figsize=(16, 5))
     for f, color, name in zip(files, sns.color_palette("Blues", n_colors=len(files)), names):
-        data = torch.load(f)
+        data = torch.load(f, weights_only=False)
         # precision is n_iou, n_points, n_cat, n_area, max_det
         precision = data['precision']
         recall = data['params'].recThrs

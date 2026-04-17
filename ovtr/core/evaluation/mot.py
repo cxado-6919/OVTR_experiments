@@ -50,12 +50,12 @@ def acc_single_video(
             gt_ignore = [gt["bboxes_ignore"] for i in range(num_classes)]
         gt = track2result(gt["bboxes"], gt["labels"], gt["instance_ids"], num_classes)
         for i in range(num_classes):
-            gt_ids, gt_bboxes = gt[i][:, 0].astype(np.int), gt[i][:, 1:]
-            pred_ids, pred_bboxes = result[i][:, 0].astype(np.int), result[i][:, 1:-1]
+            gt_ids, gt_bboxes = gt[i][:, 0].astype(np.int64), gt[i][:, 1:]
+            pred_ids, pred_bboxes = result[i][:, 0].astype(np.int64), result[i][:, 1:-1]
             dist = bbox_distances(gt_bboxes, pred_bboxes, iou_thr)
             if gt_ignore[i].shape[0] > 0:
                 # 1. assign gt and preds
-                fps = np.ones(pred_bboxes.shape[0]).astype(np.bool)
+                fps = np.ones(pred_bboxes.shape[0], dtype=bool)
                 row, col = linear_sum_assignment(dist)
                 for m, n in zip(row, col):
                     if not np.isfinite(dist[m, n]):

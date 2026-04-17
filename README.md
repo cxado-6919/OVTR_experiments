@@ -39,33 +39,45 @@ Speed tests are performed on a single NVIDIA GeForce RTX 3090 GPU.
 
 ## 🔧 Installation
 
-```shell
-# create a virtual env
-conda create -n OVTR python=3.9
-# activate the env
-conda activate OVTR
-
-# install OVTR
-git clone https://github.com/jinyanglii/OVTR.git
-cd OVTR
-pip install torch==1.10.1+cu111 torchvision==0.11.2+cu111 torchaudio==0.10.1 -f https://download.pytorch.org/whl/cu111/torch_stable.html
-pip install -r requirements.txt
-# Different installation versions may lead to changes in evaluation scores.
-
-# create a model_zoo folder
-mkdir model_zoo
-```
- - Please install [CLIP](https://github.com/openai/CLIP) package following its official installation guide.
- - Compile the Deformable Attention CUDA ops:
-
-```shell
-# from https://github.com/fundamentalvision/Deformable-DETR
-cd ovtr/models/ops
-sh make.sh
-```
+This legacy section reflects the original release environment. For modern Linux / Blackwell systems, use the **Modern / Blackwell Setup** section below instead of the original `torch 1.10.1 + cu111 + mmcv-full 1.x + mmdet 2.x` instructions.
 
 
 ## 💽 Data
+
+## Modern / Blackwell Setup
+
+```shell
+python3.11 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip wheel setuptools
+python -m pip install \
+  torch==2.7.1 \
+  torchvision==0.22.1 \
+  torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
+
+mkdir -p model_zoo
+```
+
+ - The original `torch 1.10.1 + cu111 + mmcv-full 1.x + mmdet 2.x` stack is legacy-only and is not the recommended path for Blackwell GPUs.
+ - Core OVTR training and evaluation no longer require `mmcv-full` or `mmdet`.
+ - Build both package-local Deformable Attention CUDA ops:
+
+```shell
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0+PTX}"
+
+cd ovtr/models/ops
+python setup.py build_ext --inplace
+
+cd ../../../ovtr_det_bs2_pretrain/models/ops
+python setup.py build_ext --inplace
+```
+
+ - Full Linux / Blackwell setup, smoke tests, and troubleshooting live in [docs/BLACKWELL_SETUP.md](./docs/BLACKWELL_SETUP.md).
+
+## Data
 
 Place the unzipped [TAO](https://taodataset.org/) dataset in the `data/` directory. If you choose to perform detection pretraining from scratch or generate CLIP image embeddings yourself, you may also place the [LVIS](https://www.lvisdataset.org/) dataset in the `data/` directory (optional).
 

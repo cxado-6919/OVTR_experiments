@@ -125,7 +125,10 @@ def main(args):
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
-    device = torch.device(args.device)
+    if args.distributed and str(args.device).startswith("cuda"):
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        device = torch.device(args.device)
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -134,7 +137,7 @@ def main(args):
     random.seed(seed)
 
     cfg = SLConfig.fromfile(args.config_file)
-    cfg.device = "cuda" #if not cpu_only else "cpu"
+    cfg.device = str(device)
 
     model, criterion = build_model(args, cfg)
     model.to(device)
@@ -235,16 +238,12 @@ def main(args):
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location="cpu")
+        checkpoint = torch.load(args.frozen_weights, map_location="cpu", weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint["model"])
 
     if args.pretrained is not None:
-        model_without_ddp = load_model(model_without_ddp, args.pretrained)
+        load_model(model_without_ddp, args.pretrained)
 
     output_dir = Path(args.output_dir)
     if args.resume:
@@ -253,7 +252,7 @@ def main(args):
                 args.resume, map_location="cpu", check_hash=True
             )
         else:
-            checkpoint = torch.load(args.resume, map_location="cpu")
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(
             checkpoint["model"], strict=False
         )
@@ -289,6 +288,14 @@ def main(args):
                 )
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint["epoch"] + 1
+
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model_without_ddp,
+            device_ids=[args.gpu],
+            output_device=args.gpu,
+        )
+        model_without_ddp = model.module
 
     t_e = time.time()
     print("Detection pretraining started, preparation took {:.2f} seconds.".format(t_e - t_s))

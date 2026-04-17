@@ -3,7 +3,6 @@
 # Modified from OVTrack (https://github.com/SysCV/ovtrack)
 # ------------------------------------------------------------------------
 import copy
-from tkinter import Y
 import mmcv
 import cv2
 import numpy as np

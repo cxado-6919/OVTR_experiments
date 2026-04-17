@@ -5,7 +5,11 @@ from .utils import clean_state_dict
 
 def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None):
     start_epoch = 0
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
+    checkpoint = torch.load(
+        model_path,
+        map_location=lambda storage, loc: storage,
+        weights_only=False,
+    )
     print(f'loaded {model_path}')
     
     model_state_dict = model.state_dict()

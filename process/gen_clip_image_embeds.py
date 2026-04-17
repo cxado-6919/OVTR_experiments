@@ -7,7 +7,16 @@ import random
 import operator
 
 import os
-import clip
+
+try:
+    import clip as openai_clip
+except ImportError:
+    openai_clip = None
+
+try:
+    import open_clip
+except ImportError:
+    open_clip = None
 
 json_file = './data/lvis_v1/annotations/lvis_v1_train.json'
 img_root = './data/lvis_v1'
@@ -27,8 +36,17 @@ class Make_image_embedding():
         self.embeding_list = []
         self.ratio_m = (region_ratio - 1)/2 
         self.ratio_p = 1 + (region_ratio - 1)/2 
-        self.device = "cuda"
-        self.clip_model, self.preprocess = clip.load('ViT-B/32', self.device)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if openai_clip is not None:
+            self.clip_model, self.preprocess = openai_clip.load("ViT-B/32", self.device)
+        elif open_clip is not None:
+            self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="openai", device=self.device
+            )
+        else:
+            raise ImportError(
+                "Install `open-clip-torch` or OpenAI CLIP to regenerate image embeddings."
+            )
         self.feature_all = []
         self.preprocessed_category = []
         

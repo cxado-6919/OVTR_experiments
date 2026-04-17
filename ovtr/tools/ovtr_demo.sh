@@ -1,11 +1,13 @@
-CUDA_DEVICES="0"
-MASTER_PORT=9980
-NPROC_GPU=1
-PRETRAIN_MODEL="../model_zoo/ovtr_5_frame.pth"
-OUTPUT="./results"
-VIS_OUTPUT="./results"
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+#!/usr/bin/env bash
+set -euo pipefail
+
+CUDA_DEVICES="${CUDA_DEVICES:-0}"
+MASTER_PORT="${MASTER_PORT:-9980}"
+NPROC_GPU="${NPROC_GPU:-1}"
+PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_5_frame.pth}"
+OUTPUT="${OUTPUT:-./results}"
+VIS_OUTPUT="${VIS_OUTPUT:-./results}"
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./track_demo.py \
     --config_file ./config/ovtr_5_frame_train_val.py \
     --dataset_file lvis_generated_img_seqs \

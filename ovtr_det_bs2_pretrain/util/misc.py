@@ -15,6 +15,7 @@ Misc functions, including distributed helpers.
 Mostly copy-paste from torchvision references.
 """
 import datetime
+import inspect
 import os
 import pickle
 import subprocess
@@ -440,16 +441,29 @@ def init_distributed_mode(args):
 
     args.distributed = True
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training requires CUDA, but torch.cuda.is_available() is False.")
+
     torch.cuda.set_device(args.gpu)
     args.dist_backend = "nccl"
     print("| distributed init (rank {}): {}".format(args.rank, args.dist_url), flush=True)
-    torch.distributed.init_process_group(
+    init_pg_kwargs = dict(
         backend=args.dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
     )
-    torch.distributed.barrier()
+    try:
+        init_pg_sig = inspect.signature(torch.distributed.init_process_group)
+        if "device_id" in init_pg_sig.parameters:
+            init_pg_kwargs["device_id"] = torch.device(f"cuda:{args.gpu}")
+    except (TypeError, ValueError):
+        pass
+    torch.distributed.init_process_group(**init_pg_kwargs)
+    try:
+        torch.distributed.barrier(device_ids=[args.gpu])
+    except TypeError:
+        torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 
 
@@ -479,17 +493,13 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(input, size, scale_factor, mode, align_corners)
-
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        if float(torchvision.__version__[:3]) < 0.5:
-            return _NewEmptyTensorOp.apply(input, output_shape)
-        return _new_empty_tensor(input, output_shape)
-    else:
-        return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+    return torch.nn.functional.interpolate(
+        input,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners,
+    )
 
 
 def get_total_grad_norm(parameters, norm_type=2):

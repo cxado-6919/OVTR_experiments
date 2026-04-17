@@ -15,6 +15,7 @@ import cv2
 import os
 import sys
 import math
+from contextlib import nullcontext
 from typing import Iterable
 from util.list_LVIS import CLASSES
 import torch
@@ -24,6 +25,34 @@ from pathlib import Path
 from util.events import get_event_storage, TensorboardXWriter
 from util.plot_utils import draw_boxes, draw_ref_pts, image_hwc2chw
 from datasets.data_prefetcher import data_prefetcher, data_dict_to_cuda
+
+
+def _debug_cuda_sync(device, label):
+    if os.environ.get("OVTR_DEBUG_CUDA_SYNC") == "1" and torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        print(f"[CUDA-SYNC] {label}", flush=True)
+
+
+def _split_mot_batch(data_dict):
+    imgs = data_dict.get("imgs")
+    if not isinstance(imgs, list) or len(imgs) == 0 or not isinstance(imgs[0], list):
+        return [data_dict]
+
+    batch_size = len(imgs)
+    sample_dicts = []
+    for sample_idx in range(batch_size):
+        sample_dict = {}
+        for key, value in data_dict.items():
+            if isinstance(value, list):
+                if len(value) != batch_size:
+                    raise ValueError(
+                        f"Expected batched field '{key}' to have length {batch_size}, got {len(value)}"
+                    )
+                sample_dict[key] = value[sample_idx]
+            else:
+                sample_dict[key] = value
+        sample_dicts.append(sample_dict)
+    return sample_dicts
 
 
 def visualize(track_instances, filename):
@@ -54,7 +83,9 @@ def visualize(track_instances, filename):
 
 def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0, writer=None, amp: bool = False):
+                    device: torch.device, epoch: int, max_norm: float = 0,
+                    writer=None, amp: bool = False, clip_gradients: bool = False,
+                    manual_grad_sync: bool = False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -69,14 +100,66 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
     for data_dict in metric_logger.log_every(data_loader, print_freq, header):
         filename = data_dict.pop('filename') # for visualization
         data_dict = data_dict_to_cuda(data_dict, device)
-        outputs = model(data_dict)
-
-        track_instances = outputs.pop('track_instances')
-        # visualize(track_instances, filename)
-
-        loss_dict = criterion(outputs)
         weight_dict = criterion.weight_dict
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        model_ref = model.module if hasattr(model, "module") else model
+        supports_mot_batch = getattr(model_ref, "supports_mot_batch", False)
+        sample_dicts = [data_dict] if supports_mot_batch else _split_mot_batch(data_dict)
+        micro_batch_count = len(sample_dicts)
+        filename = filename[0] if isinstance(filename, list) else filename
+
+        optimizer.zero_grad()
+        loss_dict = {}
+        vis_outputs = None
+        vis_data_dict = None
+
+        for micro_batch_idx, sample_data_dict in enumerate(sample_dicts):
+            outputs = model(sample_data_dict)
+            _debug_cuda_sync(device, f"after model forward ({micro_batch_idx + 1}/{micro_batch_count})")
+
+            track_instances = outputs.pop('track_instances')
+            # visualize(track_instances, filename)
+
+            loss_dict_i = criterion(outputs)
+            _debug_cuda_sync(device, f"after criterion forward ({micro_batch_idx + 1}/{micro_batch_count})")
+            losses = sum(loss_dict_i[k] * weight_dict[k] for k in loss_dict_i.keys() if k in weight_dict)
+
+            loss_value_local = losses.detach().item()
+            if not math.isfinite(loss_value_local):
+                print("Loss is {}, stopping training".format(loss_value_local))
+                print(loss_dict_i)
+                sys.exit(1)
+
+            scaled_losses = losses / micro_batch_count
+
+            for key, value in loss_dict_i.items():
+                if key in loss_dict:
+                    loss_dict[key] = loss_dict[key] + value.detach() / micro_batch_count
+                else:
+                    loss_dict[key] = value.detach() / micro_batch_count
+
+            if vis_outputs is None:
+                vis_outputs = {
+                    'pred_boxes': [pred_boxes.detach() for pred_boxes in outputs['pred_boxes']],
+                    'pred_logits': [pred_logits.detach() for pred_logits in outputs['pred_logits']],
+                }
+                vis_data_dict = _split_mot_batch(sample_data_dict)[0] if supports_mot_batch else sample_data_dict
+
+            _debug_cuda_sync(device, f"before backward ({micro_batch_idx + 1}/{micro_batch_count})")
+            backward_ctx = nullcontext()
+            if hasattr(model, "no_sync") and (
+                os.environ.get("OVTR_DDP_NO_SYNC_DEBUG") == "1"
+                or micro_batch_idx < micro_batch_count - 1
+            ):
+                backward_ctx = model.no_sync()
+            anomaly_ctx = (
+                torch.autograd.detect_anomaly()
+                if os.environ.get("OVTR_AUTOGRAD_ANOMALY") == "1"
+                else nullcontext()
+            )
+            with anomaly_ctx:
+                with backward_ctx:
+                    scaled_losses.backward()
+            _debug_cuda_sync(device, f"after backward ({micro_batch_idx + 1}/{micro_batch_count})")
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -85,18 +168,13 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
 
         loss_value = losses_reduced_scaled.item()
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            print(loss_dict_reduced)
-            sys.exit(1)
-
-        optimizer.zero_grad()
-        losses.backward()
+        if manual_grad_sync:
+            utils.average_gradients(model.named_parameters())
+            _debug_cuda_sync(device, "after manual grad sync")
         if max_norm > 0:
-            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            grad_total_norm = utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
-            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm) 
+            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
@@ -106,14 +184,14 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         # gather the stats from all processes
         if writer is not None:
             if step % 20 == 0:
-                img = data_dict['ori_img'][0].permute(1, 2, 0).contiguous()
+                img = vis_data_dict['ori_img'][0].permute(1, 2, 0).contiguous()
                 h, w = img.shape[:2]
-                gt_boxes = box_ops.box_cxcywh_to_xyxy(data_dict['gt_instances'][0].boxes)
+                gt_boxes = box_ops.box_cxcywh_to_xyxy(vis_data_dict['gt_instances'][0].boxes)
                 gt_boxes[:, ::2] *= w
                 gt_boxes[:, 1::2] *= h
                 vis_img = draw_boxes(img, gt_boxes, color=(0, 1, 0))
-                dt_boxes = outputs['pred_boxes'][0].detach().clone()
-                dt_scores = outputs['pred_logits'][0].detach().clone().sigmoid().max(dim=-1)[0]
+                dt_boxes = vis_outputs['pred_boxes'][0].clone()
+                dt_scores = vis_outputs['pred_logits'][0].clone().sigmoid().max(dim=-1)[0]
                 keep = dt_scores > 0.4
                 dt_boxes = dt_boxes[keep]
                 dt_scores = dt_scores[keep]

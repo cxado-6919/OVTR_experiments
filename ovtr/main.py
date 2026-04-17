@@ -9,6 +9,7 @@
 import argparse
 import datetime
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -26,6 +27,23 @@ from engine import train_one_epoch_mot
 from models import build_model
 
 from util.slconfig import SLConfig
+
+
+def should_use_manual_grad_sync(args):
+    if not args.distributed or not str(args.device).startswith("cuda"):
+        return False
+
+    force_ddp = os.environ.get("OVTR_FORCE_DDP", "0") == "1"
+    if force_ddp:
+        return False
+
+    force_manual = os.environ.get("OVTR_MANUAL_GRAD_SYNC", "0") == "1"
+    if force_manual:
+        return True
+
+    # Blackwell DDP can hit CUDA illegal memory access during AccumulateGrad/NCCL.
+    major, _ = torch.cuda.get_device_capability(args.gpu)
+    return major >= 12
 
 
 def get_args_parser():
@@ -139,7 +157,12 @@ def get_args_parser():
 
     parser.add_argument("--config_file", default="./config/ovtr_5_frame_train.py", type=str)
     parser.add_argument('--calculate_negative_samples', default=False, action='store_true')
-    parser.add_argument('--pretrained', default=None, help='resume from checkpoint')
+    parser.add_argument(
+        '--pretrained', '--pretrain',
+        dest='pretrained',
+        default=None,
+        help='path to pretrained weights to load before training/evaluation',
+    )
     parser.add_argument('--max_len', default=100, type=int)
     parser.add_argument('--lvis_anno', default="lvis_v1_train.json", type=str)
 
@@ -169,7 +192,17 @@ def main(args):
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
-    device = torch.device(args.device)
+    if args.distributed and str(args.device).startswith("cuda"):
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        device = torch.device(args.device)
+
+    def ddp_debug(msg):
+        print(
+            f"[DDP-DBG][rank={utils.get_rank()}][local_rank={getattr(args, 'gpu', 0)}] {msg}",
+            flush=True,
+        )
+
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -177,10 +210,13 @@ def main(args):
     random.seed(seed)
 
     cfg = SLConfig.fromfile(args.config_file)
-    cfg.device = "cuda" #if not cpu_only else "cpu"
+    cfg.device = str(device)
 
+    ddp_debug("before build_model")
     model, criterion = build_model(args, cfg)
+    ddp_debug("after build_model")
     model.to(device)
+    ddp_debug(f"after model.to({device})")
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -277,31 +313,32 @@ def main(args):
     else:
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop)
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        ddp_debug(f"before frozen_weights load: {args.frozen_weights}")
+        checkpoint = torch.load(args.frozen_weights, map_location="cpu", weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
+        ddp_debug("after frozen_weights load")
 
     if args.pretrained is not None:
-        model_without_ddp = load_model(model_without_ddp, args.pretrained)
+        ddp_debug(f"before pretrained load: {args.pretrained}")
+        load_model(model_without_ddp, args.pretrained)
+        ddp_debug("after pretrained load")
 
     output_dir = Path(args.output_dir)
     if args.resume:
+        ddp_debug(f"before resume load: {args.resume}")
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        if 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -324,6 +361,28 @@ def main(args):
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
+        ddp_debug("after resume load")
+
+    if args.distributed:
+        args.manual_grad_sync = should_use_manual_grad_sync(args)
+        if args.manual_grad_sync:
+            ddp_debug("skipping DDP wrap; using manual gradient all-reduce fallback")
+        else:
+            ddp_debug("before DDP wrap")
+            ddp_bucket_cap_mb = int(os.environ.get("OVTR_DDP_BUCKET_CAP_MB", "4"))
+            model = torch.nn.parallel.DistributedDataParallel(
+                model_without_ddp,
+                device_ids=[args.gpu],
+                output_device=args.gpu,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=False,
+                bucket_cap_mb=ddp_bucket_cap_mb,
+            )
+            model_without_ddp = model.module
+            ddp_debug(f"after DDP wrap (bucket_cap_mb={ddp_bucket_cap_mb})")
+    else:
+        args.manual_grad_sync = False
 
     t_e = time.time()
     print("Training started, preparation took {:.2f} seconds.".format(t_e - t_s))
@@ -354,7 +413,16 @@ def main(args):
             if args.distributed:
                 sampler_train.set_epoch(epoch)
             train_stats = train_func(
-                model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, writer=writer
+                model,
+                criterion,
+                data_loader_train,
+                optimizer,
+                device,
+                epoch,
+                args.clip_max_norm,
+                writer=writer,
+                clip_gradients=args.clip_gradients,
+                manual_grad_sync=args.manual_grad_sync,
             )
             lr_scheduler.step()
             if args.output_dir:

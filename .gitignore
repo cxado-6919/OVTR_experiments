@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Env
+.env
+
+# Notebook
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Training outputs
+outputs/
+runs/
+wandb/
+tensorboard/
+
+# Checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Datasets
+data/
+datasets/
+
+# OS files
+.DS_Store

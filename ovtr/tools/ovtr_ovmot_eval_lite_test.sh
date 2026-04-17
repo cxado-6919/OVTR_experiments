@@ -1,12 +1,14 @@
-CUDA_DEVICES="0"
-MASTER_PORT=9985
-NPROC_GPU=1
-PRETRAIN_MODEL="../model_zoo/ovtr_lite.pth"
-OUTPUT="./results"
-VIS_OUTPUT="./results/vis_output_track_lite_test"
-RESULT_PATH="./results/teta_results_lite_test"
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python -m torch.distributed.launch --master_port=${MASTER_PORT} --nproc_per_node=${NPROC_GPU} \
-    --use_env \
+#!/usr/bin/env bash
+set -euo pipefail
+
+CUDA_DEVICES="${CUDA_DEVICES:-0}"
+MASTER_PORT="${MASTER_PORT:-9985}"
+NPROC_GPU="${NPROC_GPU:-1}"
+PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_lite.pth}"
+OUTPUT="${OUTPUT:-./results}"
+VIS_OUTPUT="${VIS_OUTPUT:-./results/vis_output_track_lite_test}"
+RESULT_PATH="${RESULT_PATH:-./results/teta_results_lite_test}"
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./eval.py \
     --config_file ./config/ovtr_lite_test.py \
     --dataset_file lvis_generated_img_seqs \

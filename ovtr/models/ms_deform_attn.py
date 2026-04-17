@@ -14,7 +14,7 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
-import MultiScaleDeformableAttention as MSDA
+from .ops import HAS_MSDA_EXT, MSDA
 
 
 # helpers
@@ -313,7 +313,7 @@ class MultiScaleDeformableAttention(nn.Module):
                 )
             )
     
-        if torch.cuda.is_available() and value.is_cuda:
+        if value.is_cuda and HAS_MSDA_EXT:
             halffloat = False
             if value.dtype == torch.float16:
                 halffloat = True

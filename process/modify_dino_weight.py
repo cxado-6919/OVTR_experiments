@@ -1,7 +1,7 @@
 import torch
 
 dino_weight = './model_zoo/checkpoint0033_4scale.pth'
-checkpoint = torch.load(dino_weight)
+checkpoint = torch.load(dino_weight, weights_only=False)
 
 ori_check=checkpoint['model']
 copy_list=['transformer.decoder.layers.0.linear1.weight', 'transformer.decoder.layers.0.linear1.bias', 

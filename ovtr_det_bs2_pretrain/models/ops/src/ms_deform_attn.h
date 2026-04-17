@@ -26,16 +26,16 @@ ms_deform_attn_forward(
     const at::Tensor &attn_weight,
     const int im2col_step)
 {
-    if (value.type().is_cuda())
+    if (value.is_cuda())
     {
 #ifdef WITH_CUDA
         return ms_deform_attn_cuda_forward(
             value, spatial_shapes, level_start_index, sampling_loc, attn_weight, im2col_step);
 #else
-        AT_ERROR("Not compiled with GPU support");
+        TORCH_CHECK(false, "Not compiled with GPU support");
 #endif
     }
-    AT_ERROR("Not implemented on the CPU");
+    TORCH_CHECK(false, "ms_deform_attn_forward is only implemented for CUDA tensors");
 }
 
 std::vector<at::Tensor>
@@ -48,15 +48,15 @@ ms_deform_attn_backward(
     const at::Tensor &grad_output,
     const int im2col_step)
 {
-    if (value.type().is_cuda())
+    if (value.is_cuda())
     {
 #ifdef WITH_CUDA
         return ms_deform_attn_cuda_backward(
             value, spatial_shapes, level_start_index, sampling_loc, attn_weight, grad_output, im2col_step);
 #else
-        AT_ERROR("Not compiled with GPU support");
+        TORCH_CHECK(false, "Not compiled with GPU support");
 #endif
     }
-    AT_ERROR("Not implemented on the CPU");
+    TORCH_CHECK(false, "ms_deform_attn_backward is only implemented for CUDA tensors");
 }
 

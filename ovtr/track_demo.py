@@ -354,7 +354,7 @@ def eval(args, cfg, video_path):
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     cfg.data.test.test_mode = True
-    cfg.device = "cuda" #if not cpu_only else "cpu"
+    cfg.device = args.device
     torch.manual_seed(args.seed)
 
     # load model and weights
@@ -364,7 +364,8 @@ def eval(args, cfg, video_path):
 
     model = load_model(model, args.pretrained)
     model.eval()
-    model = model.cuda()
+    device = torch.device(args.device)
+    model = model.to(device)
     
     tracker = OVTR_inference(args, cfg, model=model)
 
@@ -393,7 +394,7 @@ def eval(args, cfg, video_path):
                     break
 
                 cur_frame, ori_frame = tracker.init_img(frame)
-                track_instances = tracker.detect(vis=args.vis, data=cur_frame.cuda().float(), track_instances=track_instances,
+                track_instances = tracker.detect(vis=args.vis, data=cur_frame.to(device).float(), track_instances=track_instances,
                                                 prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh, 
                                                 miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
                                                 frame_id=frame_id, ori_frame=ori_frame, frame_width=frame_width, frame_height=frame_height

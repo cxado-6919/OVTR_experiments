@@ -10,13 +10,39 @@ import glob
 import os
 
 import torch
-from setuptools import find_packages, setup
-from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+from setuptools import setup
+from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
 
-requirements = ["torch", "torchvision"]
+
+DEFAULT_CUDA_ARCH_LIST = "8.0;8.6;8.9;9.0;12.0+PTX"
+
+
+def _detect_arch_list():
+    if "TORCH_CUDA_ARCH_LIST" in os.environ:
+        return os.environ["TORCH_CUDA_ARCH_LIST"]
+
+    if torch.cuda.is_available():
+        archs = sorted(
+            {f"{major}.{minor}" for major, minor in (torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count()))},
+            key=lambda item: tuple(int(part) for part in item.split(".")),
+        )
+        if archs:
+            archs[-1] = f"{archs[-1]}+PTX"
+            return ";".join(archs)
+
+    return DEFAULT_CUDA_ARCH_LIST
 
 
 def get_extensions():
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "CUDA toolkit was not found. Install a CUDA-enabled PyTorch environment with nvcc "
+            "to build the MultiScaleDeformableAttention extension, or rely on the slower "
+            "pure-PyTorch fallback by skipping this build step."
+        )
+
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", _detect_arch_list())
+
     this_dir = os.path.dirname(os.path.abspath(__file__))
     extensions_dir = os.path.join(this_dir, "src")
 
@@ -24,50 +50,31 @@ def get_extensions():
     source_cpu = glob.glob(os.path.join(extensions_dir, "cpu", "*.cpp"))
     source_cuda = glob.glob(os.path.join(extensions_dir, "cuda", "*.cu"))
 
-    sources = main_file + source_cpu
-    extension = CppExtension
-    extra_compile_args = {"cxx": []}
-    define_macros = []
-
-    if torch.cuda.is_available() and CUDA_HOME is not None:
-        extension = CUDAExtension
-        sources += source_cuda
-        define_macros += [("WITH_CUDA", None)]
-        extra_compile_args["nvcc"] = [
-            "-DCUDA_HAS_FP16=1",
-            "-D__CUDA_NO_HALF_OPERATORS__",
-            "-D__CUDA_NO_HALF_CONVERSIONS__",
-            "-D__CUDA_NO_HALF2_OPERATORS__",
-        ]
-    else:
-        raise NotImplementedError("Cuda is not availabel")
-
-    sources = [os.path.join(extensions_dir, s) for s in sources]
+    sources = main_file + source_cpu + source_cuda
     include_dirs = [extensions_dir]
-    ext_modules = [
-        extension(
-            "MultiScaleDeformableAttention",
-            sources,
+    return [
+        CUDAExtension(
+            name="_C",
+            sources=sources,
             include_dirs=include_dirs,
-            define_macros=define_macros,
-            extra_compile_args=extra_compile_args,
+            define_macros=[("WITH_CUDA", None)],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": [
+                    "-O3",
+                    "--use_fast_math",
+                    "-std=c++17",
+                    "-lineinfo",
+                ],
+            },
         )
     ]
-    return ext_modules
 
 
 setup(
-    name="MultiScaleDeformableAttention",
-    version="1.0",
-    author="Weijie Su",
-    url="https://github.com/fundamentalvision/Deformable-DETR",
-    description="PyTorch Wrapper for CUDA Functions of Multi-Scale Deformable Attention",
-    packages=find_packages(
-        exclude=(
-            "configs",
-            "tests",
-        )
-    ),
+    name="ovtr-det-msda",
+    version="2.0",
+    description="OVTR detection-pretrain package-local CUDA extension for multi-scale deformable attention",
     ext_modules=get_extensions(),
-    cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
+    cmdclass={"build_ext": BuildExtension},
 )
