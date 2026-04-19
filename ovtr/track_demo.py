@@ -28,6 +28,7 @@ from pathlib import Path
 from models import build_model
 from util.slconfig import SLConfig
 from util.tool import load_model
+from util.group_a_ptq import setup_group_a_ptq
 from main import get_args_parser
 from detectron2.structures import Instances
 from datasets import build_dataset
@@ -363,6 +364,8 @@ def eval(args, cfg, video_path):
     print('number of params:', n_parameters)
 
     model = load_model(model, args.pretrained)
+    if args.group_a_ptq:
+        setup_group_a_ptq(model, args)
     model.eval()
     device = torch.device(args.device)
     model = model.to(device)

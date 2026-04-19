@@ -15,6 +15,7 @@ from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
 from .ops import HAS_MSDA_EXT, MSDA
+from .quant_utils import maybe_observe_and_quantize_group_a_attention
 
 
 # helpers
@@ -283,6 +284,7 @@ class MultiScaleDeformableAttention(nn.Module):
             bs, num_query, self.num_heads, self.num_levels * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
+        attention_weights = maybe_observe_and_quantize_group_a_attention(self, attention_weights)
         attention_weights = attention_weights.view(
             bs,
             num_query,

@@ -1,5 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/sh
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_DIR}"
 
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
 MASTER_PORT="${MASTER_PORT:-9984}"
@@ -18,9 +23,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" -
     --lr 4e-5 \
     --lr_backbone 4e-6 \
     --lr_drop 13 \
-    --pretrain ${PRETRAIN_MODEL} \
-    --output_dir ${OUTPUT} \
-    --num_workers 32 \
+    --pretrain "${PRETRAIN_MODEL}" \
+    --output_dir "${OUTPUT}" \
+    --num_workers 48 \
     --batch_size 1 \
     --sample_mode random_interval \
     --sample_interval 1 \
@@ -36,5 +41,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" -
     --ious_thresh 0.5 0.45 0.5 0.4 0.45 0.45 0.45 \
     --miss_tolerance 5 5 5 5 5 5 5 \
     --maximum_quantity 160 \
-    --result_path_track ${RESULT_PATH} \
-    --vis_output ${VIS_OUTPUT}
+    --result_path_track "${RESULT_PATH}" \
+    --vis_output "${VIS_OUTPUT}"

@@ -37,3 +37,5 @@ datasets/
 
 # OS files
 .DS_Store
+
+ovtr/results/

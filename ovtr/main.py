@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
 from util.tool import load_model
+from util.group_a_ptq import setup_group_a_ptq, calibrate_group_a_on_train_loader
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset
@@ -180,6 +181,18 @@ def get_args_parser():
     parser.add_argument('--eval', default=['track'], type=str, nargs='+')
     parser.add_argument('--eval_options', type=json.loads, default='{"resfile_path": "results/ovtrack_teta_results/"}')
     parser.add_argument('--result_path_track', default=None, type=str)
+    parser.add_argument('--group_a_ptq', action='store_true',
+                        help='enable Group A PTQ-only emulation with calibration before use')
+    parser.add_argument('--group_a_calib_batches', default=32, type=int,
+                        help='number of batches to use when calibrating Group A PTQ')
+    parser.add_argument('--group_a_calibration_only', action='store_true',
+                        help='run Group A calibration and exit without starting training')
+    parser.add_argument('--group_a_weight_bits', default=4, type=int,
+                        help='weight bit width for Group A PTQ')
+    parser.add_argument('--group_a_activation_bits', default=4, type=int,
+                        help='activation bit width for Group A PTQ')
+    parser.add_argument('--group_a_attention_bits', default=8, type=int,
+                        help='attention bit width for Group A PTQ')
     return parser
 
 
@@ -362,6 +375,19 @@ def main(args):
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
         ddp_debug("after resume load")
+
+    if args.group_a_ptq:
+        setup_group_a_ptq(model_without_ddp, args)
+        calibrate_group_a_on_train_loader(
+            model_without_ddp,
+            data_loader_train,
+            device,
+            args.group_a_calib_batches,
+            args=args,
+        )
+        if args.group_a_calibration_only:
+            print("Group A calibration finished; exiting before training as requested.")
+            return
 
     if args.distributed:
         args.manual_grad_sync = should_use_manual_grad_sync(args)

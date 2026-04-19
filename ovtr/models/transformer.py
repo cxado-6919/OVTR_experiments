@@ -22,6 +22,7 @@ from .utils import (
     ContrastiveEmbed,
     attention_protection,
 )
+from .quant_utils import maybe_quantize_group_a_level_embed
 import copy
 import math
 
@@ -203,7 +204,8 @@ class Transformer(nn.Module):
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
             if self.num_feature_levels > 1 and self.level_embed is not None:
-                lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+                level_embed = maybe_quantize_group_a_level_embed(self, self.level_embed[lvl])
+                lvl_pos_embed = pos_embed + level_embed.view(1, 1, -1)
             else:
                 lvl_pos_embed = pos_embed
             lvl_pos_embed_flatten.append(lvl_pos_embed)
@@ -974,6 +976,6 @@ def build_transformer(args):
         prior_prob=args.prior_prob, 
         log_scale=args.log_scale, 
         text_dim=args.text_dim,
-        attention_protection=args.attention_protection,
+        attention_protection=getattr(args, "attention_protection", False),
         computed_aux=args.computed_aux
     )

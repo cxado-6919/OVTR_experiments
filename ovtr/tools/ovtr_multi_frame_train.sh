@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_DIR}"
+
 CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
 MASTER_PORT="${MASTER_PORT:-9982}"
 NPROC_GPU="${NPROC_GPU:-4}"

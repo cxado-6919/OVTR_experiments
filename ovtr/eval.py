@@ -24,6 +24,7 @@ import os
 import numpy as np
 import random
 import argparse
+import time
 import torchvision.transforms.functional as F
 import torch
 import cv2
@@ -32,6 +33,7 @@ from pathlib import Path
 from models import build_model
 from util.slconfig import SLConfig
 from util.tool import load_model
+from util.group_a_ptq import setup_group_a_ptq, calibrate_group_a_on_eval_loader
 from main import get_args_parser
 from detectron2.structures import Instances
 from datasets import build_dataset
@@ -41,6 +43,39 @@ from datasets.data_prefetcher import data_dict_to_cuda
 from util.list_LVIS import CLASSES, novel_list_ori, COLORS
 from mmcv.runner import get_dist_info
 np.random.seed(2024)
+
+
+def _split_mot_batch(data_dict):
+    imgs = data_dict.get("imgs")
+    if not isinstance(imgs, list) or len(imgs) == 0 or not isinstance(imgs[0], list):
+        return [data_dict]
+
+    batch_size = len(imgs)
+    sample_dicts = []
+    for sample_idx in range(batch_size):
+        sample_dict = {}
+        for key, value in data_dict.items():
+            if isinstance(value, list):
+                if len(value) != batch_size:
+                    raise ValueError(
+                        f"Expected batched field '{key}' to have length {batch_size}, got {len(value)}"
+                    )
+                sample_dict[key] = value[sample_idx]
+            else:
+                sample_dict[key] = value
+        sample_dicts.append(sample_dict)
+    return sample_dicts
+
+
+def _unwrap_singleton_list(value):
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value
+
+
+def _sync_timing_device(device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 def plot_one_box(x, img, color=None, label=None, score=None, line_thickness=None, mask=None):
     # Plots one bounding box on image img
@@ -354,6 +389,8 @@ def eval(args, cfg):
     print('number of params:', n_parameters)
 
     model = load_model(model, args.pretrained)
+    if args.group_a_ptq:
+        setup_group_a_ptq(model, args)
     model.eval()
     model = model.to(torch.device(args.device))
 
@@ -369,6 +406,15 @@ def eval(args, cfg):
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=collate_fn, num_workers=args.num_workers,
                                  pin_memory=True)
+
+    if args.group_a_ptq:
+        calibrate_group_a_on_eval_loader(
+            model,
+            data_loader_val,
+            torch.device(args.device),
+            args.group_a_calib_batches,
+            args=args,
+        )
     
     tracker = OVTR_inference(args, cfg, model=model)
 
@@ -377,16 +423,40 @@ def eval(args, cfg):
     tracker.result_path_track = os.path.abspath(tracker.result_path_track)
     os.makedirs((tracker.result_path_track), exist_ok = True)
     track_instances = None
+    timing_device = model.text_embeddings.device
+    total_detect_time = 0.0
+    processed_frames = 0
 
     with torch.no_grad():
-        for i, data_dict in enumerate(tqdm(data_loader_val)):   
-            info = data_dict.pop('info')[0]
-            file_path = data_dict.pop('file_path')[0]
-            data_dict = data_dict_to_cuda(data_dict, device=model.text_embeddings.device)
-            track_instances = tracker.detect(vis=args.vis, data=data_dict, track_instances=track_instances, info=info, 
-                                             prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh, 
-                                             miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
-                                             file_path=file_path)
+        for i, data_dict in enumerate(tqdm(data_loader_val)):
+            sample_dicts = _split_mot_batch(dict(data_dict))
+            for sample_data_dict in sample_dicts:
+                # Tracking state is frame-sequential, so consume loader batches one sample at a time.
+                info = _unwrap_singleton_list(sample_data_dict.pop('info'))
+                file_path = _unwrap_singleton_list(sample_data_dict.pop('file_path'))
+                sample_data_dict = data_dict_to_cuda(sample_data_dict, device=timing_device)
+                _sync_timing_device(timing_device)
+                start_time = time.perf_counter()
+                track_instances = tracker.detect(vis=args.vis, data=sample_data_dict, track_instances=track_instances, info=info,
+                                                 prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh,
+                                                 miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
+                                                 file_path=file_path)
+                _sync_timing_device(timing_device)
+                total_detect_time += time.perf_counter() - start_time
+                processed_frames += 1
+
+    timing_stats_device = timing_device if timing_device.type == "cuda" else torch.device("cpu")
+    timing_stats = torch.tensor([total_detect_time, processed_frames], dtype=torch.float64, device=timing_stats_device)
+    if utils.is_dist_avail_and_initialized():
+        timing_stats = utils.all_reduce_tensor(timing_stats, average=False)
+    total_detect_time = timing_stats[0].item()
+    processed_frames = int(timing_stats[1].item())
+    if processed_frames > 0 and total_detect_time > 0:
+        avg_latency_ms = (total_detect_time / processed_frames) * 1000.0
+        fps = processed_frames / total_detect_time
+    else:
+        avg_latency_ms = float("nan")
+        fps = float("nan")
 
     resfile_path = tracker.result_path_track
     print('Inference completed')
@@ -397,6 +467,8 @@ def eval(args, cfg):
     
     rank, _ = get_dist_info()
     if rank == 0:
+        print(f'Average per-frame latency: {avg_latency_ms:.2f} ms')
+        print(f'FPS: {fps:.2f}')
         kwargs = {} if args.eval_options is None else args.eval_options
         
         eval_kwargs = cfg.get('evaluation', {}).copy()
@@ -405,7 +477,10 @@ def eval(args, cfg):
             eval_kwargs.pop(key, None)
         eval_kwargs.update(dict(metric=args.eval, **kwargs))
         eval_kwargs.resfile_path = resfile_path
-        print(dataset_val.evaluate(outputs, **eval_kwargs))
+        eval_results = dataset_val.evaluate(outputs, **eval_kwargs)
+        eval_results['avg_latency_ms'] = avg_latency_ms
+        eval_results['fps'] = fps
+        print(eval_results)
 
 
 if __name__ == '__main__':
