@@ -33,7 +33,12 @@ from pathlib import Path
 from models import build_model
 from util.slconfig import SLConfig
 from util.tool import load_model
-from util.group_a_ptq import setup_group_a_ptq, calibrate_group_a_on_eval_loader
+from util.quantization import (
+    build_quant_calibration_loader,
+    calibrate_quant_controller_on_val_loader,
+    enable_loaded_quantization,
+    setup_quant_controller,
+)
 from main import get_args_parser
 from detectron2.structures import Instances
 from datasets import build_dataset
@@ -385,12 +390,14 @@ def eval(args, cfg):
 
     # load model and weights
     model, _, = build_model(args, cfg)
+    quant_controller = setup_quant_controller(model, args)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     model = load_model(model, args.pretrained)
-    if args.group_a_ptq:
-        setup_group_a_ptq(model, args)
+    quant_state_loaded = False
+    if quant_controller is not None:
+        quant_state_loaded = enable_loaded_quantization(model, require_state=False)
     model.eval()
     model = model.to(torch.device(args.device))
 
@@ -407,14 +414,27 @@ def eval(args, cfg):
                                  drop_last=False, collate_fn=collate_fn, num_workers=args.num_workers,
                                  pin_memory=True)
 
-    if args.group_a_ptq:
-        calibrate_group_a_on_eval_loader(
+    if args.quant_mode == "ptq" and not quant_state_loaded:
+        data_loader_calib = build_quant_calibration_loader(args, cfg)
+        calibrated = calibrate_quant_controller_on_val_loader(
             model,
-            data_loader_val,
+            data_loader_calib,
             torch.device(args.device),
-            args.group_a_calib_batches,
+            args.quant_calib_samples,
             args=args,
         )
+        quant_controller.enable_quantization()
+        print(f"[Quant] PTQ calibration complete on {calibrated} samples", flush=True)
+        if args.quant_calibration_only:
+            if args.output_dir:
+                utils.save_on_master(
+                    {"model": model.state_dict(), "args": args},
+                    Path(args.output_dir) / "checkpoint_quant_calibrated.pth",
+                )
+            print("[Quant] Exiting after PTQ calibration as requested.", flush=True)
+            return
+    elif args.quant_mode == "qat" and quant_controller is not None and not quant_state_loaded:
+        raise ValueError("QAT evaluation expects a checkpoint that already contains learned quant state.")
     
     tracker = OVTR_inference(args, cfg, model=model)
 

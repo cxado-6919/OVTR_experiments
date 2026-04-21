@@ -20,12 +20,22 @@ from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
 from util.tool import load_model
-from util.group_a_ptq import setup_group_a_ptq, calibrate_group_a_on_train_loader
+from util.quantization import (
+    add_quant_args,
+    build_quant_calibration_loader,
+    calibrate_quant_controller_on_val_loader,
+    enable_loaded_quantization,
+    setup_quant_controller,
+)
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset
 from engine import train_one_epoch_mot
 from models import build_model
+from models.quant_utils import (
+    is_partition_trainable_param,
+    is_quant_trainable_param,
+)
 
 from util.slconfig import SLConfig
 
@@ -181,18 +191,7 @@ def get_args_parser():
     parser.add_argument('--eval', default=['track'], type=str, nargs='+')
     parser.add_argument('--eval_options', type=json.loads, default='{"resfile_path": "results/ovtrack_teta_results/"}')
     parser.add_argument('--result_path_track', default=None, type=str)
-    parser.add_argument('--group_a_ptq', action='store_true',
-                        help='enable Group A PTQ-only emulation with calibration before use')
-    parser.add_argument('--group_a_calib_batches', default=32, type=int,
-                        help='number of batches to use when calibrating Group A PTQ')
-    parser.add_argument('--group_a_calibration_only', action='store_true',
-                        help='run Group A calibration and exit without starting training')
-    parser.add_argument('--group_a_weight_bits', default=4, type=int,
-                        help='weight bit width for Group A PTQ')
-    parser.add_argument('--group_a_activation_bits', default=4, type=int,
-                        help='activation bit width for Group A PTQ')
-    parser.add_argument('--group_a_attention_bits', default=8, type=int,
-                        help='attention bit width for Group A PTQ')
+    add_quant_args(parser)
     return parser
 
 
@@ -224,6 +223,21 @@ def main(args):
 
     cfg = SLConfig.fromfile(args.config_file)
     cfg.device = str(device)
+    if args.quant_mode == "qat" and args.resume is None and args.epochs == 50:
+        args.epochs = 1
+        print("[Quant] Defaulting QAT fine-tuning to 1 epoch", flush=True)
+    if args.quant_mode == "qat":
+        args.sampler_steps = []
+        args.sampler_lengths = [5]
+        if not getattr(cfg, "use_transformer_ckpt", False):
+            cfg.use_transformer_ckpt = True
+        if not getattr(cfg, "use_checkpoint_track", False):
+            cfg.use_checkpoint_track = True
+        print(
+            "[Quant] Enabling transformer checkpointing and frame-wise checkpointing for QAT",
+            flush=True,
+        )
+        print("[Quant] Forcing QAT training to fixed 5-frame sampling", flush=True)
 
     ddp_debug("before build_model")
     model, criterion = build_model(args, cfg)
@@ -232,8 +246,7 @@ def main(args):
     ddp_debug(f"after model.to({device})")
 
     model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
+    quant_controller = setup_quant_controller(model_without_ddp, args)
 
     dataset_train = build_dataset(image_set='train', args=args, cfg=cfg.data.train)
 
@@ -263,49 +276,117 @@ def main(args):
                 out = True
                 break
         return out
-
-    param_dicts = [
-        {
-            "params":
-                [p for n, p in model_without_ddp.named_parameters()
-                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-            "lr": args.lr,
-        },
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-            "lr": args.lr * args.lr_linear_proj_mult,
-        }
-    ]
     
-    # Constant freezing
-    if (cfg.train_tracking_keep is not None) and (cfg.initial_grad):
-        for name, para in model.named_parameters():
-            for keyw in cfg.train_tracking_keep:
-                if keyw in name:
-                    para.requires_grad_(False)
-                else:
-                    pass
+    output_dir = Path(args.output_dir)
+
+    def build_default_param_dicts():
+        return [
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if not match_name_keywords(n, args.lr_backbone_names)
+                    and not match_name_keywords(n, args.lr_linear_proj_names)
+                    and p.requires_grad
+                ],
+                "lr": args.lr,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad
+                ],
+                "lr": args.lr_backbone,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad
+                ],
+                "lr": args.lr * args.lr_linear_proj_mult,
+            },
+        ]
+
+    def build_qat_param_dicts():
+        return [
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if is_quant_trainable_param(n) and p.requires_grad
+                ],
+                "lr": args.lr * 0.1,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if not is_quant_trainable_param(n)
+                    and not match_name_keywords(n, args.lr_backbone_names)
+                    and not match_name_keywords(n, args.lr_linear_proj_names)
+                    and p.requires_grad
+                ],
+                "lr": args.lr,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if not is_quant_trainable_param(n)
+                    and match_name_keywords(n, args.lr_backbone_names)
+                    and p.requires_grad
+                ],
+                "lr": args.lr_backbone,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model_without_ddp.named_parameters()
+                    if not is_quant_trainable_param(n)
+                    and match_name_keywords(n, args.lr_linear_proj_names)
+                    and p.requires_grad
+                ],
+                "lr": args.lr * args.lr_linear_proj_mult,
+            },
+        ]
 
     freeze_ori = []
+    if args.quant_mode == "qat":
+        for _, para in model.named_parameters():
+            para.requires_grad_(False)
+        for name, para in model.named_parameters():
+            if (
+                is_partition_trainable_param(name, args.quant_partition)
+                or is_quant_trainable_param(name)
+            ):
+                para.requires_grad_(True)
+        param_dicts = [group for group in build_qat_param_dicts() if len(group["params"]) > 0]
+    else:
+        param_dicts = build_default_param_dicts()
+
+        if (cfg.train_tracking_keep is not None) and (cfg.initial_grad):
+            for name, para in model.named_parameters():
+                for keyw in cfg.train_tracking_keep:
+                    if keyw in name:
+                        para.requires_grad_(False)
+                        break
+
+        if (cfg.train_tracking_only is not None) and (cfg.initial_grad) and (args.resume is None):
+            for _, para in model.named_parameters():
+                para.requires_grad_(False)
+            for name, para in model.named_parameters():
+                for keyw in cfg.train_tracking_only:
+                    if keyw in name:
+                        para.requires_grad_(True)
+                        break
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             print("ori_requires_grad: False ", name)
             freeze_ori.append(name)
-
-    # Pre adjustable weights
-    if (cfg.train_tracking_only is not None) and (cfg.initial_grad) and (args.resume is None):
-        for name, para in model.named_parameters():
-            para.requires_grad_(False)
-        for name, para in model.named_parameters():
-            for keyw in cfg.train_tracking_only:
-                if keyw in name:
-                    para.requires_grad_(True)
-                else:
-                    pass
 
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -314,17 +395,23 @@ def main(args):
         if not param.requires_grad:
             print("requires_grad: False ", name)
 
-    if args.sgd:
-        optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-                                    weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                      weight_decay=args.weight_decay)
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print('number of params:', n_parameters)
 
-    if len(args.lr_drop)==1:
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop[0])
-    else:
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop)
+    optimizer = None
+    lr_scheduler = None
+    if args.quant_mode != "ptq":
+        if args.sgd:
+            optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
+                                        weight_decay=args.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
+                                          weight_decay=args.weight_decay)
+
+        if len(args.lr_drop)==1:
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop[0])
+        else:
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop)
 
     if args.frozen_weights is not None:
         ddp_debug(f"before frozen_weights load: {args.frozen_weights}")
@@ -337,7 +424,6 @@ def main(args):
         load_model(model_without_ddp, args.pretrained)
         ddp_debug("after pretrained load")
 
-    output_dir = Path(args.output_dir)
     if args.resume:
         ddp_debug(f"before resume load: {args.resume}")
         if args.resume.startswith('https'):
@@ -351,7 +437,7 @@ def main(args):
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
-        if 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        if optimizer is not None and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -376,17 +462,56 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         ddp_debug("after resume load")
 
-    if args.group_a_ptq:
-        setup_group_a_ptq(model_without_ddp, args)
-        calibrate_group_a_on_train_loader(
+    def save_calibrated_checkpoint(filename: str) -> None:
+        if not args.output_dir:
+            return
+        checkpoint_path = output_dir / filename
+        payload = {
+            'model': model_without_ddp.state_dict(),
+            'args': args,
+        }
+        if optimizer is not None:
+            payload['optimizer'] = optimizer.state_dict()
+        if lr_scheduler is not None:
+            payload['lr_scheduler'] = lr_scheduler.state_dict()
+        utils.save_on_master(payload, checkpoint_path)
+
+    quant_state_loaded = False
+    if quant_controller is not None:
+        quant_state_loaded = enable_loaded_quantization(model_without_ddp, require_state=False)
+
+    if args.quant_mode == "ptq":
+        if quant_controller is None:
+            raise ValueError("PTQ requested but quant controller was not initialized.")
+        if not quant_state_loaded:
+            data_loader_calib = build_quant_calibration_loader(args, cfg)
+            calibrated = calibrate_quant_controller_on_val_loader(
+                model_without_ddp,
+                data_loader_calib,
+                device,
+                args.quant_calib_samples,
+                args=args,
+            )
+            quant_controller.enable_quantization()
+            print(f"[Quant] PTQ calibration complete on {calibrated} samples", flush=True)
+        save_calibrated_checkpoint("checkpoint_quant_calibrated.pth")
+        print("[Quant] PTQ flow does not start training; exiting after calibration/runtime setup.", flush=True)
+        return
+
+    if args.quant_mode == "qat" and quant_controller is not None and not quant_state_loaded:
+        data_loader_calib = build_quant_calibration_loader(args, cfg)
+        calibrated = calibrate_quant_controller_on_val_loader(
             model_without_ddp,
-            data_loader_train,
+            data_loader_calib,
             device,
-            args.group_a_calib_batches,
+            args.quant_calib_samples,
             args=args,
         )
-        if args.group_a_calibration_only:
-            print("Group A calibration finished; exiting before training as requested.")
+        quant_controller.enable_qat()
+        print(f"[Quant] QAT initialization complete on {calibrated} samples", flush=True)
+        if args.quant_calibration_only:
+            save_calibrated_checkpoint("checkpoint_quant_initialized.pth")
+            print("[Quant] Exiting after QAT initialization as requested.", flush=True)
             return
 
     if args.distributed:
@@ -420,7 +545,12 @@ def main(args):
         if args.vis and utils.is_main_process():
             writer = TensorboardXWriter(output_dir)
         for epoch in range(args.start_epoch, args.epochs):
-            if (epoch == cfg.global_grad_allowed_epoch_track) and (cfg.initial_grad) and (args.resume is None):
+            if (
+                args.quant_mode != "qat"
+                and (epoch == cfg.global_grad_allowed_epoch_track)
+                and (cfg.initial_grad)
+                and (args.resume is None)
+            ):
                 for name, para in model.named_parameters():
                     if args.distributed:
                         if name[7:] in freeze_ori:
@@ -450,7 +580,8 @@ def main(args):
                 clip_gradients=args.clip_gradients,
                 manual_grad_sync=args.manual_grad_sync,
             )
-            lr_scheduler.step()
+            if lr_scheduler is not None and (args.quant_mode != "qat" or args.quant_use_scheduler):
+                lr_scheduler.step()
             if args.output_dir:
                 checkpoint_paths = [output_dir / 'checkpoint.pth']
                 if (epoch + 1) % args.save_period == 0:

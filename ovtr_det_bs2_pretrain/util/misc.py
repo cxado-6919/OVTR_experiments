@@ -55,7 +55,8 @@ class SmoothedValue(object):
         """
         if not is_dist_avail_and_initialized():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
+        sync_device = "cuda" if get_dist_backend() == "nccl" and torch.cuda.is_available() else "cpu"
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device=sync_device)
         dist.barrier()
         dist.all_reduce(t)
         t = t.tolist()
@@ -109,11 +110,12 @@ def all_gather(data):
     # serialized to a Tensor
     buffer = pickle.dumps(data)
     storage = torch.ByteStorage.from_buffer(buffer)
-    tensor = torch.ByteTensor(storage).to("cuda")
+    collective_device = "cuda" if get_dist_backend() == "nccl" and torch.cuda.is_available() else "cpu"
+    tensor = torch.ByteTensor(storage).to(collective_device)
 
     # obtain Tensor size of each rank
-    local_size = torch.tensor([tensor.numel()], device="cuda")
-    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    local_size = torch.tensor([tensor.numel()], device=collective_device)
+    size_list = [torch.tensor([0], device=collective_device) for _ in range(world_size)]
     dist.all_gather(size_list, local_size)
     size_list = [int(size.item()) for size in size_list]
     max_size = max(size_list)
@@ -123,9 +125,9 @@ def all_gather(data):
     # gathering tensors of different shapes
     tensor_list = []
     for _ in size_list:
-        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device=collective_device))
     if local_size != max_size:
-        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device=collective_device)
         tensor = torch.cat((tensor, padding), dim=0)
     dist.all_gather(tensor_list, tensor)
 
@@ -157,9 +159,7 @@ def reduce_dict(input_dict, average=True):
             names.append(k)
             values.append(input_dict[k])
         values = torch.stack(values, dim=0)
-        dist.all_reduce(values)
-        if average:
-            values /= world_size
+        values = all_reduce_tensor(values, average=average)
         reduced_dict = {k: v for k, v in zip(names, values)}
     return reduced_dict
 
@@ -390,6 +390,12 @@ def get_rank():
     return dist.get_rank()
 
 
+def get_dist_backend():
+    if not is_dist_avail_and_initialized():
+        return None
+    return dist.get_backend()
+
+
 def get_local_size():
     if not is_dist_avail_and_initialized():
         return 1
@@ -404,6 +410,76 @@ def get_local_rank():
 
 def is_main_process():
     return get_rank() == 0
+
+
+@torch.no_grad()
+def average_gradients(parameters):
+    world_size = get_world_size()
+    if world_size < 2:
+        return
+
+    chunk_elems = int(os.environ.get("OVTR_GRAD_SYNC_CHUNK_ELEMS", "131072"))
+    backend = get_dist_backend()
+
+    for item in parameters:
+        if isinstance(item, tuple):
+            _, parameter = item
+        else:
+            parameter = item
+        if not parameter.requires_grad:
+            continue
+
+        local_has_grad = torch.tensor(
+            [1 if parameter.grad is not None else 0],
+            dtype=torch.int64,
+            device=parameter.device if backend == "nccl" else "cpu",
+        )
+        dist.all_reduce(local_has_grad)
+        if local_has_grad.item() == 0:
+            continue
+
+        if parameter.grad is not None and parameter.grad.is_sparse:
+            raise RuntimeError("Sparse gradients are not supported for manual all-reduce.")
+
+        if parameter.grad is None:
+            local_grad = torch.zeros_like(parameter, memory_format=torch.contiguous_format)
+        else:
+            local_grad = parameter.grad
+            if not local_grad.is_contiguous():
+                local_grad = local_grad.contiguous()
+
+        sync_grad = local_grad.detach().clone(memory_format=torch.contiguous_format)
+        if backend == "gloo" and sync_grad.is_cuda:
+            sync_grad = sync_grad.cpu()
+        flat_grad = sync_grad.view(-1)
+        for start in range(0, flat_grad.numel(), chunk_elems):
+            grad_chunk = flat_grad[start : start + chunk_elems]
+            dist.all_reduce(grad_chunk)
+            grad_chunk.div_(world_size)
+
+        sync_grad = sync_grad.to(device=parameter.device, dtype=parameter.dtype)
+        if parameter.grad is None:
+            parameter.grad = sync_grad
+        else:
+            parameter.grad.copy_(sync_grad)
+
+
+def all_reduce_tensor(tensor, average=False):
+    world_size = get_world_size()
+    if world_size < 2:
+        return tensor
+
+    backend = get_dist_backend()
+    original_device = tensor.device
+    reduced = tensor.contiguous()
+    if backend == "gloo" and tensor.is_cuda:
+        reduced = tensor.detach().cpu()
+    dist.all_reduce(reduced)
+    if average:
+        reduced /= world_size
+    if reduced.device != original_device:
+        reduced = reduced.to(original_device)
+    return reduced
 
 
 def save_on_master(*args, **kwargs):
@@ -445,7 +521,12 @@ def init_distributed_mode(args):
         raise RuntimeError("Distributed training requires CUDA, but torch.cuda.is_available() is False.")
 
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = "nccl"
+    forced_backend = os.environ.get("OVTR_DIST_BACKEND")
+    if forced_backend is not None:
+        args.dist_backend = forced_backend
+    else:
+        major, _ = torch.cuda.get_device_capability(args.gpu)
+        args.dist_backend = "gloo" if major >= 12 else "nccl"
     print("| distributed init (rank {}): {}".format(args.rank, args.dist_url), flush=True)
     init_pg_kwargs = dict(
         backend=args.dist_backend,
@@ -455,13 +536,16 @@ def init_distributed_mode(args):
     )
     try:
         init_pg_sig = inspect.signature(torch.distributed.init_process_group)
-        if "device_id" in init_pg_sig.parameters:
+        if args.dist_backend == "nccl" and "device_id" in init_pg_sig.parameters:
             init_pg_kwargs["device_id"] = torch.device(f"cuda:{args.gpu}")
     except (TypeError, ValueError):
         pass
     torch.distributed.init_process_group(**init_pg_kwargs)
     try:
-        torch.distributed.barrier(device_ids=[args.gpu])
+        if args.dist_backend == "nccl":
+            torch.distributed.barrier(device_ids=[args.gpu])
+        else:
+            torch.distributed.barrier()
     except TypeError:
         torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)

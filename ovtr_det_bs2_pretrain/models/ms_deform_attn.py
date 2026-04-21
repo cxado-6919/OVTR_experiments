@@ -313,7 +313,8 @@ class MultiScaleDeformableAttention(nn.Module):
                 )
             )
     
-        if value.is_cuda and HAS_MSDA_EXT:
+        use_msda_ext = value.is_cuda and HAS_MSDA_EXT
+        if use_msda_ext:
             halffloat = False
             if value.dtype == torch.float16:
                 halffloat = True

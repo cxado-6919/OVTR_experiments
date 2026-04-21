@@ -22,7 +22,6 @@ from .utils import (
     ContrastiveEmbed,
     attention_protection,
 )
-from .quant_utils import maybe_quantize_group_a_level_embed
 import copy
 import math
 
@@ -204,8 +203,7 @@ class Transformer(nn.Module):
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
             if self.num_feature_levels > 1 and self.level_embed is not None:
-                level_embed = maybe_quantize_group_a_level_embed(self, self.level_embed[lvl])
-                lvl_pos_embed = pos_embed + level_embed.view(1, 1, -1)
+                lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             else:
                 lvl_pos_embed = pos_embed
             lvl_pos_embed_flatten.append(lvl_pos_embed)
@@ -492,6 +490,7 @@ class TransformerEncoder(nn.Module):
                         memory_text,
                         padding_mask,
                         text_attention_mask,
+                        use_reentrant=False,
                     )
                 else:
                     output, memory_text = self.fusion_layers[layer_id](
@@ -514,6 +513,7 @@ class TransformerEncoder(nn.Module):
                     spatial_shapes,
                     level_start_index,
                     padding_mask,
+                    use_reentrant=False,
                 )
             else:
                 output = layer(

@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from .utils import clean_state_dict
+from models.quant_utils import apply_ovtr_quant_state_dict
 
 
 def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None):
@@ -14,6 +15,7 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
     
     model_state_dict = model.state_dict()
     state_dict = clean_state_dict(checkpoint['model'])
+    state_dict = apply_ovtr_quant_state_dict(model, state_dict)
 
     # check loaded parameters and created model parameters
     for k in state_dict:
@@ -24,10 +26,12 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                     k, model_state_dict[k].shape, state_dict[k].shape))
                 state_dict[k] = model_state_dict[k]
         else:
-            print('Drop parameter {}.'.format(k))
+            if "_group_a_" not in k:
+                print('Drop parameter {}.'.format(k))
     for k in model_state_dict:
         if not (k in state_dict):
-            print('No param {}.'.format(k))
+            if "_ovtr_quant_" not in k:
+                print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
     print("|| Weights have been checked completely ||")

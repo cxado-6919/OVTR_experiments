@@ -599,6 +599,7 @@ class LVIS_seqs_Dataset_val(TaoDataset):
 
 
 def build(image_set, args, cfg):
+    cfg = copy.deepcopy(cfg)
     cfg.pop('type')
     if image_set == 'train':
         dataset = LVIS_seqs_Dataset(args, **cfg)

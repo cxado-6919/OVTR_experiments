@@ -39,6 +39,7 @@ def train_one_epoch(
     max_norm: float = 0,
     masks: bool = False,
     amp: bool = False,
+    manual_grad_sync: bool = False,
 ):
     model.train()
     criterion.train()
@@ -93,6 +94,8 @@ def train_one_epoch(
         if amp:
             optimizer.zero_grad()
             scaler.scale(losses).backward()
+            if manual_grad_sync:
+                utils.average_gradients(model.named_parameters())
             if max_norm > 0:
                 scaler.unscale_(optimizer)
                 grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
@@ -103,6 +106,8 @@ def train_one_epoch(
         else:
             optimizer.zero_grad()
             losses.backward()
+            if manual_grad_sync:
+                utils.average_gradients(model.named_parameters())
             if max_norm > 0:
                 grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             else:

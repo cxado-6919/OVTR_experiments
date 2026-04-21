@@ -28,7 +28,7 @@ from pathlib import Path
 from models import build_model
 from util.slconfig import SLConfig
 from util.tool import load_model
-from util.group_a_ptq import setup_group_a_ptq
+from util.quantization import enable_loaded_quantization, setup_quant_controller
 from main import get_args_parser
 from detectron2.structures import Instances
 from datasets import build_dataset
@@ -360,12 +360,15 @@ def eval(args, cfg, video_path):
 
     # load model and weights
     model, _, = build_model(args, cfg)
+    quant_controller = setup_quant_controller(model, args)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     model = load_model(model, args.pretrained)
-    if args.group_a_ptq:
-        setup_group_a_ptq(model, args)
+    if quant_controller is not None and not enable_loaded_quantization(model, require_state=False):
+        raise ValueError(
+            f"{args.quant_mode.upper()} demo expects a checkpoint that already contains quant state."
+        )
     model.eval()
     device = torch.device(args.device)
     model = model.to(device)

@@ -27,6 +27,19 @@ from util.slconfig import SLConfig
 import datetime
 
 
+def should_use_manual_grad_sync(args):
+    if not args.distributed or not str(args.device).startswith("cuda"):
+        return False
+
+    if os.environ.get("OVTR_FORCE_DDP", "0") == "1":
+        return False
+    if os.environ.get("OVTR_MANUAL_GRAD_SYNC", "0") == "1":
+        return True
+
+    major, _ = torch.cuda.get_device_capability(args.gpu)
+    return major >= 12
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser("OVTR detection pre-training", add_help=False)
     parser.add_argument("--lr", default=2e-4, type=float)
@@ -113,6 +126,8 @@ def get_args_parser():
     parser.add_argument('--pretrained', default=None, help='resume from checkpoint')
     parser.add_argument('--max_len', default=13, type=int)
     parser.add_argument('--lvis_anno', default="lvis_v1_train.json", type=str)
+    parser.add_argument("--skip_initial_grad_schedule", action="store_true",
+                        help="skip the detection-pretraining initial freeze/unfreeze schedule and fine-tune all originally trainable parameters from epoch 0")
     return parser
 
 
@@ -167,7 +182,6 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
     )
-
     def match_name_keywords(n, name_keywords):
         out = False
         for b in name_keywords:
@@ -213,7 +227,12 @@ def main(args):
             freeze_ori.append(name)
 
     # Pre adjustable weights
-    if (cfg.initial_grad_allowed is not None) and (cfg.initial_grad) and (args.resume is None):
+    if (
+        (cfg.initial_grad_allowed is not None)
+        and (cfg.initial_grad)
+        and (args.resume is None)
+        and (not args.skip_initial_grad_schedule)
+    ):
         for name, para in model.named_parameters():
             para.requires_grad_(False)
         for name, para in model.named_parameters():
@@ -290,19 +309,36 @@ def main(args):
             args.start_epoch = checkpoint["epoch"] + 1
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model_without_ddp,
-            device_ids=[args.gpu],
-            output_device=args.gpu,
-        )
-        model_without_ddp = model.module
+        args.manual_grad_sync = should_use_manual_grad_sync(args)
+        if args.manual_grad_sync:
+            print(
+                "[Distributed] Skipping DDP wrap; using manual gradient all-reduce with backend "
+                f"{args.dist_backend}",
+                flush=True,
+            )
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model_without_ddp,
+                device_ids=[args.gpu],
+                output_device=args.gpu,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+            model_without_ddp = model.module
+    else:
+        args.manual_grad_sync = False
 
     t_e = time.time()
     print("Detection pretraining started, preparation took {:.2f} seconds.".format(t_e - t_s))
     start_time = time.time()
     begin_time = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
     for epoch in range(args.start_epoch, args.epochs):
-        if (epoch == cfg.global_grad_allowed_epoch) and (cfg.initial_grad) and (args.resume is None):
+        if (
+            (epoch == cfg.global_grad_allowed_epoch)
+            and (cfg.initial_grad)
+            and (args.resume is None)
+            and (not args.skip_initial_grad_schedule)
+        ):
             for name, para in model.named_parameters():
                 if args.distributed:
                         if name[7:] in freeze_ori:
@@ -317,7 +353,7 @@ def main(args):
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     print(f"requires_grad in epoch{epoch}: False ", name)
-                    
+
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
@@ -330,6 +366,7 @@ def main(args):
             args.clip_max_norm,
             args.masks,
             args.amp,
+            manual_grad_sync=args.manual_grad_sync,
         )
         lr_scheduler.step()
         if args.output_dir:

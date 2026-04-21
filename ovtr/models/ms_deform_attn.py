@@ -15,7 +15,7 @@ from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
 from .ops import HAS_MSDA_EXT, MSDA
-from .quant_utils import maybe_observe_and_quantize_group_a_attention
+from .quant_utils import maybe_observe_and_quantize_attention
 
 
 # helpers
@@ -284,7 +284,7 @@ class MultiScaleDeformableAttention(nn.Module):
             bs, num_query, self.num_heads, self.num_levels * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
-        attention_weights = maybe_observe_and_quantize_group_a_attention(self, attention_weights)
+        attention_weights = maybe_observe_and_quantize_attention(self, attention_weights)
         attention_weights = attention_weights.view(
             bs,
             num_query,
@@ -315,7 +315,7 @@ class MultiScaleDeformableAttention(nn.Module):
                 )
             )
     
-        if value.is_cuda and HAS_MSDA_EXT:
+        if value.is_cuda and HAS_MSDA_EXT and not getattr(self, "_ovtr_quant_force_pytorch_msda", False):
             halffloat = False
             if value.dtype == torch.float16:
                 halffloat = True
