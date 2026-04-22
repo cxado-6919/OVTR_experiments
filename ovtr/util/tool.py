@@ -30,8 +30,13 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                 print('Drop parameter {}.'.format(k))
     for k in model_state_dict:
         if not (k in state_dict):
-            if "_ovtr_quant_" not in k:
-                print('No param {}.'.format(k))
+            if "_ovtr_quant_" in k:
+                # Quant tensors are loaded directly into the patched modules by
+                # apply_ovtr_quant_state_dict(); leaving them as missing here
+                # avoids feeding empty default observer buffers back through
+                # torch.load_state_dict().
+                continue
+            print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
     print("|| Weights have been checked completely ||")

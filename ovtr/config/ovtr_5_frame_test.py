@@ -179,6 +179,13 @@ data = dict(
                         ref_prefix='ref'),
                     ],
                 ),
+    calib=dict(
+        type=dataset_type,
+        classes='../data/lvis_classes_v1.txt',
+        ann_file='../data/lvis_clear_75_60_calib_512.json',
+        img_prefix='../data/lvis_v1/',
+        ref_img_sampler=None,
+        pipeline=test_pipeline),
     val=dict(
         type=dataset_type,
         classes='../data/lvis_classes_v1.txt',

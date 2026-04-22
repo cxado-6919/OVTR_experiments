@@ -528,6 +528,13 @@ class LVIS_seqs_Dataset_val(TaoDataset):
         frame_id = self.data_infos[idx]['frame_id']
         gt_instances = self.results_to_instances(results, frame_id, ann_info)
         return gt_instances
+
+    def _get_eval_ann_info(self, img_info):
+        # Calibration can use LVIS-derived held-out splits while final eval uses
+        # TAO-style annotations. Pick the parser that TaoDataset initialized.
+        if hasattr(self, "lvis"):
+            return self.get_lvis_ann_info(img_info)
+        return self.get_ann_info(img_info)
         
     def results_to_instances(self, results, frame_id, ann_info):
         img_shape_without_pad = results['img_metas'][0].data['pad_shape']
@@ -555,7 +562,7 @@ class LVIS_seqs_Dataset_val(TaoDataset):
         """
 
         img_info = self.data_infos[idx]
-        ann_info = self.get_ann_info(img_info)
+        ann_info = self._get_eval_ann_info(img_info)
         ann_info.update({'file_path':img_info['file_name']})
         results = dict(img_info=img_info)
         self.pre_pipeline(results)
@@ -590,7 +597,7 @@ class LVIS_seqs_Dataset_val(TaoDataset):
         return ref_img_info
     
     def prepare_results(self, img_info):
-        ann_info = self.get_ann_info(img_info)
+        ann_info = self._get_eval_ann_info(img_info)
         results = dict(img_info=img_info, ann_info=ann_info)
         if self.proposals is not None:
             idx = self.img_ids.index(img_info["id"])

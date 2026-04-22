@@ -1,4 +1,5 @@
 import copy
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -22,13 +23,13 @@ def add_quant_args(parser) -> None:
         "--quant_partition",
         default="exp_a",
         choices=list(SUPPORTED_QUANT_PARTITIONS),
-        help="module partition to quantize",
+        help="module partition to quantize (supported backends patch Conv2d/Linear/MSDA only)",
     )
     parser.add_argument(
         "--quant_calib_samples",
         default=512,
         type=int,
-        help="number of TAO validation samples to use for min-max calibration",
+        help="number of calibration samples to use for min-max calibration",
     )
     parser.add_argument(
         "--quant_calibration_only",
@@ -126,23 +127,60 @@ def setup_quant_controller(model: torch.nn.Module, args) -> Optional[object]:
     return controller
 
 
-def build_quant_calibration_loader(args, cfg):
+def _cfg_get(cfg_obj, key, default=None):
+    if hasattr(cfg_obj, key):
+        return getattr(cfg_obj, key)
+    if isinstance(cfg_obj, dict):
+        return cfg_obj.get(key, default)
+    return default
+
+
+def _cfg_set(cfg_obj, key, value) -> None:
+    if hasattr(cfg_obj, key):
+        setattr(cfg_obj, key, value)
+    else:
+        cfg_obj[key] = value
+
+
+def _resolve_calibration_config(cfg):
     calib_cfg = None
-    if hasattr(cfg.data, "test"):
+    calib_source = None
+    if hasattr(cfg.data, "calib"):
+        calib_cfg = copy.deepcopy(cfg.data.calib)
+        calib_source = "held-out LVIS calibration"
+    elif hasattr(cfg.data, "test"):
         calib_cfg = copy.deepcopy(cfg.data.test)
+        calib_source = "evaluation dataset"
     elif hasattr(cfg.data, "val"):
         calib_cfg = copy.deepcopy(cfg.data.val)
+        calib_source = "validation dataset"
     else:
-        raise AttributeError("Configuration must provide cfg.data.test or cfg.data.val for quant calibration.")
+        raise AttributeError(
+            "Configuration must provide cfg.data.calib, cfg.data.test, or cfg.data.val for quant calibration."
+        )
 
-    if hasattr(calib_cfg, "test_mode"):
-        calib_cfg.test_mode = True
-    else:
-        calib_cfg["test_mode"] = True
+    calib_ann_file = _cfg_get(calib_cfg, "ann_file")
+    if calib_source == "held-out LVIS calibration" and calib_ann_file is not None:
+        ann_files = calib_ann_file if isinstance(calib_ann_file, (list, tuple)) else [calib_ann_file]
+        missing_files = [ann_file for ann_file in ann_files if not Path(ann_file).exists()]
+        if missing_files:
+            missing_list = ", ".join(missing_files)
+            raise FileNotFoundError(
+                "[Quant] Held-out calibration split not found: "
+                f"{missing_list}. Generate it with "
+                "'python ../process/create_lvis_calibration_split.py' from the ovtr directory."
+            )
 
+    _cfg_set(calib_cfg, "test_mode", True)
+    return calib_cfg, calib_source
+
+
+def build_quant_calibration_loader(args, cfg):
+    calib_cfg, calib_source = _resolve_calibration_config(cfg)
     dataset_val = build_dataset(image_set="val", args=args, cfg=calib_cfg)
+    dataset_val.quant_calibration_description = calib_source
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    return DataLoader(
+    data_loader = DataLoader(
         dataset_val,
         batch_size=1,
         sampler=sampler_val,
@@ -151,6 +189,8 @@ def build_quant_calibration_loader(args, cfg):
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    data_loader.quant_calibration_description = calib_source
+    return data_loader
 
 
 def _broadcast_quant_state(controller) -> None:
@@ -185,8 +225,13 @@ def calibrate_quant_controller_on_val_loader(
     if utils.is_main_process():
         track_instances = None
         prev_file_path = None
+        calibration_description = getattr(
+            data_loader,
+            "quant_calibration_description",
+            getattr(data_loader.dataset, "quant_calibration_description", "calibration dataset"),
+        )
         print(
-            f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} TAO validation samples",
+            f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} {calibration_description} samples",
             flush=True,
         )
         for data_dict in data_loader:

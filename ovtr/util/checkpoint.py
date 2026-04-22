@@ -45,7 +45,18 @@ class CheckpointFunction(torch.autograd.Function):
             if ctx.input_tensors[i].requires_grad:
                 to_autograd.append(ctx.input_tensors[i])
 
-        output_tensors, output_grads = zip(*filter(lambda t: t[0].requires_grad, zip(output_tensors, output_grads)))
+        grad_pairs = [
+            (output_tensor, output_grad)
+            for output_tensor, output_grad in zip(output_tensors, output_grads)
+            if isinstance(output_tensor, torch.Tensor)
+            and output_tensor.requires_grad
+            and output_grad is not None
+        ]
+        if not grad_pairs:
+            total_inputs = len(ctx.input_tensors) + len(ctx.input_params)
+            return (None, None) + (None,) * total_inputs
+
+        output_tensors, output_grads = zip(*grad_pairs)
         input_grads = torch.autograd.grad(output_tensors, to_autograd + ctx.input_params, output_grads, allow_unused=True)
         input_grads = list(input_grads)
         for i in range(len(ctx.input_tensors)):

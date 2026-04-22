@@ -23,6 +23,7 @@ from .transformer import build_transformer
 from .updater import build as build_updater
 from .deformable_detr import SetCriterion
 from .segmentation import sigmoid_focal_loss
+from .quant_utils import maybe_get_quantized_embedding_weight
 
 from util.clip_utils import load_embeddings
 from .utils import MLP, protect_det_preds, protect_track_preds, preprocess_for_masks
@@ -664,7 +665,7 @@ class OVTR(nn.Module):
         device = self.transformer.level_embed.device
 
         track_instances.ref_pts = torch.zeros((num_queries, 4), device=device)
-        track_instances.query_tgt = self.transformer.tgt_embed.weight
+        track_instances.query_tgt = maybe_get_quantized_embedding_weight(self.transformer.tgt_embed)
         track_instances.query_pos = torch.zeros((num_queries, dim_h), device=device)
 
         track_instances.obj_idxes = torch.full((num_queries,), -1, dtype=torch.long, device=device)
