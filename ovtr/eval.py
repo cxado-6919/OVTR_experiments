@@ -45,7 +45,7 @@ from datasets import build_dataset
 import datasets.samplers as samplers
 import util.misc as utils
 from datasets.data_prefetcher import data_dict_to_cuda
-from util.list_LVIS import CLASSES, novel_list_ori, COLORS
+from util.list_LVIS import CLASSES, COLORS
 from mmcv.runner import get_dist_info
 np.random.seed(2024)
 
@@ -123,8 +123,6 @@ def draw_bboxes(ori_img, bbox, identities=None, mask=None, offset=(0, 0), cvt_co
         id = int(identities[i]) if identities is not None else 0
         color = COLORS[id % len(COLORS)]
         label_str = '{:d} {:s}'.format(id, CLASSES[label])
-        if label in novel_list_ori:
-            print(f"found novel category! {label_str} location is in {img_path}")
         img = plot_one_box([x1, y1, x2, y2], img, color, label_str, score=score, mask=m)
     return img
 
@@ -382,12 +380,6 @@ class OVTR_inference(object):
                 axis=-1), dt_instances.obj_idxes, img_path = img_path)
         if vis_points:
             img_show = draw_points(img_show, ref_pts)
-        dataset_name, sequence_name, frame_name = self._get_vis_output_parts(img_path)
-        frame_output_dir = os.path.join(save_path, dataset_name, sequence_name)
-        os.makedirs(frame_output_dir, exist_ok=True)
-        frame_output_path = os.path.join(frame_output_dir, frame_name)
-        cv2.imwrite(frame_output_path, img_show)
-
         writer = self._get_video_writer(img_path, img_show.shape[1], img_show.shape[0])
         if writer is not None:
             writer.write(img_show)
