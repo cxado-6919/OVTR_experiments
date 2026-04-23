@@ -260,10 +260,15 @@ class OVTR_inference(object):
         self.results = defaultdict(list)
         self.result_path_track = args.result_path_track
         self.cur_vis_img_path = args.vis_output
+        self.video_output_root = None
+        self.video_writers = {}
+        self.vis_video_fps = 10.0
         self.root = cfg.data.val.img_prefix
         self.num_classes = len(CLASSES)
         self.vis_points = args.vis_points
         self.dataset_list = ["YFCC100M", "HACS", "BDD", "ArgoVerse", "AVA", "LaSOT", "Charades"]
+        if self.cur_vis_img_path is not None:
+            self.video_output_root = os.path.join(self.cur_vis_img_path, "videos")
 
     @staticmethod
     def filter_dt_by_score(dt_instances: Instances, prob_threshold: float, score_threshold: float) -> Instances:
@@ -334,17 +339,58 @@ class OVTR_inference(object):
         return np.empty((0, 7))
 
     @staticmethod
-    def visualize_img_with_bbox(save_path, img_path, dt_instances: Instances, ref_pts=None, vis_points=None):
+    def _get_vis_output_parts(img_path):
+        img_path_parts = Path(img_path).parts
+        frame_name = img_path_parts[-1]
+        sequence_name = img_path_parts[-2] if len(img_path_parts) >= 2 else "sequence"
+        dataset_name = img_path_parts[-3] if len(img_path_parts) >= 3 else "dataset"
+        return dataset_name, sequence_name, frame_name
+
+    def _get_video_writer(self, img_path, frame_width, frame_height):
+        if self.video_output_root is None:
+            return None
+
+        dataset_name, sequence_name, _ = self._get_vis_output_parts(img_path)
+        writer_key = (dataset_name, sequence_name)
+        writer = self.video_writers.get(writer_key)
+        if writer is not None:
+            return writer
+
+        output_dir = os.path.join(self.video_output_root, dataset_name)
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{sequence_name}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, self.vis_video_fps, (frame_width, frame_height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not initialize VideoWriter for {output_path}")
+        self.video_writers[writer_key] = writer
+        return writer
+
+    def close_visualization_writers(self):
+        for writer in self.video_writers.values():
+            writer.release()
+        self.video_writers.clear()
+
+    def visualize_img_with_bbox(self, save_path, img_path, dt_instances: Instances, ref_pts=None, vis_points=None):
         img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image for visualization: {img_path}")
+        img_show = img
         if dt_instances.has('scores'):
             img_show = draw_bboxes(img, np.concatenate(
                 [dt_instances.boxes, dt_instances.scores.reshape(-1, 1), dt_instances.cls_idxes.reshape(-1, 1)],
                 axis=-1), dt_instances.obj_idxes, img_path = img_path)
-        os.makedirs(os.path.join(save_path, img_path.split('/')[-3], img_path.split('/')[-2]), exist_ok = True)
         if vis_points:
             img_show = draw_points(img_show, ref_pts)
-        save_path = os.path.join(save_path, img_path.split('/')[-3], img_path.split('/')[-2], img_path.split('/')[-1])
-        cv2.imwrite(save_path, img_show)
+        dataset_name, sequence_name, frame_name = self._get_vis_output_parts(img_path)
+        frame_output_dir = os.path.join(save_path, dataset_name, sequence_name)
+        os.makedirs(frame_output_dir, exist_ok=True)
+        frame_output_path = os.path.join(frame_output_dir, frame_name)
+        cv2.imwrite(frame_output_path, img_show)
+
+        writer = self._get_video_writer(img_path, img_show.shape[1], img_show.shape[0])
+        if writer is not None:
+            writer.write(img_show)
 
     def detect(self, prob_threshold=0.6, score_threshold=0.5, filter_score_thresh=0.5, miss_tolerance=5, maximum_quantity=60, area_threshold=100, ious_thresh=0.3,
                vis=False, data=None, track_instances=None, info=None, file_path=None):
@@ -383,6 +429,8 @@ def eval(args, cfg):
     utils.init_distributed_mode(args)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    if args.vis and not args.vis_output:
+        raise ValueError("--vis requires --vis_output so eval visualizations have a destination.")
 
     cfg.data.test.test_mode = True
     cfg.device = args.device
@@ -447,23 +495,26 @@ def eval(args, cfg):
     total_detect_time = 0.0
     processed_frames = 0
 
-    with torch.no_grad():
-        for i, data_dict in enumerate(tqdm(data_loader_val)):
-            sample_dicts = _split_mot_batch(dict(data_dict))
-            for sample_data_dict in sample_dicts:
-                # Tracking state is frame-sequential, so consume loader batches one sample at a time.
-                info = _unwrap_singleton_list(sample_data_dict.pop('info'))
-                file_path = _unwrap_singleton_list(sample_data_dict.pop('file_path'))
-                sample_data_dict = data_dict_to_cuda(sample_data_dict, device=timing_device)
-                _sync_timing_device(timing_device)
-                start_time = time.perf_counter()
-                track_instances = tracker.detect(vis=args.vis, data=sample_data_dict, track_instances=track_instances, info=info,
-                                                 prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh,
-                                                 miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
-                                                 file_path=file_path)
-                _sync_timing_device(timing_device)
-                total_detect_time += time.perf_counter() - start_time
-                processed_frames += 1
+    try:
+        with torch.no_grad():
+            for i, data_dict in enumerate(tqdm(data_loader_val)):
+                sample_dicts = _split_mot_batch(dict(data_dict))
+                for sample_data_dict in sample_dicts:
+                    # Tracking state is frame-sequential, so consume loader batches one sample at a time.
+                    info = _unwrap_singleton_list(sample_data_dict.pop('info'))
+                    file_path = _unwrap_singleton_list(sample_data_dict.pop('file_path'))
+                    sample_data_dict = data_dict_to_cuda(sample_data_dict, device=timing_device)
+                    _sync_timing_device(timing_device)
+                    start_time = time.perf_counter()
+                    track_instances = tracker.detect(vis=args.vis, data=sample_data_dict, track_instances=track_instances, info=info,
+                                                     prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh,
+                                                     miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
+                                                     file_path=file_path)
+                    _sync_timing_device(timing_device)
+                    total_detect_time += time.perf_counter() - start_time
+                    processed_frames += 1
+    finally:
+        tracker.close_visualization_writers()
 
     timing_stats_device = timing_device if timing_device.type == "cuda" else torch.device("cpu")
     timing_stats = torch.tensor([total_detect_time, processed_frames], dtype=torch.float64, device=timing_stats_device)

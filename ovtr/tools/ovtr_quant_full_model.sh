@@ -111,6 +111,7 @@ elif [ "${QUANT_MODE}" = "ptq" ]; then
         --ious_thresh ${IOUS_THRESH}
         --miss_tolerance 5 5 5 5 5 5 5
         --maximum_quantity 160
+        --vis
         --result_path_track "${RESULT_PATH}"
         --vis_output "${VIS_OUTPUT}"
     )
