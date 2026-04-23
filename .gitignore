@@ -24,6 +24,8 @@ outputs/
 runs/
 wandb/
 tensorboard/
+results/
+weights/
 
 # Checkpoints
 checkpoints/

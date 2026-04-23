@@ -59,6 +59,15 @@ def add_quant_args(parser) -> None:
         action="store_true",
         help="step the learning-rate scheduler during QAT fine-tuning",
     )
+    parser.add_argument(
+        "--quant_qat_allow_batch",
+        action="store_true",
+        help=(
+            "experimental: for batch_size > 1, disable the QAT-only checkpoint forcing "
+            "while keeping fixed 5-frame sampling so the batched MOT path can run when "
+            "the config supports it; ignored when batch_size <= 1"
+        ),
+    )
 
 
 def _first_or_default(value, default):

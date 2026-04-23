@@ -20,6 +20,7 @@ QAT_LR="${QAT_LR:-4e-5}"
 QAT_LR_BACKBONE="${QAT_LR_BACKBONE:-4e-6}"
 QUANT_USE_SCHEDULER="${QUANT_USE_SCHEDULER:-0}"
 QUANT_CALIBRATION_ONLY="${QUANT_CALIBRATION_ONLY:-0}"
+QAT_ALLOW_BATCH="${QAT_ALLOW_BATCH:-0}"
 
 if [ "${QUANT_MODE}" = "qat" ]; then
     CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
@@ -94,6 +95,9 @@ if [ "${QUANT_MODE}" = "qat" ]; then
     fi
     if [ "${QUANT_CALIBRATION_ONLY}" = "1" ]; then
         CMD+=(--quant_calibration_only)
+    fi
+    if [ "${QAT_ALLOW_BATCH}" = "1" ]; then
+        CMD+=(--quant_qat_allow_batch)
     fi
 elif [ "${QUANT_MODE}" = "ptq" ]; then
     CMD=(

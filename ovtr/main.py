@@ -229,14 +229,28 @@ def main(args):
     if args.quant_mode == "qat":
         args.sampler_steps = []
         args.sampler_lengths = [5]
-        if not getattr(cfg, "use_transformer_ckpt", False):
-            cfg.use_transformer_ckpt = True
-        if not getattr(cfg, "use_checkpoint_track", False):
-            cfg.use_checkpoint_track = True
-        print(
-            "[Quant] Enabling transformer checkpointing and frame-wise checkpointing for QAT",
-            flush=True,
-        )
+        allow_batched_qat = args.quant_qat_allow_batch and args.batch_size > 1
+        if allow_batched_qat:
+            cfg.use_transformer_ckpt = False
+            cfg.use_checkpoint_track = False
+            print(
+                "[Quant] Experimental QAT batch mode enabled for batch_size > 1; checkpoint forcing is disabled.",
+                flush=True,
+            )
+        else:
+            if args.quant_qat_allow_batch and args.batch_size <= 1:
+                print(
+                    "[Quant] Ignoring quant_qat_allow_batch because batch_size <= 1; keeping QAT checkpointing enabled.",
+                    flush=True,
+                )
+            if not getattr(cfg, "use_transformer_ckpt", False):
+                cfg.use_transformer_ckpt = True
+            if not getattr(cfg, "use_checkpoint_track", False):
+                cfg.use_checkpoint_track = True
+            print(
+                "[Quant] Enabling transformer checkpointing and frame-wise checkpointing for QAT",
+                flush=True,
+            )
         print("[Quant] Forcing QAT training to fixed 5-frame sampling", flush=True)
 
     ddp_debug("before build_model")
