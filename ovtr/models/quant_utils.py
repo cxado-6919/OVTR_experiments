@@ -656,7 +656,26 @@ def _is_exp_a2_trainable_param(name: str) -> bool:
     )
 
 
-def _is_exp_a3_trainable_param(name: str) -> bool:
+def _is_exp_a3_output_head_param(name: str) -> bool:
+    return (
+        name.startswith("transformer.decoder.bbox_embed")
+        or name.startswith("feature_align")
+        or name in {
+            "transformer.decoder.log_scale",
+            "transformer.decoder.bias_lang",
+            "transformer.decoder.bias0",
+        }
+    )
+
+
+def _is_exp_a3_output_head_module(name: str) -> bool:
+    return (
+        name.startswith("transformer.decoder.bbox_embed")
+        or name.startswith("feature_align")
+    )
+
+
+def _is_exp_a3_full_trainable_param(name: str) -> bool:
     return (
         name.startswith("transformer.decoder")
         or name.startswith("transformer.tgt_embed")
@@ -664,11 +683,15 @@ def _is_exp_a3_trainable_param(name: str) -> bool:
     )
 
 
+def _is_exp_a3_trainable_param(name: str) -> bool:
+    return _is_exp_a3_full_trainable_param(name) and not _is_exp_a3_output_head_param(name)
+
+
 def _is_exp_a_trainable_param(name: str) -> bool:
     return (
         _is_exp_a1_trainable_param(name)
         or _is_exp_a2_trainable_param(name)
-        or _is_exp_a3_trainable_param(name)
+        or _is_exp_a3_full_trainable_param(name)
     )
 
 
@@ -806,6 +829,8 @@ class OVTRQuantController:
                 return False
 
         if self.partition in {"exp_a", "exp_a3"}:
+            if self.partition == "exp_a3" and _is_exp_a3_output_head_module(name):
+                return False
             if (
                 name.startswith("transformer.decoder")
                 or name.startswith("transformer.tgt_embed")
