@@ -660,11 +660,6 @@ def _is_exp_a3_output_head_param(name: str) -> bool:
     return (
         name.startswith("transformer.decoder.bbox_embed")
         or name.startswith("feature_align")
-        or name in {
-            "transformer.decoder.log_scale",
-            "transformer.decoder.bias_lang",
-            "transformer.decoder.bias0",
-        }
     )
 
 
