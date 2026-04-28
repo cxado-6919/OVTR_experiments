@@ -8,7 +8,7 @@ cd "${PROJECT_DIR}"
 
 MODEL_VARIANT="${MODEL_VARIANT:-lite}"
 QUANT_MODE="${QUANT_MODE:-ptq}"
-# Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_b
+# Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_a3_head, exp_b
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a}"
 MASTER_PORT="${MASTER_PORT:-9987}"
 OUTPUT="${OUTPUT:-./results_quant}"

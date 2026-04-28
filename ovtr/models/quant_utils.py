@@ -631,7 +631,7 @@ def _is_quant_module(module: nn.Module) -> bool:
     return isinstance(module, (nn.Conv2d, nn.Linear, nn.MultiheadAttention, nn.Embedding)) or _is_msda(module)
 
 
-SUPPORTED_QUANT_PARTITIONS = ("exp_a", "exp_a1", "exp_a2", "exp_a3", "exp_b")
+SUPPORTED_QUANT_PARTITIONS = ("exp_a", "exp_a1", "exp_a2", "exp_a3", "exp_a3_head", "exp_b")
 
 
 def _is_encoder_aggregation_param(name: str) -> bool:
@@ -680,6 +680,10 @@ def _is_exp_a3_full_trainable_param(name: str) -> bool:
 
 def _is_exp_a3_trainable_param(name: str) -> bool:
     return _is_exp_a3_full_trainable_param(name) and not _is_exp_a3_output_head_param(name)
+
+
+def _is_exp_a3_head_trainable_param(name: str) -> bool:
+    return _is_exp_a3_full_trainable_param(name)
 
 
 def _is_exp_a_trainable_param(name: str) -> bool:
@@ -823,7 +827,7 @@ class OVTRQuantController:
             if self.partition == "exp_a2":
                 return False
 
-        if self.partition in {"exp_a", "exp_a3"}:
+        if self.partition in {"exp_a", "exp_a3", "exp_a3_head"}:
             if self.partition == "exp_a3" and _is_exp_a3_output_head_module(name):
                 return False
             if (
@@ -832,7 +836,7 @@ class OVTRQuantController:
                 or name.startswith("feature_align")
             ):
                 return True
-            if self.partition == "exp_a3":
+            if self.partition in {"exp_a3", "exp_a3_head"}:
                 return False
 
         if self.partition == "exp_a":
@@ -1448,6 +1452,8 @@ def is_partition_trainable_param(name: str, partition: str) -> bool:
         return _is_exp_a2_trainable_param(name)
     if partition == "exp_a3":
         return _is_exp_a3_trainable_param(name)
+    if partition == "exp_a3_head":
+        return _is_exp_a3_head_trainable_param(name)
     if partition == "exp_b":
         return _is_exp_b_trainable_param(name)
     raise ValueError(f"Unsupported partition: {partition}")
