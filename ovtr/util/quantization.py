@@ -1,9 +1,12 @@
 import copy
+import hashlib
+import math
 from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from datasets import build_dataset
@@ -30,6 +33,41 @@ def add_quant_args(parser) -> None:
         default=512,
         type=int,
         help="number of calibration samples to use for min-max calibration",
+    )
+    parser.add_argument(
+        "--quant_calib_sequence_length",
+        default=3,
+        type=int,
+        help="number of deterministic pseudo-video frames generated per LVIS calibration image",
+    )
+    parser.add_argument(
+        "--quant_calib_max_translate",
+        default=0.08,
+        type=float,
+        help="maximum pseudo-sequence translation as an image-size fraction",
+    )
+    parser.add_argument(
+        "--quant_calib_max_rotate",
+        default=6.0,
+        type=float,
+        help="maximum pseudo-sequence rotation in degrees",
+    )
+    parser.add_argument(
+        "--quant_calib_scale_jitter",
+        default=0.08,
+        type=float,
+        help="maximum pseudo-sequence multiplicative scale jitter around 1.0",
+    )
+    parser.add_argument(
+        "--quant_calib_motion_blur",
+        default=3,
+        type=int,
+        help="odd motion-blur kernel size for pseudo-sequence calibration; <=1 disables blur",
+    )
+    parser.add_argument(
+        "--quant_disable_pseudo_sequence_calib",
+        action="store_true",
+        help="disable pseudo-sequence calibration and use the legacy static-frame calibration path",
     )
     parser.add_argument(
         "--quant_calibration_only",
@@ -104,6 +142,125 @@ def _unwrap_singleton_list(value):
     while isinstance(value, list) and len(value) == 1:
         value = value[0]
     return value
+
+
+def _stable_unit_values(seed: int, key: str, count: int):
+    digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
+    values = []
+    offset = 0
+    while len(values) < count:
+        if offset + 4 > len(digest):
+            digest = hashlib.sha256(digest).digest()
+            offset = 0
+        raw = int.from_bytes(digest[offset:offset + 4], byteorder="little", signed=False)
+        values.append((raw / float(2**32 - 1)) * 2.0 - 1.0)
+        offset += 4
+    return values
+
+
+def _pseudo_sequence_enabled(args) -> bool:
+    return args is not None and not getattr(args, "quant_disable_pseudo_sequence_calib", False)
+
+
+def _pseudo_sequence_length(args) -> int:
+    if not _pseudo_sequence_enabled(args):
+        return 1
+    return max(1, int(getattr(args, "quant_calib_sequence_length", 3)))
+
+
+def _clone_sample_for_pseudo_frame(sample_data_dict, image: torch.Tensor):
+    pseudo_data = dict(sample_data_dict)
+    pseudo_data["imgs"] = [image]
+    return pseudo_data
+
+
+def _apply_motion_blur(image: torch.Tensor, kernel_size: int, horizontal: bool) -> torch.Tensor:
+    if kernel_size <= 1:
+        return image
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    channels = image.shape[0]
+    kernel = image.new_zeros((channels, 1, kernel_size, kernel_size))
+    if horizontal:
+        kernel[:, 0, kernel_size // 2, :] = 1.0 / float(kernel_size)
+    else:
+        kernel[:, 0, :, kernel_size // 2] = 1.0 / float(kernel_size)
+    return F.conv2d(
+        image.unsqueeze(0),
+        kernel,
+        padding=kernel_size // 2,
+        groups=channels,
+    ).squeeze(0)
+
+
+def _augment_pseudo_calibration_image(
+    image: torch.Tensor,
+    *,
+    frame_index: int,
+    sequence_length: int,
+    file_path: str,
+    args,
+) -> torch.Tensor:
+    if frame_index == 0 or sequence_length <= 1:
+        return image.clone()
+
+    alpha = float(frame_index) / float(max(sequence_length - 1, 1))
+    seed = int(getattr(args, "seed", 0))
+    tx_sign, ty_sign, rot_sign, scale_sign, blur_sign = _stable_unit_values(seed, file_path, 5)
+    translate = float(getattr(args, "quant_calib_max_translate", 0.08))
+    max_rotate = float(getattr(args, "quant_calib_max_rotate", 6.0))
+    scale_jitter = float(getattr(args, "quant_calib_scale_jitter", 0.08))
+
+    tx = 2.0 * translate * tx_sign * alpha
+    ty = 2.0 * translate * ty_sign * alpha
+    rotate = math.radians(max_rotate * rot_sign * alpha)
+    scale = max(0.1, 1.0 + scale_jitter * scale_sign * alpha)
+    cos_r = math.cos(rotate) * scale
+    sin_r = math.sin(rotate) * scale
+    theta = image.new_tensor([[cos_r, -sin_r, tx], [sin_r, cos_r, ty]]).unsqueeze(0)
+    grid = F.affine_grid(
+        theta,
+        size=(1, image.shape[0], image.shape[1], image.shape[2]),
+        align_corners=False,
+    )
+    augmented = F.grid_sample(
+        image.unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    ).squeeze(0)
+
+    blur_kernel = int(getattr(args, "quant_calib_motion_blur", 3))
+    if blur_kernel > 1 and frame_index > 0:
+        augmented = _apply_motion_blur(augmented, blur_kernel, horizontal=blur_sign >= 0)
+    return augmented
+
+
+def _iter_pseudo_calibration_frames(sample_data_dict, file_path: str, args):
+    sequence_length = _pseudo_sequence_length(args)
+    base_image = sample_data_dict["imgs"][0]
+    for frame_index in range(sequence_length):
+        image = _augment_pseudo_calibration_image(
+            base_image,
+            frame_index=frame_index,
+            sequence_length=sequence_length,
+            file_path=file_path,
+            args=args,
+        )
+        yield frame_index, _clone_sample_for_pseudo_frame(sample_data_dict, image)
+
+
+def _format_cfg_path(path_value) -> str:
+    if path_value is None:
+        return "N/A"
+    if isinstance(path_value, (list, tuple)):
+        return ", ".join(str(item) for item in path_value)
+    return str(path_value)
+
+
+def _path_mentions_tao(path_value) -> bool:
+    return "tao" in _format_cfg_path(path_value).lower()
 
 
 def _configure_tracking_thresholds_for_calibration(model_ref, args) -> None:
@@ -188,6 +345,9 @@ def build_quant_calibration_loader(args, cfg):
     calib_cfg, calib_source = _resolve_calibration_config(cfg)
     dataset_val = build_dataset(image_set="val", args=args, cfg=calib_cfg)
     dataset_val.quant_calibration_description = calib_source
+    dataset_val.quant_calibration_ann_file = _cfg_get(calib_cfg, "ann_file")
+    if hasattr(cfg, "data") and hasattr(cfg.data, "train"):
+        dataset_val.quant_qat_train_ann_file = _cfg_get(cfg.data.train, "ann_file")
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     data_loader = DataLoader(
         dataset_val,
@@ -199,6 +359,8 @@ def build_quant_calibration_loader(args, cfg):
         pin_memory=True,
     )
     data_loader.quant_calibration_description = calib_source
+    data_loader.quant_calibration_ann_file = getattr(dataset_val, "quant_calibration_ann_file", None)
+    data_loader.quant_qat_train_ann_file = getattr(dataset_val, "quant_qat_train_ann_file", None)
     return data_loader
 
 
@@ -232,39 +394,74 @@ def calibrate_quant_controller_on_val_loader(
 
     calibrated = 0
     if utils.is_main_process():
-        track_instances = None
-        prev_file_path = None
         calibration_description = getattr(
             data_loader,
             "quant_calibration_description",
             getattr(data_loader.dataset, "quant_calibration_description", "calibration dataset"),
         )
+        calibration_ann_file = getattr(data_loader, "quant_calibration_ann_file", None)
+        qat_train_ann_file = getattr(data_loader, "quant_qat_train_ann_file", None)
+        sequence_length = _pseudo_sequence_length(args)
+        total_frames = num_samples * sequence_length
+        if sequence_length > 1:
+            print(
+                f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
+                f"{calibration_description} base images x {sequence_length} pseudo frames "
+                f"({total_frames} observer frames)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
+                f"{calibration_description} static frames",
+                flush=True,
+            )
         print(
-            f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} {calibration_description} samples",
+            f"[Quant] Calibration annotation source: "
+            f"{_format_cfg_path(calibration_ann_file)}",
             flush=True,
         )
+        print(
+            f"[Quant] QAT fine-tuning annotation source: "
+            f"{_format_cfg_path(qat_train_ann_file)}",
+            flush=True,
+        )
+        if _path_mentions_tao(calibration_ann_file) or _path_mentions_tao(qat_train_ann_file):
+            print(
+                "[Quant] WARNING: TAO path detected in calibration or QAT training source; "
+                "the LVIS-only quantization protocol is not satisfied.",
+                flush=True,
+            )
+        else:
+            print(
+                "[Quant] TAO validation/test data is excluded from calibration and QAT fine-tuning",
+                flush=True,
+            )
+
         for data_dict in data_loader:
             sample_dicts = _split_mot_batch(dict(data_dict))
             for sample_data_dict in sample_dicts:
                 info = _unwrap_singleton_list(sample_data_dict.pop("info"))
                 file_path = _unwrap_singleton_list(sample_data_dict.pop("file_path"))
-                frame_id = info[0]
-                if frame_id == 0 or file_path != prev_file_path:
-                    track_instances = None
                 sample_data_dict = data_dict_to_cuda(sample_data_dict, device)
-                result = model_ref.inference_single_image(
+                track_instances = None
+                for frame_id, pseudo_data_dict in _iter_pseudo_calibration_frames(
                     sample_data_dict,
-                    track_instances=track_instances,
-                    frame_id=frame_id,
-                    ori_img_size=info[1],
-                )
-                track_instances = result["track_instances"]
-                if track_instances is not None:
-                    if track_instances.has("boxes"):
-                        track_instances.remove("boxes")
-                    if track_instances.has("labels"):
-                        track_instances.remove("labels")
-                prev_file_path = file_path
+                    file_path,
+                    args,
+                ):
+                    result = model_ref.inference_single_image(
+                        pseudo_data_dict,
+                        track_instances=track_instances,
+                        frame_id=frame_id,
+                        ori_img_size=info[1],
+                    )
+                    track_instances = result["track_instances"]
+                    if track_instances is not None:
+                        if track_instances.has("boxes"):
+                            track_instances.remove("boxes")
+                        if track_instances.has("labels"):
+                            track_instances.remove("labels")
                 calibrated += 1
                 if calibrated >= num_samples:
                     break
