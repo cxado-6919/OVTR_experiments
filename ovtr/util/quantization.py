@@ -259,10 +259,6 @@ def _format_cfg_path(path_value) -> str:
     return str(path_value)
 
 
-def _path_mentions_tao(path_value) -> bool:
-    return "tao" in _format_cfg_path(path_value).lower()
-
-
 def _configure_tracking_thresholds_for_calibration(model_ref, args) -> None:
     model_ref.track_base.score_thresh = _first_or_default(getattr(args, "score_thresh", None), 0.5)
     model_ref.track_base.filter_score_thresh = _first_or_default(
@@ -309,24 +305,15 @@ def _cfg_set(cfg_obj, key, value) -> None:
 
 
 def _resolve_calibration_config(cfg):
-    calib_cfg = None
-    calib_source = None
-    if hasattr(cfg.data, "calib"):
-        calib_cfg = copy.deepcopy(cfg.data.calib)
-        calib_source = "held-out LVIS calibration"
-    elif hasattr(cfg.data, "test"):
-        calib_cfg = copy.deepcopy(cfg.data.test)
-        calib_source = "evaluation dataset"
-    elif hasattr(cfg.data, "val"):
-        calib_cfg = copy.deepcopy(cfg.data.val)
-        calib_source = "validation dataset"
-    else:
+    if not hasattr(cfg.data, "calib"):
         raise AttributeError(
-            "Configuration must provide cfg.data.calib, cfg.data.test, or cfg.data.val for quant calibration."
+            "Configuration must provide cfg.data.calib for quant calibration."
         )
 
+    calib_cfg = copy.deepcopy(cfg.data.calib)
+    calib_source = "held-out LVIS calibration"
     calib_ann_file = _cfg_get(calib_cfg, "ann_file")
-    if calib_source == "held-out LVIS calibration" and calib_ann_file is not None:
+    if calib_ann_file is not None:
         ann_files = calib_ann_file if isinstance(calib_ann_file, (list, tuple)) else [calib_ann_file]
         missing_files = [ann_file for ann_file in ann_files if not Path(ann_file).exists()]
         if missing_files:
@@ -346,8 +333,6 @@ def build_quant_calibration_loader(args, cfg):
     dataset_val = build_dataset(image_set="val", args=args, cfg=calib_cfg)
     dataset_val.quant_calibration_description = calib_source
     dataset_val.quant_calibration_ann_file = _cfg_get(calib_cfg, "ann_file")
-    if hasattr(cfg, "data") and hasattr(cfg.data, "train"):
-        dataset_val.quant_qat_train_ann_file = _cfg_get(cfg.data.train, "ann_file")
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     data_loader = DataLoader(
         dataset_val,
@@ -360,7 +345,6 @@ def build_quant_calibration_loader(args, cfg):
     )
     data_loader.quant_calibration_description = calib_source
     data_loader.quant_calibration_ann_file = getattr(dataset_val, "quant_calibration_ann_file", None)
-    data_loader.quant_qat_train_ann_file = getattr(dataset_val, "quant_qat_train_ann_file", None)
     return data_loader
 
 
@@ -400,7 +384,6 @@ def calibrate_quant_controller_on_val_loader(
             getattr(data_loader.dataset, "quant_calibration_description", "calibration dataset"),
         )
         calibration_ann_file = getattr(data_loader, "quant_calibration_ann_file", None)
-        qat_train_ann_file = getattr(data_loader, "quant_qat_train_ann_file", None)
         sequence_length = _pseudo_sequence_length(args)
         total_frames = num_samples * sequence_length
         if sequence_length > 1:
@@ -421,22 +404,6 @@ def calibrate_quant_controller_on_val_loader(
             f"{_format_cfg_path(calibration_ann_file)}",
             flush=True,
         )
-        print(
-            f"[Quant] QAT fine-tuning annotation source: "
-            f"{_format_cfg_path(qat_train_ann_file)}",
-            flush=True,
-        )
-        if _path_mentions_tao(calibration_ann_file) or _path_mentions_tao(qat_train_ann_file):
-            print(
-                "[Quant] WARNING: TAO path detected in calibration or QAT training source; "
-                "the LVIS-only quantization protocol is not satisfied.",
-                flush=True,
-            )
-        else:
-            print(
-                "[Quant] TAO validation/test data is excluded from calibration and QAT fine-tuning",
-                flush=True,
-            )
 
         for data_dict in data_loader:
             sample_dicts = _split_mot_batch(dict(data_dict))
