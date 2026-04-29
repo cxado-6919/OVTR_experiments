@@ -37,6 +37,7 @@ from util.quantization import (
     build_quant_calibration_loader,
     calibrate_quant_controller_on_val_loader,
     enable_loaded_quantization,
+    prepare_quant_model_for_calibration,
     setup_quant_controller,
 )
 from main import get_args_parser
@@ -438,6 +439,12 @@ def eval(args, cfg):
     quant_state_loaded = False
     if quant_controller is not None:
         quant_state_loaded = enable_loaded_quantization(model, require_state=False)
+        if not quant_state_loaded:
+            prepare_quant_model_for_calibration(
+                model,
+                args,
+                quant_state_loaded=quant_state_loaded,
+            )
     model.eval()
     model = model.to(torch.device(args.device))
 

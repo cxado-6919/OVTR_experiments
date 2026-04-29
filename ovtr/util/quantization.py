@@ -29,6 +29,87 @@ def add_quant_args(parser) -> None:
         help="module partition to quantize (supported backends patch Conv2d/Linear/MSDA only)",
     )
     parser.add_argument(
+        "--quant_pipeline",
+        default="standard",
+        choices=["standard", "legacy"],
+        help="quantization preparation pipeline; legacy keeps the previous min-max flow",
+    )
+    parser.add_argument(
+        "--quant_range_method",
+        default=None,
+        choices=["mse", "minmax"],
+        help="range estimator; defaults to mse for standard and minmax for legacy",
+    )
+    parser.add_argument(
+        "--quant_bn_folding",
+        dest="quant_bn_folding",
+        action="store_true",
+        default=None,
+        help="fold FrozenBatchNorm2d into preceding Conv2d before quantization",
+    )
+    parser.add_argument(
+        "--quant_no_bn_folding",
+        dest="quant_bn_folding",
+        action="store_false",
+        help="disable quantization BN folding",
+    )
+    parser.add_argument(
+        "--quant_cle",
+        dest="quant_cle",
+        action="store_true",
+        default=None,
+        help="apply safe cross-layer equalization before quantization",
+    )
+    parser.add_argument(
+        "--quant_no_cle",
+        dest="quant_cle",
+        action="store_false",
+        help="disable cross-layer equalization",
+    )
+    parser.add_argument(
+        "--quant_adaround",
+        dest="quant_adaround",
+        action="store_true",
+        default=None,
+        help="apply AdaRound-style weight rounding before calibration",
+    )
+    parser.add_argument(
+        "--quant_no_adaround",
+        dest="quant_adaround",
+        action="store_false",
+        help="disable AdaRound-style weight rounding",
+    )
+    parser.add_argument(
+        "--quant_adaround_samples",
+        default=128,
+        type=int,
+        help="maximum calibration samples used by AdaRound-style rounding",
+    )
+    parser.add_argument(
+        "--quant_adaround_iters",
+        default=1000,
+        type=int,
+        help="optimization iterations budget for AdaRound-style rounding",
+    )
+    parser.add_argument(
+        "--quant_mse_bins",
+        default=2048,
+        type=int,
+        help="histogram bins budget for MSE range estimation",
+    )
+    parser.add_argument(
+        "--quant_mse_candidates",
+        default=80,
+        type=int,
+        help="number of clipping candidates for MSE range estimation",
+    )
+    parser.add_argument(
+        "--quant_bias_correction",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="bias correction policy; auto uses it when AdaRound is disabled or unavailable",
+    )
+    parser.add_argument(
         "--quant_calib_samples",
         default=512,
         type=int,
@@ -259,6 +340,139 @@ def _format_cfg_path(path_value) -> str:
     return str(path_value)
 
 
+def resolve_quant_args(args) -> None:
+    if args is None:
+        return
+    pipeline = getattr(args, "quant_pipeline", "standard")
+    if getattr(args, "quant_range_method", None) is None:
+        args.quant_range_method = "mse" if pipeline == "standard" else "minmax"
+    if getattr(args, "quant_bn_folding", None) is None:
+        args.quant_bn_folding = pipeline == "standard"
+    if getattr(args, "quant_cle", None) is None:
+        args.quant_cle = pipeline == "standard"
+    if getattr(args, "quant_adaround", None) is None:
+        args.quant_adaround = pipeline == "standard"
+    if not hasattr(args, "quant_mse_candidates"):
+        args.quant_mse_candidates = 80
+    if not hasattr(args, "quant_mse_bins"):
+        args.quant_mse_bins = 2048
+    if not hasattr(args, "quant_adaround_iters"):
+        args.quant_adaround_iters = 1000
+    if not hasattr(args, "quant_adaround_samples"):
+        args.quant_adaround_samples = 128
+    if not hasattr(args, "quant_bias_correction"):
+        args.quant_bias_correction = "auto"
+
+
+@torch.no_grad()
+def _fold_frozen_batch_norms(model_ref: torch.nn.Module) -> int:
+    folded = 0
+    eps = 1e-5
+    for parent in model_ref.modules():
+        children = list(parent.named_children())
+        for (_, conv), (_, bn) in zip(children, children[1:]):
+            if not isinstance(conv, torch.nn.Conv2d):
+                continue
+            if bn.__class__.__name__ != "FrozenBatchNorm2d":
+                continue
+            weight = bn.weight.to(device=conv.weight.device, dtype=conv.weight.dtype)
+            bias = bn.bias.to(device=conv.weight.device, dtype=conv.weight.dtype)
+            running_mean = bn.running_mean.to(device=conv.weight.device, dtype=conv.weight.dtype)
+            running_var = bn.running_var.to(device=conv.weight.device, dtype=conv.weight.dtype)
+            scale = weight * (running_var + eps).rsqrt()
+            folded_bias = bias - running_mean * scale
+            conv.weight.mul_(scale.reshape(-1, 1, 1, 1))
+            if conv.bias is None:
+                conv.bias = torch.nn.Parameter(folded_bias.clone(), requires_grad=False)
+            else:
+                conv.bias.mul_(scale).add_(folded_bias)
+            bn.weight.fill_(1.0)
+            bn.bias.zero_()
+            bn.running_mean.zero_()
+            bn.running_var.fill_(1.0 - eps)
+            folded += 1
+    return folded
+
+
+@torch.no_grad()
+def _equalize_linear_pair(first: torch.nn.Linear, second: torch.nn.Linear) -> bool:
+    if first.out_features != second.in_features:
+        return False
+    first_range = first.weight.detach().abs().amax(dim=1).clamp(min=1e-8)
+    second_range = second.weight.detach().abs().amax(dim=0).clamp(min=1e-8)
+    scale = torch.sqrt(second_range / first_range).clamp(0.1, 10.0)
+    first.weight.mul_(scale.reshape(-1, 1))
+    if first.bias is not None:
+        first.bias.mul_(scale)
+    second.weight.div_(scale.reshape(1, -1))
+    return True
+
+
+@torch.no_grad()
+def _equalize_conv_pair(first: torch.nn.Conv2d, second: torch.nn.Conv2d) -> bool:
+    if first.out_channels != second.in_channels or first.groups != 1 or second.groups != 1:
+        return False
+    first_range = first.weight.detach().abs().amax(dim=(1, 2, 3)).clamp(min=1e-8)
+    second_range = second.weight.detach().abs().amax(dim=(0, 2, 3)).clamp(min=1e-8)
+    scale = torch.sqrt(second_range / first_range).clamp(0.1, 10.0)
+    first.weight.mul_(scale.reshape(-1, 1, 1, 1))
+    if first.bias is not None:
+        first.bias.mul_(scale)
+    second.weight.div_(scale.reshape(1, -1, 1, 1))
+    return True
+
+
+def _apply_safe_cross_layer_equalization(model_ref: torch.nn.Module) -> int:
+    equalized = 0
+    for parent in model_ref.modules():
+        if not isinstance(parent, torch.nn.Sequential):
+            continue
+        children = list(parent.children())
+        for first, second in zip(children, children[1:]):
+            if isinstance(first, torch.nn.Linear) and isinstance(second, torch.nn.Linear):
+                equalized += int(_equalize_linear_pair(first, second))
+            elif isinstance(first, torch.nn.Conv2d) and isinstance(second, torch.nn.Conv2d):
+                equalized += int(_equalize_conv_pair(first, second))
+    return equalized
+
+
+def _should_run_bias_correction(args) -> bool:
+    bias_policy = getattr(args, "quant_bias_correction", "auto")
+    return bias_policy == "on" or (bias_policy == "auto" and not getattr(args, "quant_adaround", False))
+
+
+def prepare_quant_model_for_calibration(model: torch.nn.Module, args, *, quant_state_loaded: bool = False) -> None:
+    if getattr(args, "quant_mode", "none") == "none" or quant_state_loaded:
+        return
+    resolve_quant_args(args)
+    if getattr(args, "quant_pipeline", "standard") != "standard":
+        return
+
+    model_ref = unwrap_model(model)
+    if getattr(args, "quant_bn_folding", False):
+        folded = _fold_frozen_batch_norms(model_ref)
+        if utils.is_main_process() and folded:
+            print(f"[Quant] Folded {folded} FrozenBatchNorm2d modules into Conv2d", flush=True)
+    if getattr(args, "quant_cle", False):
+        equalized = _apply_safe_cross_layer_equalization(model_ref)
+        if utils.is_main_process() and equalized:
+            print(f"[Quant] Applied cross-layer equalization to {equalized} adjacent module pairs", flush=True)
+
+    controller = getattr(model_ref, "_ovtr_quant_controller", None)
+    if controller is not None and getattr(args, "quant_adaround", False):
+        updated = controller.apply_adaround(
+            num_iters=getattr(args, "quant_adaround_iters", 1000),
+            num_samples=getattr(args, "quant_adaround_samples", 128),
+        )
+        if utils.is_main_process() and updated:
+            print(f"[Quant] Applied AdaRound-style weight rounding to {updated} modules", flush=True)
+
+    if controller is not None and _should_run_bias_correction(args):
+        corrected = controller.apply_bias_correction()
+        if utils.is_main_process() and corrected:
+            print(f"[Quant] Materialized bias terms for {corrected} modules", flush=True)
+
+
 def _configure_tracking_thresholds_for_calibration(model_ref, args) -> None:
     model_ref.track_base.score_thresh = _first_or_default(getattr(args, "score_thresh", None), 0.5)
     model_ref.track_base.filter_score_thresh = _first_or_default(
@@ -276,6 +490,7 @@ def setup_quant_controller(model: torch.nn.Module, args) -> Optional[object]:
     if getattr(args, "quant_mode", "none") == "none":
         return None
 
+    resolve_quant_args(args)
     model_ref = unwrap_model(model)
     controller = maybe_prepare_ovtr_quant_controller(
         model_ref,
@@ -284,6 +499,9 @@ def setup_quant_controller(model: torch.nn.Module, args) -> Optional[object]:
         weight_bits=args.quant_weight_bits,
         activation_bits=args.quant_activation_bits,
         attention_bits=args.quant_attention_bits,
+        range_method=args.quant_range_method,
+        mse_candidates=args.quant_mse_candidates,
+        mse_bins=args.quant_mse_bins,
     )
     print(f"[Quant] {controller.summary()}", flush=True)
     return controller
@@ -357,6 +575,76 @@ def _broadcast_quant_state(controller) -> None:
     controller.load_exported_state_dict(payload[0])
 
 
+def _register_bias_correction_hooks(controller):
+    stats = {}
+    handles = []
+
+    def _hook(module, inputs, output):
+        if not inputs or not isinstance(inputs[0], torch.Tensor) or not isinstance(output, torch.Tensor):
+            return
+        x = inputs[0].detach()
+        quantized_out = output.detach()
+        if isinstance(module, torch.nn.Conv2d):
+            fp_out = F.conv2d(
+                x,
+                module.weight,
+                module.bias,
+                module.stride,
+                module.padding,
+                module.dilation,
+                module.groups,
+            )
+            if fp_out.shape != quantized_out.shape or fp_out.ndim < 2:
+                return
+            reduce_dims = (0,) + tuple(range(2, fp_out.ndim))
+            error_sum = (fp_out - quantized_out).sum(dim=reduce_dims)
+            count = float((fp_out.numel() // max(fp_out.shape[1], 1)))
+        elif isinstance(module, torch.nn.Linear):
+            fp_out = F.linear(x, module.weight, module.bias)
+            if fp_out.shape != quantized_out.shape or fp_out.ndim == 0:
+                return
+            reduce_dims = tuple(range(fp_out.ndim - 1))
+            error_sum = (fp_out - quantized_out).sum(dim=reduce_dims)
+            count = float((fp_out.numel() // max(fp_out.shape[-1], 1)))
+        else:
+            return
+
+        if not torch.isfinite(error_sum).all() or count <= 0:
+            return
+        if module not in stats:
+            stats[module] = [
+                torch.zeros_like(error_sum),
+                torch.tensor(0.0, device=error_sum.device, dtype=error_sum.dtype),
+            ]
+        stats[module][0].add_(error_sum)
+        stats[module][1].add_(count)
+
+    for module in controller.quant_modules:
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+            handles.append(module.register_forward_hook(_hook))
+    return stats, handles
+
+
+def _finalize_bias_correction_stats(stats) -> dict:
+    corrections = {}
+    for module, (error_sum, count) in stats.items():
+        if count.item() <= 0:
+            continue
+        name = getattr(module, "_ovtr_quant_name", None)
+        if not name:
+            continue
+        corrections[name] = (error_sum / count).detach().cpu()
+    return corrections
+
+
+def _broadcast_bias_corrections(corrections: dict) -> dict:
+    if not utils.is_dist_avail_and_initialized():
+        return corrections
+    payload = [corrections if utils.is_main_process() else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0] or {}
+
+
 @torch.no_grad()
 def calibrate_quant_controller_on_val_loader(
     model: torch.nn.Module,
@@ -377,64 +665,81 @@ def calibrate_quant_controller_on_val_loader(
         _configure_tracking_thresholds_for_calibration(model_ref, args)
 
     calibrated = 0
-    if utils.is_main_process():
-        calibration_description = getattr(
-            data_loader,
-            "quant_calibration_description",
-            getattr(data_loader.dataset, "quant_calibration_description", "calibration dataset"),
-        )
-        calibration_ann_file = getattr(data_loader, "quant_calibration_ann_file", None)
-        sequence_length = _pseudo_sequence_length(args)
-        total_frames = num_samples * sequence_length
-        if sequence_length > 1:
-            print(
-                f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
-                f"{calibration_description} base images x {sequence_length} pseudo frames "
-                f"({total_frames} observer frames)",
-                flush=True,
-            )
-        else:
-            print(
-                f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
-                f"{calibration_description} static frames",
-                flush=True,
-            )
-        print(
-            f"[Quant] Calibration annotation source: "
-            f"{_format_cfg_path(calibration_ann_file)}",
-            flush=True,
-        )
+    bias_stats = {}
+    bias_handles = []
+    if args is not None and _should_run_bias_correction(args):
+        bias_stats, bias_handles = _register_bias_correction_hooks(controller)
 
-        for data_dict in data_loader:
-            sample_dicts = _split_mot_batch(dict(data_dict))
-            for sample_data_dict in sample_dicts:
-                info = _unwrap_singleton_list(sample_data_dict.pop("info"))
-                file_path = _unwrap_singleton_list(sample_data_dict.pop("file_path"))
-                sample_data_dict = data_dict_to_cuda(sample_data_dict, device)
-                track_instances = None
-                for frame_id, pseudo_data_dict in _iter_pseudo_calibration_frames(
-                    sample_data_dict,
-                    file_path,
-                    args,
-                ):
-                    result = model_ref.inference_single_image(
-                        pseudo_data_dict,
-                        track_instances=track_instances,
-                        frame_id=frame_id,
-                        ori_img_size=info[1],
-                    )
-                    track_instances = result["track_instances"]
-                    if track_instances is not None:
-                        if track_instances.has("boxes"):
-                            track_instances.remove("boxes")
-                        if track_instances.has("labels"):
-                            track_instances.remove("labels")
-                calibrated += 1
+    try:
+        if utils.is_main_process():
+            calibration_description = getattr(
+                data_loader,
+                "quant_calibration_description",
+                getattr(data_loader.dataset, "quant_calibration_description", "calibration dataset"),
+            )
+            calibration_ann_file = getattr(data_loader, "quant_calibration_ann_file", None)
+            sequence_length = _pseudo_sequence_length(args)
+            total_frames = num_samples * sequence_length
+            if sequence_length > 1:
+                print(
+                    f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
+                    f"{calibration_description} base images x {sequence_length} pseudo frames "
+                    f"({total_frames} observer frames)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[Quant] Calibrating {controller.mode.upper()} on {num_samples} "
+                    f"{calibration_description} static frames",
+                    flush=True,
+                )
+            print(
+                f"[Quant] Calibration annotation source: "
+                f"{_format_cfg_path(calibration_ann_file)}",
+                flush=True,
+            )
+
+            for data_dict in data_loader:
+                sample_dicts = _split_mot_batch(dict(data_dict))
+                for sample_data_dict in sample_dicts:
+                    info = _unwrap_singleton_list(sample_data_dict.pop("info"))
+                    file_path = _unwrap_singleton_list(sample_data_dict.pop("file_path"))
+                    sample_data_dict = data_dict_to_cuda(sample_data_dict, device)
+                    track_instances = None
+                    for frame_id, pseudo_data_dict in _iter_pseudo_calibration_frames(
+                        sample_data_dict,
+                        file_path,
+                        args,
+                    ):
+                        result = model_ref.inference_single_image(
+                            pseudo_data_dict,
+                            track_instances=track_instances,
+                            frame_id=frame_id,
+                            ori_img_size=info[1],
+                        )
+                        track_instances = result["track_instances"]
+                        if track_instances is not None:
+                            if track_instances.has("boxes"):
+                                track_instances.remove("boxes")
+                            if track_instances.has("labels"):
+                                track_instances.remove("labels")
+                    calibrated += 1
+                    if calibrated >= num_samples:
+                        break
                 if calibrated >= num_samples:
                     break
-            if calibrated >= num_samples:
-                break
+    finally:
+        for handle in bias_handles:
+            handle.remove()
 
+    if args is not None and _should_run_bias_correction(args):
+        corrections = _finalize_bias_correction_stats(bias_stats) if utils.is_main_process() else {}
+        corrections = _broadcast_bias_corrections(corrections)
+        corrected = controller.apply_bias_corrections(corrections)
+        if utils.is_main_process() and corrected:
+            print(f"[Quant] Applied bias correction to {corrected} modules", flush=True)
+
+    controller.finalize_calibration()
     _broadcast_quant_state(controller)
     if was_training:
         model.train()

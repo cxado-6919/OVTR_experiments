@@ -25,6 +25,7 @@ from util.quantization import (
     build_quant_calibration_loader,
     calibrate_quant_controller_on_val_loader,
     enable_loaded_quantization,
+    prepare_quant_model_for_calibration,
     setup_quant_controller,
 )
 import util.misc as utils
@@ -33,6 +34,7 @@ from datasets import build_dataset
 from engine import train_one_epoch_mot
 from models import build_model
 from models.quant_utils import (
+    apply_ovtr_quant_state_dict,
     is_partition_trainable_param,
     is_quant_trainable_param,
 )
@@ -445,7 +447,8 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        model_state = apply_ovtr_quant_state_dict(model_without_ddp, checkpoint['model'])
+        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(model_state, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
@@ -493,6 +496,12 @@ def main(args):
     quant_state_loaded = False
     if quant_controller is not None:
         quant_state_loaded = enable_loaded_quantization(model_without_ddp, require_state=False)
+        if not quant_state_loaded:
+            prepare_quant_model_for_calibration(
+                model_without_ddp,
+                args,
+                quant_state_loaded=quant_state_loaded,
+            )
 
     if args.quant_mode == "ptq":
         if quant_controller is None:

@@ -36,6 +36,7 @@ from util.quantization import (
     build_quant_calibration_loader,
     calibrate_quant_controller_on_val_loader,
     enable_loaded_quantization,
+    prepare_quant_model_for_calibration,
     setup_quant_controller,
 )
 from util.slconfig import SLConfig
@@ -165,6 +166,12 @@ def build_loaded_model(args, cfg, device: torch.device, *, checkpoint_path: str,
     quant_state_loaded = False
     if quant_controller is not None:
         quant_state_loaded = enable_loaded_quantization(model, require_state=False)
+        if not quant_state_loaded:
+            prepare_quant_model_for_calibration(
+                model,
+                run_args,
+                quant_state_loaded=quant_state_loaded,
+            )
 
     if quant_mode == "ptq":
         if quant_controller is None:

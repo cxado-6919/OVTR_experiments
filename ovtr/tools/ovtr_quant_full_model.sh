@@ -8,6 +8,8 @@ cd "${PROJECT_DIR}"
 
 MODEL_VARIANT="${MODEL_VARIANT:-lite}"
 QUANT_MODE="${QUANT_MODE:-ptq}"
+QUANT_PIPELINE="${QUANT_PIPELINE:-standard}"
+QUANT_RANGE_METHOD="${QUANT_RANGE_METHOD:-}"
 # Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_a3_head, exp_b
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a}"
 MASTER_PORT="${MASTER_PORT:-9987}"
@@ -83,6 +85,7 @@ COMMON_ARGS=(
     --track_query_iteration CIP
     --calculate_negative_samples
     --quant_mode "${QUANT_MODE}"
+    --quant_pipeline "${QUANT_PIPELINE}"
     --quant_partition "${QUANT_PARTITION}"
     --quant_calib_samples "${CALIB_SAMPLES}"
     --quant_calib_sequence_length "${QUANT_CALIB_SEQUENCE_LENGTH}"
@@ -91,6 +94,10 @@ COMMON_ARGS=(
     --quant_calib_scale_jitter "${QUANT_CALIB_SCALE_JITTER}"
     --quant_calib_motion_blur "${QUANT_CALIB_MOTION_BLUR}"
 )
+
+if [ -n "${QUANT_RANGE_METHOD}" ]; then
+    COMMON_ARGS+=(--quant_range_method "${QUANT_RANGE_METHOD}")
+fi
 
 if [ "${QUANT_DISABLE_PSEUDO_SEQUENCE_CALIB}" = "1" ]; then
     COMMON_ARGS+=(--quant_disable_pseudo_sequence_calib)
