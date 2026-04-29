@@ -32,6 +32,15 @@ def _reduce_minmax(x: torch.Tensor, axis: Optional[int]) -> Tuple[torch.Tensor, 
     return x.amin(dim=reduce_dims), x.amax(dim=reduce_dims)
 
 
+def _evenly_spaced_indices(length: int, count: int, device: torch.device) -> torch.Tensor:
+    if count >= length:
+        return torch.arange(length, device=device, dtype=torch.long)
+    if count <= 1:
+        return torch.zeros((max(count, 0),), device=device, dtype=torch.long)
+    steps = torch.arange(count, device=device, dtype=torch.long)
+    return torch.div(steps * (length - 1), count - 1, rounding_mode="floor")
+
+
 def _quant_bounds(bit_width: int, symmetric: bool) -> Tuple[int, int]:
     if symmetric:
         qmax = (1 << (bit_width - 1)) - 1
@@ -144,7 +153,7 @@ class MinMaxObserver(nn.Module):
                 return
             take = min(flat.numel(), min(self.sample_limit, 4096))
             if take < flat.numel():
-                index = torch.linspace(0, flat.numel() - 1, take, device=flat.device).long()
+                index = _evenly_spaced_indices(flat.numel(), take, flat.device)
                 flat = flat.index_select(0, index)
             sample = flat.detach().cpu()
             if self._sample_values is None:
@@ -152,12 +161,11 @@ class MinMaxObserver(nn.Module):
             else:
                 self._sample_values = torch.cat([self._sample_values, sample], dim=0)
                 if self._sample_values.numel() > self.sample_limit:
-                    index = torch.linspace(
-                        0,
-                        self._sample_values.numel() - 1,
+                    index = _evenly_spaced_indices(
+                        self._sample_values.numel(),
                         self.sample_limit,
-                        device=self._sample_values.device,
-                    ).long()
+                        self._sample_values.device,
+                    )
                     self._sample_values = self._sample_values.index_select(0, index)
             return
 
@@ -170,7 +178,7 @@ class MinMaxObserver(nn.Module):
         per_channel_limit = max(1, self.sample_limit // max(moved.shape[0], 1))
         take = min(moved.shape[1], min(per_channel_limit, 2048))
         if take < moved.shape[1]:
-            index = torch.linspace(0, moved.shape[1] - 1, take, device=moved.device).long()
+            index = _evenly_spaced_indices(moved.shape[1], take, moved.device)
             moved = moved.index_select(1, index)
         sample = moved.detach().cpu()
         if self._sample_values is None:
@@ -178,12 +186,11 @@ class MinMaxObserver(nn.Module):
         else:
             self._sample_values = torch.cat([self._sample_values, sample], dim=1)
             if self._sample_values.shape[1] > per_channel_limit:
-                index = torch.linspace(
-                    0,
-                    self._sample_values.shape[1] - 1,
+                index = _evenly_spaced_indices(
+                    self._sample_values.shape[1],
                     per_channel_limit,
-                    device=self._sample_values.device,
-                ).long()
+                    self._sample_values.device,
+                )
                 self._sample_values = self._sample_values.index_select(1, index)
 
     def _mse_range_from_samples(self, num_candidates: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -423,7 +430,7 @@ class LSQQuantizer(nn.Module):
                 return
             take = min(flat.numel(), min(self.sample_limit, 4096))
             if take < flat.numel():
-                index = torch.linspace(0, flat.numel() - 1, take, device=flat.device).long()
+                index = _evenly_spaced_indices(flat.numel(), take, flat.device)
                 flat = flat.index_select(0, index)
             sample = flat.detach().cpu()
             if self._sample_values is None:
@@ -431,12 +438,11 @@ class LSQQuantizer(nn.Module):
             else:
                 self._sample_values = torch.cat([self._sample_values, sample], dim=0)
                 if self._sample_values.numel() > self.sample_limit:
-                    index = torch.linspace(
-                        0,
-                        self._sample_values.numel() - 1,
+                    index = _evenly_spaced_indices(
+                        self._sample_values.numel(),
                         self.sample_limit,
-                        device=self._sample_values.device,
-                    ).long()
+                        self._sample_values.device,
+                    )
                     self._sample_values = self._sample_values.index_select(0, index)
             return
 
@@ -449,7 +455,7 @@ class LSQQuantizer(nn.Module):
         per_channel_limit = max(1, self.sample_limit // max(moved.shape[0], 1))
         take = min(moved.shape[1], min(per_channel_limit, 2048))
         if take < moved.shape[1]:
-            index = torch.linspace(0, moved.shape[1] - 1, take, device=moved.device).long()
+            index = _evenly_spaced_indices(moved.shape[1], take, moved.device)
             moved = moved.index_select(1, index)
         sample = moved.detach().cpu()
         if self._sample_values is None:
@@ -457,12 +463,11 @@ class LSQQuantizer(nn.Module):
         else:
             self._sample_values = torch.cat([self._sample_values, sample], dim=1)
             if self._sample_values.shape[1] > per_channel_limit:
-                index = torch.linspace(
-                    0,
-                    self._sample_values.shape[1] - 1,
+                index = _evenly_spaced_indices(
+                    self._sample_values.shape[1],
                     per_channel_limit,
-                    device=self._sample_values.device,
-                ).long()
+                    self._sample_values.device,
+                )
                 self._sample_values = self._sample_values.index_select(1, index)
 
     def _mse_range_from_samples(self, num_candidates: int) -> Tuple[torch.Tensor, torch.Tensor]:
