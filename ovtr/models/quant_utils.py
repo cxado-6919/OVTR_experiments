@@ -1165,6 +1165,37 @@ def apply_ovtr_quant_state_dict(model: nn.Module, state_dict: Dict[str, torch.Te
     return remaining_state
 
 
+def materialize_checkpoint_bias_parameters(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> int:
+    materialized = 0
+    for key, value in state_dict.items():
+        if not key.endswith(".bias") or is_ovtr_quant_state_key(key):
+            continue
+        if "." not in key:
+            continue
+
+        module_name, attr_name = key.rsplit(".", 1)
+        if attr_name != "bias":
+            continue
+        try:
+            target_module = model.get_submodule(module_name) if module_name else model
+        except AttributeError:
+            continue
+        if not isinstance(target_module, (nn.Conv2d, nn.Linear)):
+            continue
+        if target_module.bias is not None:
+            continue
+        if value.ndim != 1:
+            continue
+        expected = target_module.out_channels if isinstance(target_module, nn.Conv2d) else target_module.out_features
+        if value.numel() != expected:
+            continue
+
+        loaded = value.detach().to(device=target_module.weight.device, dtype=target_module.weight.dtype).clone()
+        target_module.bias = nn.Parameter(loaded, requires_grad=False)
+        materialized += 1
+    return materialized
+
+
 class OVTRQuantController:
     def __init__(
         self,

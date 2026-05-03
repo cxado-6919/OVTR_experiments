@@ -7,6 +7,7 @@ PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_DIR}"
 
 MODEL_VARIANT="${MODEL_VARIANT:-5_frame}"
+EVAL_SPLIT="${EVAL_SPLIT:-val}"
 QUANT_MODE="${QUANT_MODE:-ptq}"
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a3}"
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
@@ -17,24 +18,40 @@ CALIB_SAMPLES="${CALIB_SAMPLES:-512}"
 ANALYSIS_MAX_FRAMES="${ANALYSIS_MAX_FRAMES:-0}"
 ANALYSIS_PLOT_MAX_AGE="${ANALYSIS_PLOT_MAX_AGE:-0}"
 ANALYSIS_IOU_DIVERGENCE_THRESH="${ANALYSIS_IOU_DIVERGENCE_THRESH:-0.5}"
+ANALYSIS_SAMPLE_SEQS_PER_DATASET="${ANALYSIS_SAMPLE_SEQS_PER_DATASET:-10}"
+ANALYSIS_SAMPLE_DATASETS="${ANALYSIS_SAMPLE_DATASETS:-YFCC100M HACS BDD ArgoVerse AVA LaSOT Charades}"
 
-case "${MODEL_VARIANT}" in
-    lite)
+case "${MODEL_VARIANT}:${EVAL_SPLIT}" in
+    lite:val)
         CONFIG_FILE="./config/ovtr_lite_train_val.py"
         FP32_PRETRAIN_DEFAULT="../model_zoo/ovtr_lite.pth"
         SCORE_THRESH="0.19 0.19 0.19 0.19 0.19 0.19 0.19"
         FILTER_SCORE_THRESH="0.19 0.19 0.19 0.19 0.19 0.19 0.19"
         IOUS_THRESH="0.45 0.45 0.45 0.45 0.45 0.45 0.45"
         ;;
-    5_frame)
+    lite:test)
+        CONFIG_FILE="./config/ovtr_lite_test.py"
+        FP32_PRETRAIN_DEFAULT="../model_zoo/ovtr_lite.pth"
+        SCORE_THRESH="0.19 0.19 0.19 0.19 0.19 0.19 0.19"
+        FILTER_SCORE_THRESH="0.19 0.19 0.19 0.19 0.19 0.19 0.19"
+        IOUS_THRESH="0.45 0.45 0.45 0.45 0.45 0.45 0.45"
+        ;;
+    5_frame:val)
         CONFIG_FILE="./config/ovtr_5_frame_train_val.py"
         FP32_PRETRAIN_DEFAULT="../model_zoo/ovtr_5_frame.pth"
         SCORE_THRESH="0.20 0.17 0.17 0.20 0.17 0.20 0.17"
         FILTER_SCORE_THRESH="0.20 0.17 0.17 0.20 0.17 0.20 0.17"
         IOUS_THRESH="0.5 0.45 0.5 0.4 0.45 0.45 0.45"
         ;;
+    5_frame:test)
+        CONFIG_FILE="./config/ovtr_5_frame_test.py"
+        FP32_PRETRAIN_DEFAULT="../model_zoo/ovtr_5_frame.pth"
+        SCORE_THRESH="0.20 0.17 0.17 0.20 0.17 0.20 0.17"
+        FILTER_SCORE_THRESH="0.20 0.17 0.17 0.20 0.17 0.20 0.17"
+        IOUS_THRESH="0.5 0.45 0.5 0.4 0.45 0.45 0.45"
+        ;;
     *)
-        echo "Unsupported MODEL_VARIANT: ${MODEL_VARIANT}" >&2
+        echo "Unsupported MODEL_VARIANT/EVAL_SPLIT combination: ${MODEL_VARIANT}/${EVAL_SPLIT}" >&2
         exit 1
         ;;
 esac
@@ -46,7 +63,7 @@ if [ "${QUANT_MODE}" = "qat" ]; then
 else
     PRETRAIN_MODEL="${PRETRAIN_MODEL:-${FP32_PRETRAIN_DEFAULT}}"
 fi
-ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-./results/quant_drift_${MODEL_VARIANT}_${QUANT_MODE}_${QUANT_PARTITION}}"
+ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-./results/quant_drift_${MODEL_VARIANT}_${QUANT_MODE}_${QUANT_PARTITION}_${EVAL_SPLIT}}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python ./analyze_quant_drift.py \
     --config_file "${CONFIG_FILE}" \
@@ -63,6 +80,8 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python ./analyze_quant_drift.py \
     --analysis_max_frames "${ANALYSIS_MAX_FRAMES}" \
     --analysis_plot_max_age "${ANALYSIS_PLOT_MAX_AGE}" \
     --analysis_iou_divergence_thresh "${ANALYSIS_IOU_DIVERGENCE_THRESH}" \
+    --analysis_sample_sequences_per_dataset "${ANALYSIS_SAMPLE_SEQS_PER_DATASET}" \
+    --analysis_sample_datasets ${ANALYSIS_SAMPLE_DATASETS} \
     --output_dir "${OUTPUT}" \
     --num_workers "${NUM_WORKERS}" \
     --batch_size "${BATCH_SIZE}" \

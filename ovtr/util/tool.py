@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from .utils import clean_state_dict
-from models.quant_utils import apply_ovtr_quant_state_dict
+from models.quant_utils import apply_ovtr_quant_state_dict, materialize_checkpoint_bias_parameters
 
 
 def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None):
@@ -13,9 +13,12 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
     )
     print(f'loaded {model_path}')
     
-    model_state_dict = model.state_dict()
     state_dict = clean_state_dict(checkpoint['model'])
     state_dict = apply_ovtr_quant_state_dict(model, state_dict)
+    materialized = materialize_checkpoint_bias_parameters(model, state_dict)
+    if materialized:
+        print(f"Materialized {materialized} checkpoint bias parameters.")
+    model_state_dict = model.state_dict()
 
     # check loaded parameters and created model parameters
     for k in state_dict:

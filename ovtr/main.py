@@ -37,6 +37,7 @@ from models.quant_utils import (
     apply_ovtr_quant_state_dict,
     is_partition_trainable_param,
     is_quant_trainable_param,
+    materialize_checkpoint_bias_parameters,
 )
 
 from util.slconfig import SLConfig
@@ -448,6 +449,9 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model_state = apply_ovtr_quant_state_dict(model_without_ddp, checkpoint['model'])
+        materialized = materialize_checkpoint_bias_parameters(model_without_ddp, model_state)
+        if materialized:
+            print(f"Materialized {materialized} checkpoint bias parameters.")
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(model_state, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:

@@ -47,6 +47,78 @@ FEEDBACK_INPUT_FIELDS = (
 
 POSTPROCESS_ONLY_FIELDS = ("boxes", "labels", "pred_logits", "pred_boxes")
 
+TRACK_METRIC_COLUMNS = [
+    "run_mode",
+    "file_path",
+    "frame_id",
+    "sequence_key",
+    "obj_id",
+    "track_age",
+    "query_tgt_cosine_distance",
+    "query_pos_cosine_distance",
+    "ref_pts_l1_distance",
+    "pred_box_iou",
+    "score_fp32",
+    "score_quant",
+    "class_fp32",
+    "class_quant",
+    "disappear_time_fp32",
+    "disappear_time_quant",
+    "alternate_obj_id",
+    "alternate_iou",
+    "divergence_type",
+]
+
+FRAME_METRIC_COLUMNS = [
+    "run_mode",
+    "file_path",
+    "frame_id",
+    "active_fp32",
+    "active_quant",
+    "matched_tracks",
+    "missing_tracks",
+    "mean_query_tgt_cosine_distance",
+    "mean_pred_box_iou",
+]
+
+QUERY_STATE_IO_COLUMNS = [
+    "run_mode",
+    "file_path",
+    "frame_id",
+    "sequence_key",
+    "obj_id",
+    "track_age",
+    "output_present",
+    "input_output_query_tgt_cosine_distance",
+    "input_output_query_pos_cosine_distance",
+    "input_output_ref_pts_l1_distance",
+]
+
+ACCUMULATION_GAP_COLUMNS = [
+    "file_path",
+    "frame_id",
+    "sequence_key",
+    "obj_id",
+    "track_age",
+    "free_query_tgt_cosine_distance",
+    "one_step_query_tgt_cosine_distance",
+    "query_tgt_distance_gap",
+    "free_query_pos_cosine_distance",
+    "one_step_query_pos_cosine_distance",
+    "query_pos_distance_gap",
+    "free_ref_pts_l1_distance",
+    "one_step_ref_pts_l1_distance",
+    "ref_pts_l1_gap",
+    "free_pred_box_iou",
+    "one_step_pred_box_iou",
+    "pred_box_iou_gap",
+    "free_divergence_type",
+    "one_step_divergence_type",
+]
+
+EMPTY_TRACK_RESULT = np.zeros((0, 5), dtype=np.float32)
+EMPTY_SCORED_TRACK_RESULT = np.zeros((0, 6), dtype=np.float32)
+
 
 @dataclass
 class TrackState:
@@ -90,6 +162,7 @@ class RunResult:
     track_metric_rows: List[dict] = field(default_factory=list)
     frame_metric_rows: List[dict] = field(default_factory=list)
     divergence_rows: List[dict] = field(default_factory=list)
+    state_io_rows: List[dict] = field(default_factory=list)
 
     @property
     def avg_latency_ms(self) -> float:
@@ -280,7 +353,7 @@ def filter_dt_by_area(dt_instances: Instances, area_threshold: float) -> Instanc
 
 
 def track_results_from_instances(dt_instances: Instances, num_classes: int) -> List[np.ndarray]:
-    empty = [np.zeros((0, 5), dtype=np.float32) for _ in range(num_classes)]
+    empty = [EMPTY_TRACK_RESULT for _ in range(num_classes)]
     if len(dt_instances) == 0 or not dt_instances.has("boxes"):
         return empty
 
@@ -292,7 +365,7 @@ def track_results_from_instances(dt_instances: Instances, num_classes: int) -> L
     for cls_idx in range(num_classes):
         keep = labels == cls_idx
         if not keep.any():
-            out.append(np.zeros((0, 5), dtype=np.float32))
+            out.append(EMPTY_TRACK_RESULT)
             continue
         out.append(np.concatenate([obj_ids[keep, None], boxes[keep]], axis=1).astype(np.float32))
     return out
@@ -304,7 +377,7 @@ def track_results_with_dummy_scores(track_results: Sequence[List[np.ndarray]]) -
         scored_frame = []
         for cls_result in frame_result:
             if cls_result.shape[0] == 0:
-                scored_frame.append(np.zeros((0, 6), dtype=np.float32))
+                scored_frame.append(EMPTY_SCORED_TRACK_RESULT)
             elif cls_result.shape[1] == 5:
                 score = np.ones((cls_result.shape[0], 1), dtype=cls_result.dtype)
                 scored_frame.append(np.concatenate([cls_result, score], axis=1).astype(np.float32))
@@ -365,6 +438,128 @@ def l1_distance(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> float:
     if a is None or b is None:
         return float("nan")
     return float(torch.mean(torch.abs(a.float() - b.float())).item())
+
+
+def _safe_float(value, default: float = float("nan")) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out
+
+
+def _numeric_gap(left, right) -> float:
+    left_value = _safe_float(left)
+    right_value = _safe_float(right)
+    if math.isnan(left_value) or math.isnan(right_value):
+        return float("nan")
+    return left_value - right_value
+
+
+def compare_query_state_io(
+    *,
+    run_mode: str,
+    file_path: str,
+    frame_id: int,
+    input_instances: Optional[Instances],
+    output_frame: FrameTrace,
+    reference_frame: Optional[FrameTrace] = None,
+) -> List[dict]:
+    if input_instances is None or not input_instances.has("obj_idxes"):
+        return []
+
+    sequence_key = sequence_key_from_file_path(file_path)
+    cpu_instances = input_instances.to(torch.device("cpu"))
+    rows = []
+    for index, obj_idx in enumerate(cpu_instances.obj_idxes):
+        obj_id = int(obj_idx.item())
+        if obj_id < 0:
+            continue
+
+        output_state = output_frame.active.get(obj_id)
+        reference_state = reference_frame.active.get(obj_id) if reference_frame is not None else None
+        track_age = float("nan")
+        if reference_state is not None:
+            track_age = reference_state.track_age
+        elif output_state is not None:
+            track_age = output_state.track_age
+        rows.append(
+            {
+                "run_mode": run_mode,
+                "file_path": file_path,
+                "frame_id": int(frame_id),
+                "sequence_key": sequence_key,
+                "obj_id": obj_id,
+                "track_age": track_age,
+                "output_present": output_state is not None,
+                "input_output_query_tgt_cosine_distance": cosine_distance(
+                    _get_tensor_field(cpu_instances, "query_tgt", index),
+                    output_state.query_tgt if output_state is not None else None,
+                ),
+                "input_output_query_pos_cosine_distance": cosine_distance(
+                    _get_tensor_field(cpu_instances, "query_pos", index),
+                    output_state.query_pos if output_state is not None else None,
+                ),
+                "input_output_ref_pts_l1_distance": l1_distance(
+                    _get_tensor_field(cpu_instances, "ref_pts", index),
+                    output_state.ref_pts if output_state is not None else None,
+                ),
+            }
+        )
+    return rows
+
+
+def build_accumulation_gap_rows(free_rows: Sequence[dict], one_step_rows: Sequence[dict]) -> List[dict]:
+    one_step_by_key = {
+        (row.get("sequence_key"), int(row.get("frame_id")), int(row.get("obj_id"))): row
+        for row in one_step_rows
+        if row.get("sequence_key") is not None and row.get("frame_id") is not None and row.get("obj_id") is not None
+    }
+    gap_rows = []
+    for free_row in free_rows:
+        if free_row.get("sequence_key") is None or free_row.get("frame_id") is None or free_row.get("obj_id") is None:
+            continue
+        key = (free_row.get("sequence_key"), int(free_row.get("frame_id")), int(free_row.get("obj_id")))
+        one_step_row = one_step_by_key.get(key)
+        if one_step_row is None:
+            continue
+
+        gap_rows.append(
+            {
+                "file_path": free_row.get("file_path", one_step_row.get("file_path")),
+                "frame_id": int(free_row.get("frame_id")),
+                "sequence_key": free_row.get("sequence_key"),
+                "obj_id": int(free_row.get("obj_id")),
+                "track_age": free_row.get("track_age", one_step_row.get("track_age")),
+                "free_query_tgt_cosine_distance": free_row.get("query_tgt_cosine_distance"),
+                "one_step_query_tgt_cosine_distance": one_step_row.get("query_tgt_cosine_distance"),
+                "query_tgt_distance_gap": _numeric_gap(
+                    free_row.get("query_tgt_cosine_distance"),
+                    one_step_row.get("query_tgt_cosine_distance"),
+                ),
+                "free_query_pos_cosine_distance": free_row.get("query_pos_cosine_distance"),
+                "one_step_query_pos_cosine_distance": one_step_row.get("query_pos_cosine_distance"),
+                "query_pos_distance_gap": _numeric_gap(
+                    free_row.get("query_pos_cosine_distance"),
+                    one_step_row.get("query_pos_cosine_distance"),
+                ),
+                "free_ref_pts_l1_distance": free_row.get("ref_pts_l1_distance"),
+                "one_step_ref_pts_l1_distance": one_step_row.get("ref_pts_l1_distance"),
+                "ref_pts_l1_gap": _numeric_gap(
+                    free_row.get("ref_pts_l1_distance"),
+                    one_step_row.get("ref_pts_l1_distance"),
+                ),
+                "free_pred_box_iou": free_row.get("pred_box_iou"),
+                "one_step_pred_box_iou": one_step_row.get("pred_box_iou"),
+                "pred_box_iou_gap": _numeric_gap(
+                    free_row.get("pred_box_iou"),
+                    one_step_row.get("pred_box_iou"),
+                ),
+                "free_divergence_type": free_row.get("divergence_type", ""),
+                "one_step_divergence_type": one_step_row.get("divergence_type", ""),
+            }
+        )
+    return gap_rows
 
 
 def _best_alternate_iou(fp_state: TrackState, quant_frame: FrameTrace) -> Tuple[float, Optional[int]]:
@@ -634,7 +829,13 @@ def _json_safe(value):
     return value
 
 
-def _save_csv(rows: List[dict], path: Path, columns: Optional[List[str]] = None) -> None:
+def _save_csv(
+    rows: List[dict],
+    path: Path,
+    columns: Optional[List[str]] = None,
+    *,
+    append: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
     if columns is not None:
@@ -642,7 +843,7 @@ def _save_csv(rows: List[dict], path: Path, columns: Optional[List[str]] = None)
             if column not in df:
                 df[column] = np.nan
         df = df[columns]
-    df.to_csv(path, index=False)
+    df.to_csv(path, index=False, mode="a" if append else "w", header=not append)
 
 
 def write_metric_csvs(
@@ -651,42 +852,34 @@ def write_metric_csvs(
     frame_rows: List[dict],
     divergence_rows: List[dict],
     output_dir: Path,
+    append: bool = False,
 ) -> None:
-    track_columns = [
-        "run_mode",
-        "file_path",
-        "frame_id",
-        "sequence_key",
-        "obj_id",
-        "track_age",
-        "query_tgt_cosine_distance",
-        "query_pos_cosine_distance",
-        "ref_pts_l1_distance",
-        "pred_box_iou",
-        "score_fp32",
-        "score_quant",
-        "class_fp32",
-        "class_quant",
-        "disappear_time_fp32",
-        "disappear_time_quant",
-        "alternate_obj_id",
-        "alternate_iou",
-        "divergence_type",
-    ]
-    frame_columns = [
-        "run_mode",
-        "file_path",
-        "frame_id",
-        "active_fp32",
-        "active_quant",
-        "matched_tracks",
-        "missing_tracks",
-        "mean_query_tgt_cosine_distance",
-        "mean_pred_box_iou",
-    ]
-    _save_csv(track_rows, output_dir / "track_metrics.csv", columns=track_columns)
-    _save_csv(frame_rows, output_dir / "frame_metrics.csv", columns=frame_columns)
-    _save_csv(divergence_rows, output_dir / "divergences.csv", columns=track_columns)
+    _save_csv(track_rows, output_dir / "track_metrics.csv", columns=TRACK_METRIC_COLUMNS, append=append)
+    _save_csv(frame_rows, output_dir / "frame_metrics.csv", columns=FRAME_METRIC_COLUMNS, append=append)
+    _save_csv(divergence_rows, output_dir / "divergences.csv", columns=TRACK_METRIC_COLUMNS, append=append)
+
+
+def write_research_csvs(
+    *,
+    one_step_rows: List[dict],
+    accumulation_gap_rows: List[dict],
+    state_io_rows: List[dict],
+    output_dir: Path,
+    append: bool = False,
+) -> None:
+    _save_csv(one_step_rows, output_dir / "one_step_metrics.csv", columns=TRACK_METRIC_COLUMNS, append=append)
+    _save_csv(
+        accumulation_gap_rows,
+        output_dir / "accumulation_gap.csv",
+        columns=ACCUMULATION_GAP_COLUMNS,
+        append=append,
+    )
+    _save_csv(
+        state_io_rows,
+        output_dir / "query_state_io_metrics.csv",
+        columns=QUERY_STATE_IO_COLUMNS,
+        append=append,
+    )
 
 
 def _plot_age_curve(df: pd.DataFrame, value: str, ylabel: str, title: str, output_path: Path, max_age: int) -> None:
