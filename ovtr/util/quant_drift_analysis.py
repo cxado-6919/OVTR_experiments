@@ -94,6 +94,21 @@ QUERY_STATE_IO_COLUMNS = [
     "input_output_ref_pts_l1_distance",
 ]
 
+RECURRENT_QUERY_DRIFT_COLUMNS = [
+    "run_mode",
+    "file_path",
+    "frame_id",
+    "sequence_key",
+    "obj_id",
+    "track_age",
+    "input_present",
+    "query_tgt_cosine_distance",
+    "query_pos_cosine_distance",
+    "ref_pts_l1_distance",
+    "query_tgt_distance_delta_from_prev",
+    "missing_recurrent_input",
+]
+
 ACCUMULATION_GAP_COLUMNS = [
     "file_path",
     "frame_id",
@@ -114,6 +129,21 @@ ACCUMULATION_GAP_COLUMNS = [
     "pred_box_iou_gap",
     "free_divergence_type",
     "one_step_divergence_type",
+]
+
+QUANT_BOUNDARY_ERROR_COLUMNS = [
+    "run_mode",
+    "file_path",
+    "frame_id",
+    "module_name",
+    "tensor_role",
+    "shape",
+    "numel",
+    "mean_abs_error",
+    "max_abs_error",
+    "mse",
+    "relative_l2_error",
+    "cosine_distance",
 ]
 
 EMPTY_TRACK_RESULT = np.zeros((0, 5), dtype=np.float32)
@@ -163,6 +193,8 @@ class RunResult:
     frame_metric_rows: List[dict] = field(default_factory=list)
     divergence_rows: List[dict] = field(default_factory=list)
     state_io_rows: List[dict] = field(default_factory=list)
+    recurrent_query_rows: List[dict] = field(default_factory=list)
+    quant_boundary_rows: List[dict] = field(default_factory=list)
 
     @property
     def avg_latency_ms(self) -> float:
@@ -507,6 +539,101 @@ def compare_query_state_io(
             }
         )
     return rows
+
+
+def _index_instances_by_obj_id(instances: Optional[Instances]) -> Tuple[Optional[Instances], Dict[int, int]]:
+    if instances is None or not instances.has("obj_idxes"):
+        return None, {}
+    cpu_instances = instances.to(torch.device("cpu"))
+    by_obj_id = {}
+    for index, obj_idx in enumerate(cpu_instances.obj_idxes):
+        obj_id = int(obj_idx.item())
+        if obj_id >= 0:
+            by_obj_id[obj_id] = index
+    return cpu_instances, by_obj_id
+
+
+def compare_recurrent_query_to_reference(
+    *,
+    run_mode: str,
+    file_path: str,
+    frame_id: int,
+    input_instances: Optional[Instances],
+    fp32_frame: Optional[FrameTrace],
+    previous_query_tgt_distances: Dict[Tuple[str, int], float],
+) -> List[dict]:
+    if fp32_frame is None or fp32_frame.feedback_active is None:
+        return []
+
+    sequence_key = sequence_key_from_file_path(file_path)
+    input_cpu, input_by_obj_id = _index_instances_by_obj_id(input_instances)
+    reference_cpu, reference_by_obj_id = _index_instances_by_obj_id(fp32_frame.feedback_active)
+    if reference_cpu is None:
+        return []
+
+    rows = []
+    for obj_id, reference_index in reference_by_obj_id.items():
+        input_index = input_by_obj_id.get(obj_id)
+        reference_state = fp32_frame.active.get(obj_id)
+        track_age = reference_state.track_age if reference_state is not None else float("nan")
+        input_present = input_cpu is not None and input_index is not None
+
+        if input_present:
+            query_tgt_distance = cosine_distance(
+                _get_tensor_field(input_cpu, "query_tgt", input_index),
+                _get_tensor_field(reference_cpu, "query_tgt", reference_index),
+            )
+            query_pos_distance = cosine_distance(
+                _get_tensor_field(input_cpu, "query_pos", input_index),
+                _get_tensor_field(reference_cpu, "query_pos", reference_index),
+            )
+            ref_pts_distance = l1_distance(
+                _get_tensor_field(input_cpu, "ref_pts", input_index),
+                _get_tensor_field(reference_cpu, "ref_pts", reference_index),
+            )
+        else:
+            query_tgt_distance = float("nan")
+            query_pos_distance = float("nan")
+            ref_pts_distance = float("nan")
+
+        prev_key = (sequence_key, obj_id)
+        previous_distance = previous_query_tgt_distances.get(prev_key, float("nan"))
+        query_tgt_delta = _numeric_gap(query_tgt_distance, previous_distance)
+        if not math.isnan(_safe_float(query_tgt_distance)):
+            previous_query_tgt_distances[prev_key] = float(query_tgt_distance)
+
+        rows.append(
+            {
+                "run_mode": run_mode,
+                "file_path": file_path,
+                "frame_id": int(frame_id),
+                "sequence_key": sequence_key,
+                "obj_id": obj_id,
+                "track_age": track_age,
+                "input_present": bool(input_present),
+                "query_tgt_cosine_distance": query_tgt_distance,
+                "query_pos_cosine_distance": query_pos_distance,
+                "ref_pts_l1_distance": ref_pts_distance,
+                "query_tgt_distance_delta_from_prev": query_tgt_delta,
+                "missing_recurrent_input": not input_present,
+            }
+        )
+    return rows
+
+
+def build_recurrent_query_age_summary(rows: Sequence[dict]) -> List[dict]:
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    if df.empty or "track_age" not in df or "query_tgt_cosine_distance" not in df:
+        return []
+    grouped = (
+        df.dropna(subset=["track_age", "query_tgt_cosine_distance"])
+        .groupby(["run_mode", "track_age"], dropna=True)["query_tgt_cosine_distance"]
+        .agg(["count", "mean", "median"])
+        .reset_index()
+    )
+    return grouped.to_dict("records")
 
 
 def build_accumulation_gap_rows(free_rows: Sequence[dict], one_step_rows: Sequence[dict]) -> List[dict]:
@@ -864,6 +991,8 @@ def write_research_csvs(
     one_step_rows: List[dict],
     accumulation_gap_rows: List[dict],
     state_io_rows: List[dict],
+    recurrent_query_rows: List[dict],
+    quant_boundary_rows: List[dict],
     output_dir: Path,
     append: bool = False,
 ) -> None:
@@ -878,6 +1007,18 @@ def write_research_csvs(
         state_io_rows,
         output_dir / "query_state_io_metrics.csv",
         columns=QUERY_STATE_IO_COLUMNS,
+        append=append,
+    )
+    _save_csv(
+        recurrent_query_rows,
+        output_dir / "recurrent_query_drift.csv",
+        columns=RECURRENT_QUERY_DRIFT_COLUMNS,
+        append=append,
+    )
+    _save_csv(
+        quant_boundary_rows,
+        output_dir / "quant_boundary_errors.csv",
+        columns=QUANT_BOUNDARY_ERROR_COLUMNS,
         append=append,
     )
 
@@ -928,6 +1069,24 @@ def _plot_metric_bars(summary: dict, output_path: Path) -> None:
     plt.close()
 
 
+def _plot_quant_boundary_error(df: pd.DataFrame, output_path: Path, max_modules: int = 20) -> None:
+    plt.figure(figsize=(11, 5))
+    plot_df = df.dropna(subset=["module_name", "mean_abs_error"]) if not df.empty else df
+    if plot_df.empty:
+        plt.text(0.5, 0.5, "No quant boundary errors", ha="center", va="center")
+        plt.xticks([])
+    else:
+        grouped = plot_df.groupby("module_name")["mean_abs_error"].mean().sort_values(ascending=False)
+        grouped = grouped.head(max_modules)
+        plt.bar(np.arange(len(grouped)), grouped.values)
+        plt.xticks(np.arange(len(grouped)), grouped.index, rotation=45, ha="right")
+    plt.ylabel("Mean absolute error")
+    plt.title("Quant boundary error by module")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
 def write_plots(output_dir: Path, metrics_summary: dict, plot_max_age: int) -> None:
     track_path = output_dir / "track_metrics.csv"
     if track_path.exists():
@@ -956,6 +1115,29 @@ def write_plots(output_dir: Path, metrics_summary: dict, plot_max_age: int) -> N
         output_dir / "pred_box_iou_by_age.png",
         plot_max_age,
     )
+
+    recurrent_path = output_dir / "recurrent_query_drift.csv"
+    if recurrent_path.exists():
+        recurrent_df = pd.read_csv(recurrent_path)
+    else:
+        recurrent_df = pd.DataFrame()
+    if recurrent_df.empty:
+        recurrent_df = pd.DataFrame(columns=["run_mode", "track_age", "query_tgt_cosine_distance"])
+    _plot_age_curve(
+        recurrent_df,
+        "query_tgt_cosine_distance",
+        "Cosine distance",
+        "recurrent query_tgt drift by track age",
+        output_dir / "recurrent_query_tgt_by_age.png",
+        plot_max_age,
+    )
+
+    boundary_path = output_dir / "quant_boundary_errors.csv"
+    if boundary_path.exists():
+        boundary_df = pd.read_csv(boundary_path)
+    else:
+        boundary_df = pd.DataFrame()
+    _plot_quant_boundary_error(boundary_df, output_dir / "quant_boundary_error_by_module.png")
     _plot_metric_bars(metrics_summary, output_dir / "teacher_forced_vs_free_metrics.png")
 
 

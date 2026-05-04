@@ -1,4 +1,5 @@
 import math
+import re
 from types import MethodType
 from typing import Dict, Optional, Set, Tuple
 
@@ -654,15 +655,28 @@ def _maybe_observe_and_quantize_activation_qat(
     return x
 
 
+def _record_quant_boundary(module: nn.Module, tensor_role: str, before: torch.Tensor, after: torch.Tensor) -> None:
+    recorder = getattr(module, "_ovtr_quant_boundary_recorder", None)
+    if recorder is None:
+        return
+    recorder.record(getattr(module, "_ovtr_quant_name", ""), tensor_role, before, after)
+
+
 def _ovtr_quant_conv2d_forward(self, x: torch.Tensor) -> torch.Tensor:
     if self._ovtr_quant_backend == "ptq":
+        input_before = x
         x = _maybe_observe_and_quantize_activation_ptq(
             x,
             self._ovtr_quant_input_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
-        weight = self._ovtr_quant_weight_quantizer.quantize(self.weight)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "input", input_before, x)
+        weight_before = self.weight
+        weight = self._ovtr_quant_weight_quantizer.quantize(weight_before)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "weight", weight_before, weight)
         out = F.conv2d(
             x,
             weight,
@@ -672,23 +686,31 @@ def _ovtr_quant_conv2d_forward(self, x: torch.Tensor) -> torch.Tensor:
             self.dilation,
             self.groups,
         )
+        output_before = out
         out = _maybe_observe_and_quantize_activation_ptq(
             out,
             self._ovtr_quant_output_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "output", output_before, out)
         return out
 
+    input_before = x
     x = _maybe_observe_and_quantize_activation_qat(
         x,
         self._ovtr_quant_input_quantizer,
         self._ovtr_quant_observer_enabled,
         self._ovtr_quant_quant_enabled,
     )
+    if self._ovtr_quant_quant_enabled:
+        _record_quant_boundary(self, "input", input_before, x)
     weight = self.weight
     if self._ovtr_quant_quant_enabled:
+        weight_before = weight
         weight = self._ovtr_quant_weight_quantizer.quantize(weight)
+        _record_quant_boundary(self, "weight", weight_before, weight)
     out = F.conv2d(
         x,
         weight,
@@ -698,74 +720,101 @@ def _ovtr_quant_conv2d_forward(self, x: torch.Tensor) -> torch.Tensor:
         self.dilation,
         self.groups,
     )
+    output_before = out
     out = _maybe_observe_and_quantize_activation_qat(
         out,
         self._ovtr_quant_output_quantizer,
         self._ovtr_quant_observer_enabled,
         self._ovtr_quant_quant_enabled,
     )
+    if self._ovtr_quant_quant_enabled:
+        _record_quant_boundary(self, "output", output_before, out)
     return out
 
 
 def _ovtr_quant_linear_forward(self, x: torch.Tensor) -> torch.Tensor:
     if self._ovtr_quant_backend == "ptq":
+        input_before = x
         x = _maybe_observe_and_quantize_activation_ptq(
             x,
             self._ovtr_quant_input_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
-        weight = self._ovtr_quant_weight_quantizer.quantize(self.weight)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "input", input_before, x)
+        weight_before = self.weight
+        weight = self._ovtr_quant_weight_quantizer.quantize(weight_before)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "weight", weight_before, weight)
         out = F.linear(x, weight, self.bias)
+        output_before = out
         out = _maybe_observe_and_quantize_activation_ptq(
             out,
             self._ovtr_quant_output_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "output", output_before, out)
         return out
 
+    input_before = x
     x = _maybe_observe_and_quantize_activation_qat(
         x,
         self._ovtr_quant_input_quantizer,
         self._ovtr_quant_observer_enabled,
         self._ovtr_quant_quant_enabled,
     )
+    if self._ovtr_quant_quant_enabled:
+        _record_quant_boundary(self, "input", input_before, x)
     weight = self.weight
     if self._ovtr_quant_quant_enabled:
+        weight_before = weight
         weight = self._ovtr_quant_weight_quantizer.quantize(weight)
+        _record_quant_boundary(self, "weight", weight_before, weight)
     out = F.linear(x, weight, self.bias)
+    output_before = out
     out = _maybe_observe_and_quantize_activation_qat(
         out,
         self._ovtr_quant_output_quantizer,
         self._ovtr_quant_observer_enabled,
         self._ovtr_quant_quant_enabled,
     )
+    if self._ovtr_quant_quant_enabled:
+        _record_quant_boundary(self, "output", output_before, out)
     return out
 
 
 def _ovtr_quant_embedding_weight(self) -> torch.Tensor:
     if self._ovtr_quant_backend == "ptq":
-        weight = self._ovtr_quant_weight_quantizer.quantize(self.weight)
+        weight_before = self.weight
+        weight = self._ovtr_quant_weight_quantizer.quantize(weight_before)
         if self._ovtr_quant_calibration_enabled:
             self._ovtr_quant_output_observer.observe(weight)
         if self._ovtr_quant_quant_enabled:
             weight = self._ovtr_quant_output_observer.fake_quant(weight)
+            _record_quant_boundary(self, "embedding_weight", weight_before, weight)
         return weight
 
-    weight = self.weight
+    weight_before = self.weight
+    weight = weight_before
     if self._ovtr_quant_quant_enabled:
         weight = self._ovtr_quant_weight_quantizer.quantize(weight)
     if self._ovtr_quant_observer_enabled:
         self._ovtr_quant_output_quantizer.observe(weight)
     if self._ovtr_quant_quant_enabled:
         weight = self._ovtr_quant_output_quantizer.quantize(weight)
+        _record_quant_boundary(self, "embedding_weight", weight_before, weight)
     return weight
 
 
 def _ovtr_quant_embedding_forward(self, x: torch.Tensor) -> torch.Tensor:
     if self._ovtr_quant_backend == "ptq":
-        weight = self._ovtr_quant_weight_quantizer.quantize(self.weight)
+        weight_before = self.weight
+        weight = self._ovtr_quant_weight_quantizer.quantize(weight_before)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "embedding_weight", weight_before, weight)
         out = F.embedding(
             x,
             weight,
@@ -775,17 +824,22 @@ def _ovtr_quant_embedding_forward(self, x: torch.Tensor) -> torch.Tensor:
             self.scale_grad_by_freq,
             self.sparse,
         )
+        output_before = out
         out = _maybe_observe_and_quantize_activation_ptq(
             out,
             self._ovtr_quant_output_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "output", output_before, out)
         return out
 
-    weight = self.weight
+    weight_before = self.weight
+    weight = weight_before
     if self._ovtr_quant_quant_enabled:
         weight = self._ovtr_quant_weight_quantizer.quantize(weight)
+        _record_quant_boundary(self, "embedding_weight", weight_before, weight)
     out = F.embedding(
         x,
         weight,
@@ -795,12 +849,15 @@ def _ovtr_quant_embedding_forward(self, x: torch.Tensor) -> torch.Tensor:
         self.scale_grad_by_freq,
         self.sparse,
     )
+    output_before = out
     out = _maybe_observe_and_quantize_activation_qat(
         out,
         self._ovtr_quant_output_quantizer,
         self._ovtr_quant_observer_enabled,
         self._ovtr_quant_quant_enabled,
     )
+    if self._ovtr_quant_quant_enabled:
+        _record_quant_boundary(self, "output", output_before, out)
     return out
 
 
@@ -897,45 +954,69 @@ def _ovtr_quant_multihead_attention_forward(
         attn_mask = torch.ones(tgt_len, src_len, device=query.device, dtype=torch.bool).triu(diagonal=1)
 
     if self._ovtr_quant_backend == "ptq":
+        query_before = query
         query = _maybe_observe_and_quantize_activation_ptq(
             query,
             self._ovtr_quant_query_input_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "query_input", query_before, query)
+        key_before = key
         key = _maybe_observe_and_quantize_activation_ptq(
             key,
             self._ovtr_quant_key_input_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "key_input", key_before, key)
+        value_before = value
         value = _maybe_observe_and_quantize_activation_ptq(
             value,
             self._ovtr_quant_value_input_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
-        in_proj_weight = _maybe_quantize_mha_weight_ptq(self, self.in_proj_weight)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "value_input", value_before, value)
+        in_proj_weight_before = self.in_proj_weight
+        in_proj_weight = _maybe_quantize_mha_weight_ptq(self, in_proj_weight_before)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "weight", in_proj_weight_before, in_proj_weight)
     else:
+        query_before = query
         query = _maybe_observe_and_quantize_activation_qat(
             query,
             self._ovtr_quant_query_input_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "query_input", query_before, query)
+        key_before = key
         key = _maybe_observe_and_quantize_activation_qat(
             key,
             self._ovtr_quant_key_input_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "key_input", key_before, key)
+        value_before = value
         value = _maybe_observe_and_quantize_activation_qat(
             value,
             self._ovtr_quant_value_input_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
-        in_proj_weight = _maybe_quantize_mha_weight_qat(self, self.in_proj_weight)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "value_input", value_before, value)
+        in_proj_weight_before = self.in_proj_weight
+        in_proj_weight = _maybe_quantize_mha_weight_qat(self, in_proj_weight_before)
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "weight", in_proj_weight_before, in_proj_weight)
 
     bias_q, bias_k, bias_v = (None, None, None)
     if self.in_proj_bias is not None:
@@ -947,43 +1028,61 @@ def _ovtr_quant_multihead_attention_forward(
     v = F.linear(value, w_v, bias_v)
 
     if self._ovtr_quant_backend == "ptq":
+        q_before = q
         q = _maybe_observe_and_quantize_activation_ptq(
             q,
             self._ovtr_quant_query_proj_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "query_proj", q_before, q)
+        k_before = k
         k = _maybe_observe_and_quantize_activation_ptq(
             k,
             self._ovtr_quant_key_proj_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "key_proj", k_before, k)
+        v_before = v
         v = _maybe_observe_and_quantize_activation_ptq(
             v,
             self._ovtr_quant_value_proj_observer,
             self._ovtr_quant_calibration_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "value_proj", v_before, v)
     else:
+        q_before = q
         q = _maybe_observe_and_quantize_activation_qat(
             q,
             self._ovtr_quant_query_proj_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "query_proj", q_before, q)
+        k_before = k
         k = _maybe_observe_and_quantize_activation_qat(
             k,
             self._ovtr_quant_key_proj_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "key_proj", k_before, k)
+        v_before = v
         v = _maybe_observe_and_quantize_activation_qat(
             v,
             self._ovtr_quant_value_proj_quantizer,
             self._ovtr_quant_observer_enabled,
             self._ovtr_quant_quant_enabled,
         )
+        if self._ovtr_quant_quant_enabled:
+            _record_quant_boundary(self, "value_proj", v_before, v)
 
     q = q.contiguous().view(tgt_len, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
     k = k.contiguous().view(src_len, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
@@ -1648,6 +1747,29 @@ class OVTRQuantController:
         self.model._ovtr_quant_controller = self
         self.model.transformer._ovtr_quant_controller = self
 
+    def _iter_recordable_quant_modules(self):
+        seen = set()
+        for module in list(self.quant_modules) + list(self.attention_modules):
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            yield module
+
+    def set_quant_boundary_recorder(self, recorder, module_regex: Optional[str] = None) -> None:
+        pattern = re.compile(module_regex) if module_regex else None
+        for module in self._iter_recordable_quant_modules():
+            module_name = getattr(module, "_ovtr_quant_name", "")
+            if pattern is None or pattern.search(module_name):
+                module._ovtr_quant_boundary_recorder = recorder
+            elif hasattr(module, "_ovtr_quant_boundary_recorder"):
+                module._ovtr_quant_boundary_recorder = None
+
+    def clear_quant_boundary_recorder(self) -> None:
+        for module in self._iter_recordable_quant_modules():
+            if hasattr(module, "_ovtr_quant_boundary_recorder"):
+                module._ovtr_quant_boundary_recorder = None
+
     def reset_calibration(self) -> None:
         for module in self.quant_modules:
             if isinstance(module, nn.Embedding):
@@ -2205,7 +2327,9 @@ def maybe_observe_and_quantize_attention(module: nn.Module, attention_weights: t
         if getattr(module, "_ovtr_quant_attention_calibration_enabled", False):
             observer.observe(attention_weights)
         if getattr(module, "_ovtr_quant_attention_quant_enabled", False):
-            return observer.fake_quant(attention_weights)
+            quantized = observer.fake_quant(attention_weights)
+            _record_quant_boundary(module, "attention", attention_weights, quantized)
+            return quantized
         return attention_weights
 
     if backend == "qat":
@@ -2215,7 +2339,9 @@ def maybe_observe_and_quantize_attention(module: nn.Module, attention_weights: t
         if getattr(module, "_ovtr_quant_attention_observer_enabled", False):
             quantizer.observe(attention_weights)
         if getattr(module, "_ovtr_quant_attention_quant_enabled", False):
-            return quantizer.quantize(attention_weights)
+            quantized = quantizer.quantize(attention_weights)
+            _record_quant_boundary(module, "attention", attention_weights, quantized)
+            return quantized
         return attention_weights
 
     return attention_weights

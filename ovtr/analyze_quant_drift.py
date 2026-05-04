@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -26,6 +27,7 @@ from util.quant_drift_analysis import (
     build_teacher_forced_input,
     compare_query_state_io,
     compare_frame_to_reference,
+    compare_recurrent_query_to_reference,
     run_inference_frame,
     sequence_key_from_file_path,
     snapshot_frame_state,
@@ -93,6 +95,22 @@ def add_analysis_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=DEFAULT_ANALYSIS_SAMPLE_DATASETS,
         help="Dataset prefixes eligible for sequence sampling.",
     )
+    parser.add_argument(
+        "--analysis_record_quant_boundaries",
+        action="store_true",
+        help="Record fake-quant tensor error at quantized module boundaries.",
+    )
+    parser.add_argument(
+        "--analysis_quant_boundary_module_regex",
+        default=None,
+        help="Regex for quantized module names recorded in quant_boundary_errors.csv.",
+    )
+    parser.add_argument(
+        "--analysis_quant_boundary_max_rows_per_frame",
+        default=0,
+        type=int,
+        help="Maximum quant boundary rows recorded per frame. 0 means no limit.",
+    )
     return parser
 
 
@@ -155,6 +173,86 @@ def normalize_analysis_args(args) -> None:
         )
     if args.analysis_fp32_pretrain is None:
         args.analysis_fp32_pretrain = args.pretrained
+
+
+class QuantBoundaryRecorder:
+    def __init__(self, max_rows_per_frame: int = 0):
+        self.max_rows_per_frame = max(0, int(max_rows_per_frame))
+        self.rows = []
+        self.run_mode = ""
+        self.file_path = ""
+        self.frame_id = -1
+        self._frame_rows = 0
+
+    def reset(self) -> None:
+        self.rows = []
+        self._frame_rows = 0
+
+    def set_frame(self, *, run_mode: str, file_path: str, frame_id: int) -> None:
+        self.run_mode = run_mode
+        self.file_path = file_path
+        self.frame_id = int(frame_id)
+        self._frame_rows = 0
+
+    def record(self, module_name: str, tensor_role: str, before: torch.Tensor, after: torch.Tensor) -> None:
+        if self.max_rows_per_frame > 0 and self._frame_rows >= self.max_rows_per_frame:
+            return
+        if before is None or after is None or before.shape != after.shape:
+            return
+
+        with torch.no_grad():
+            before_f = before.detach().float()
+            after_f = after.detach().float()
+            diff = after_f - before_f
+            numel = int(diff.numel())
+            if numel == 0:
+                return
+
+            diff_flat = diff.flatten()
+            before_flat = before_f.flatten()
+            after_flat = after_f.flatten()
+            denom = torch.linalg.vector_norm(before_flat)
+            relative_l2 = float((torch.linalg.vector_norm(diff_flat) / denom).item()) if denom.item() > 0 else float("nan")
+            cosine_distance = float((1.0 - F.cosine_similarity(before_flat, after_flat, dim=0)).item())
+
+            self.rows.append(
+                {
+                    "run_mode": self.run_mode,
+                    "file_path": self.file_path,
+                    "frame_id": self.frame_id,
+                    "module_name": module_name,
+                    "tensor_role": tensor_role,
+                    "shape": "x".join(str(dim) for dim in before.shape),
+                    "numel": numel,
+                    "mean_abs_error": float(diff_flat.abs().mean().item()),
+                    "max_abs_error": float(diff_flat.abs().max().item()),
+                    "mse": float(diff_flat.pow(2).mean().item()),
+                    "relative_l2_error": relative_l2,
+                    "cosine_distance": cosine_distance,
+                }
+            )
+            self._frame_rows += 1
+
+
+def default_quant_boundary_module_regex(partition: str) -> Optional[str]:
+    if partition == "exp_b":
+        return r"^track_embed"
+    if partition == "exp_a3":
+        return r"^(transformer\.decoder|transformer\.tgt_embed|feature_align)"
+    return None
+
+
+def configure_quant_boundary_recorder(model, args, recorder: Optional[QuantBoundaryRecorder]) -> None:
+    controller = getattr(model, "_ovtr_quant_controller", None)
+    if controller is None:
+        return
+    if recorder is None:
+        controller.clear_quant_boundary_recorder()
+        return
+    module_regex = args.analysis_quant_boundary_module_regex
+    if not module_regex:
+        module_regex = default_quant_boundary_module_regex(args.quant_partition)
+    controller.set_quant_boundary_recorder(recorder, module_regex=module_regex)
 
 
 def build_validation_dataset(args, cfg):
@@ -426,6 +524,7 @@ def run_analysis_pass(
     args,
     fp32_trace: Optional[ReferenceTrace] = None,
     teacher_forced: bool = False,
+    boundary_recorder: Optional[QuantBoundaryRecorder] = None,
     progress_desc: Optional[str] = None,
     progress_leave: bool = True,
 ) -> RunResult:
@@ -438,13 +537,17 @@ def run_analysis_pass(
     frame_metric_rows = []
     divergence_rows = []
     state_io_rows = []
+    recurrent_query_rows = []
     first_divergences = {}
     track_ages = {}
+    previous_query_tgt_distances = {}
     track_instances = None
     previous_sequence = None
     previous_fp32_frame = None
     total_detect_time = 0.0
     processed_frames = 0
+    if boundary_recorder is not None:
+        boundary_recorder.reset()
 
     progress = tqdm(data_loader, desc=progress_desc or run_mode, leave=progress_leave)
     with torch.no_grad():
@@ -460,6 +563,7 @@ def run_analysis_pass(
                 if sequence_reset:
                     track_instances = None
                     previous_fp32_frame = None
+                    previous_query_tgt_distances.clear()
                     if hasattr(model, "clear"):
                         model.clear()
 
@@ -473,6 +577,19 @@ def run_analysis_pass(
                         model.track_base.max_obj_id = previous_fp32_frame.max_obj_id
 
                 input_feedback_active = snapshot_feedback_active(track_instances)
+                if fp32_trace is not None:
+                    recurrent_query_rows.extend(
+                        compare_recurrent_query_to_reference(
+                            run_mode=run_mode,
+                            file_path=file_path,
+                            frame_id=frame_id,
+                            input_instances=input_feedback_active,
+                            fp32_frame=previous_fp32_frame,
+                            previous_query_tgt_distances=previous_query_tgt_distances,
+                        )
+                    )
+                if boundary_recorder is not None:
+                    boundary_recorder.set_frame(run_mode=run_mode, file_path=file_path, frame_id=frame_id)
                 sync_timing_device(device)
                 start_time = time.perf_counter()
                 next_track_instances, frame_track_results, score_threshold, max_obj_id = run_inference_frame(
@@ -544,6 +661,8 @@ def run_analysis_pass(
         frame_metric_rows=frame_metric_rows,
         divergence_rows=divergence_rows,
         state_io_rows=state_io_rows,
+        recurrent_query_rows=recurrent_query_rows,
+        quant_boundary_rows=list(boundary_recorder.rows) if boundary_recorder is not None else [],
     )
 
 
@@ -593,6 +712,8 @@ def main(args) -> None:
         one_step_rows=[],
         accumulation_gap_rows=[],
         state_io_rows=[],
+        recurrent_query_rows=[],
+        quant_boundary_rows=[],
         output_dir=output_dir,
         append=False,
     )
@@ -613,6 +734,12 @@ def main(args) -> None:
         checkpoint_path=args.pretrained,
         quant_mode=args.quant_mode,
     )
+    boundary_recorder = None
+    if args.analysis_record_quant_boundaries:
+        boundary_recorder = QuantBoundaryRecorder(
+            max_rows_per_frame=args.analysis_quant_boundary_max_rows_per_frame,
+        )
+        configure_quant_boundary_recorder(quant_model, args, boundary_recorder)
 
     fp32_result = empty_run_result("fp32_free")
     quant_free_result = empty_run_result("quant_free")
@@ -642,6 +769,7 @@ def main(args) -> None:
             device=device,
             args=args,
             fp32_trace=fp32_trace,
+            boundary_recorder=boundary_recorder,
             progress_desc=f"quant_free {sequence_desc}",
             progress_leave=False,
         )
@@ -654,6 +782,7 @@ def main(args) -> None:
             args=args,
             fp32_trace=fp32_trace,
             teacher_forced=True,
+            boundary_recorder=boundary_recorder,
             progress_desc=f"quant_teacher_forced {sequence_desc}",
             progress_leave=False,
         )
@@ -685,6 +814,14 @@ def main(args) -> None:
                 fp32_sequence_result.state_io_rows
                 + quant_free_sequence_result.state_io_rows
                 + quant_teacher_sequence_result.state_io_rows
+            ),
+            recurrent_query_rows=(
+                quant_free_sequence_result.recurrent_query_rows
+                + quant_teacher_sequence_result.recurrent_query_rows
+            ),
+            quant_boundary_rows=(
+                quant_free_sequence_result.quant_boundary_rows
+                + quant_teacher_sequence_result.quant_boundary_rows
             ),
             output_dir=output_dir,
             append=True,
