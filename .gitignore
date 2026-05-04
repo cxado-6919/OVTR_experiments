@@ -42,3 +42,4 @@ datasets/
 .DS_Store
 
 ovtr/results/ovtr/results_ptq_lite/teta_results/
+*.mp4

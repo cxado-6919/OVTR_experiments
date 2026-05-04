@@ -12,32 +12,50 @@ NPROC_GPU="${NPROC_GPU:-1}"
 PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_5_frame.pth}"
 OUTPUT="${OUTPUT:-./results}"
 VIS_OUTPUT="${VIS_OUTPUT:-./results}"
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
-    ./track_demo.py \
-    --config_file ./config/ovtr_5_frame_train_val.py \
-    --dataset_file lvis_generated_img_seqs \
-    --epochs 16 \
-    --with_box_refine \
-    --two_stage \
-    --lr 4e-5 \
-    --lr_backbone 4e-6 \
-    --lr_drop 13 \
-    --pretrain "${PRETRAIN_MODEL}" \
-    --output_dir "${OUTPUT}" \
-    --num_workers 32 \
-    --batch_size 1 \
-    --sample_mode random_interval \
-    --sample_interval 1 \
-    --sampler_steps 4 7 14 \
-    --sampler_lengths 2 3 4 5 \
-    --merger_dropout 0 \
-    --random_drop 0.1 \
-    --fp_ratio 0.3 \
-    --track_query_iteration CIP \
-    --calculate_negative_samples \
-    --score_thresh 0.3 \
-    --filter_score_thresh 0.3 \
-    --ious_thresh 0.3 \
-    --miss_tolerance 5 \
-    --maximum_quantity 50 \
+VIDEO_PATH="${VIDEO_PATH:-../video/track_demo.mp4}"
+OUTPUT_VIDEO="${OUTPUT_VIDEO:-}"
+MAX_FRAMES="${MAX_FRAMES:-}"
+
+DEMO_ARGS=(
+    --master_port="${MASTER_PORT}"
+    --nproc_per_node="${NPROC_GPU}"
+    ./track_demo.py
+    --config_file ./config/ovtr_5_frame_train_val.py
+    --dataset_file lvis_generated_img_seqs
+    --epochs 16
+    --with_box_refine
+    --two_stage
+    --lr 4e-5
+    --lr_backbone 4e-6
+    --lr_drop 13
+    --pretrain "${PRETRAIN_MODEL}"
+    --output_dir "${OUTPUT}"
+    --num_workers 32
+    --batch_size 1
+    --sample_mode random_interval
+    --sample_interval 1
+    --sampler_steps 4 7 14
+    --sampler_lengths 2 3 4 5
+    --merger_dropout 0
+    --random_drop 0.1
+    --fp_ratio 0.3
+    --track_query_iteration CIP
+    --calculate_negative_samples
+    --score_thresh 0.3
+    --filter_score_thresh 0.3
+    --ious_thresh 0.3
+    --miss_tolerance 5
+    --maximum_quantity 50
     --vis_output "${VIS_OUTPUT}"
+    --video_path "${VIDEO_PATH}"
+)
+
+if [ -n "${OUTPUT_VIDEO}" ]; then
+    DEMO_ARGS+=(--output_video "${OUTPUT_VIDEO}")
+fi
+
+if [ -n "${MAX_FRAMES}" ]; then
+    DEMO_ARGS+=(--max_frames "${MAX_FRAMES}")
+fi
+
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun "${DEMO_ARGS[@]}"
