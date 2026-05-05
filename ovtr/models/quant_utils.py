@@ -49,6 +49,98 @@ def _quant_bounds(bit_width: int, symmetric: bool) -> Tuple[int, int]:
     return 0, (1 << bit_width) - 1
 
 
+def _as_scalar_tensor(value: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return value.detach().reshape(-1)[0].to(device=device, dtype=dtype)
+
+
+def quantize_affine_uint(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    *,
+    bit_width: int,
+) -> torch.Tensor:
+    qmin, qmax = _quant_bounds(bit_width, symmetric=False)
+    scale = _as_scalar_tensor(scale, device=x.device, dtype=x.dtype).clamp(min=1e-8)
+    zero_point = torch.round(_as_scalar_tensor(zero_point, device=x.device, dtype=x.dtype)).clamp(qmin, qmax)
+    q = torch.round(x / scale + zero_point).clamp(qmin, qmax)
+    return q.to(torch.uint8)
+
+
+def dequantize_affine_uint(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    scale = _as_scalar_tensor(scale, device=q.device, dtype=dtype)
+    zero_point = torch.round(_as_scalar_tensor(zero_point, device=q.device, dtype=dtype))
+    return (q.to(dtype) - zero_point) * scale
+
+
+def _pack_4bit_values(q: torch.Tensor) -> torch.Tensor:
+    q = q.reshape(-1).to(torch.uint8) & 0x0F
+    if q.numel() % 2:
+        q = torch.cat([q, q.new_zeros(1)], dim=0)
+    low = q[0::2]
+    high = q[1::2] << 4
+    return (low | high).contiguous()
+
+
+def _unpack_4bit_values(packed: torch.Tensor, num_values: int) -> torch.Tensor:
+    packed = packed.reshape(-1).to(torch.uint8)
+    out = torch.empty(packed.numel() * 2, device=packed.device, dtype=torch.uint8)
+    out[0::2] = packed & 0x0F
+    out[1::2] = (packed >> 4) & 0x0F
+    return out[:num_values].contiguous()
+
+
+def pack_uint4(q: torch.Tensor) -> torch.Tensor:
+    """Pack unsigned 4-bit values; element 0 is stored in the low nibble."""
+    if q.numel() and bool(((q < 0) | (q > 15)).any().item()):
+        raise ValueError("UINT4 pack expects values in [0, 15].")
+    return _pack_4bit_values(q)
+
+
+def unpack_uint4(packed: torch.Tensor, num_values: int) -> torch.Tensor:
+    return _unpack_4bit_values(packed, num_values)
+
+
+def pack_int4(q: torch.Tensor) -> torch.Tensor:
+    """Pack signed 4-bit two's-complement values; element 0 is stored in the low nibble."""
+    if q.numel() and bool(((q < -8) | (q > 7)).any().item()):
+        raise ValueError("INT4 pack expects values in [-8, 7].")
+    return _pack_4bit_values(q.to(torch.int16) & 0x0F)
+
+
+def unpack_int4(packed: torch.Tensor, num_values: int) -> torch.Tensor:
+    q = _unpack_4bit_values(packed, num_values).to(torch.int8)
+    return torch.where(q >= 8, q - 16, q)
+
+
+def quantize_weight_int4_per_channel(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    qmin, qmax = _quant_bounds(4, symmetric=True)
+    scale = scale.detach().abs().clamp(min=1e-8).to(device=weight.device, dtype=weight.dtype)
+    view_shape = [1] * weight.ndim
+    view_shape[0] = scale.numel()
+    q = torch.round(weight.detach() / scale.reshape(view_shape)).clamp(qmin, qmax)
+    return q.to(torch.int8)
+
+
+def fake_quant_from_packed_uint4(
+    packed: torch.Tensor,
+    num_values: int,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    *,
+    shape: Optional[Tuple[int, ...]] = None,
+) -> torch.Tensor:
+    q = unpack_uint4(packed, num_values)
+    out = dequantize_affine_uint(q, scale, zero_point)
+    return out.reshape(shape) if shape is not None else out
+
+
 def _safe_minmax(min_val: torch.Tensor, max_val: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
     min_val = torch.minimum(min_val, max_val - eps)
     max_val = torch.maximum(max_val, min_val + eps)
@@ -735,12 +827,13 @@ def _ovtr_quant_conv2d_forward(self, x: torch.Tensor) -> torch.Tensor:
 def _ovtr_quant_linear_forward(self, x: torch.Tensor) -> torch.Tensor:
     if self._ovtr_quant_backend == "ptq":
         input_before = x
-        x = _maybe_observe_and_quantize_activation_ptq(
-            x,
-            self._ovtr_quant_input_observer,
-            self._ovtr_quant_calibration_enabled,
-            self._ovtr_quant_quant_enabled,
-        )
+        if not getattr(self, "_ovtr_quant_skip_input_quantizer", False):
+            x = _maybe_observe_and_quantize_activation_ptq(
+                x,
+                self._ovtr_quant_input_observer,
+                self._ovtr_quant_calibration_enabled,
+                self._ovtr_quant_quant_enabled,
+            )
         if self._ovtr_quant_quant_enabled:
             _record_quant_boundary(self, "input", input_before, x)
         weight_before = self.weight
@@ -760,12 +853,13 @@ def _ovtr_quant_linear_forward(self, x: torch.Tensor) -> torch.Tensor:
         return out
 
     input_before = x
-    x = _maybe_observe_and_quantize_activation_qat(
-        x,
-        self._ovtr_quant_input_quantizer,
-        self._ovtr_quant_observer_enabled,
-        self._ovtr_quant_quant_enabled,
-    )
+    if not getattr(self, "_ovtr_quant_skip_input_quantizer", False):
+        x = _maybe_observe_and_quantize_activation_qat(
+            x,
+            self._ovtr_quant_input_quantizer,
+            self._ovtr_quant_observer_enabled,
+            self._ovtr_quant_quant_enabled,
+        )
     if self._ovtr_quant_quant_enabled:
         _record_quant_boundary(self, "input", input_before, x)
     weight = self.weight
@@ -1295,15 +1389,82 @@ def materialize_checkpoint_bias_parameters(model: nn.Module, state_dict: Dict[st
     return materialized
 
 
+def _set_buffer(module: nn.Module, name: str, value: torch.Tensor) -> None:
+    value = value.detach().contiguous()
+    if name in module._buffers:
+        module._buffers[name] = value
+    else:
+        module.register_buffer(name, value)
+
+
+def _require_lsq_initialized(quantizer: nn.Module, owner: str) -> None:
+    if quantizer is None:
+        raise RuntimeError(f"Missing quantizer for {owner}.")
+    if not getattr(quantizer, "initialized", torch.tensor(False)).item():
+        raise RuntimeError(f"Quantizer for {owner} is not initialized; cannot export int_msda state.")
+
+
+def _require_asymmetric_per_tensor_uint4(quantizer: nn.Module, owner: str) -> None:
+    _require_lsq_initialized(quantizer, owner)
+    if getattr(quantizer, "bit_width", None) != 4 or getattr(quantizer, "symmetric", None):
+        raise RuntimeError(f"{owner} must be 4-bit asymmetric activation quantizer for int_msda.")
+    if getattr(quantizer, "axis", None) is not None:
+        raise RuntimeError(f"{owner} must be per-tensor activation quantizer for int_msda.")
+    if quantizer.scale.numel() != 1 or quantizer.zero_point is None or quantizer.zero_point.numel() != 1:
+        raise RuntimeError(f"{owner} must expose scalar scale and zero-point for int_msda.")
+
+
+def _require_symmetric_per_channel_int4_weight(quantizer: nn.Module, owner: str) -> None:
+    _require_lsq_initialized(quantizer, owner)
+    if getattr(quantizer, "bit_width", None) != 4 or not getattr(quantizer, "symmetric", None):
+        raise RuntimeError(f"{owner} must be 4-bit symmetric weight quantizer for int_msda.")
+    if getattr(quantizer, "axis", None) != 0:
+        raise RuntimeError(f"{owner} must use per-output-channel weight scales for int_msda.")
+
+
+def _require_attention_per_head_uint8(quantizer: nn.Module, owner: str, num_heads: int) -> None:
+    _require_lsq_initialized(quantizer, owner)
+    if getattr(quantizer, "bit_width", None) != 8 or getattr(quantizer, "symmetric", None):
+        raise RuntimeError(f"{owner} must be 8-bit asymmetric attention quantizer for int_msda.")
+    if getattr(quantizer, "axis", None) != 2:
+        raise RuntimeError(f"{owner} attention quantizer axis must be the num_heads dimension.")
+    if quantizer.scale.numel() != num_heads or quantizer.zero_point is None or quantizer.zero_point.numel() != num_heads:
+        raise RuntimeError(f"{owner} attention qparams must have shape [num_heads].")
+
+
+def _export_lowbit_linear(linear: nn.Linear, owner: str) -> None:
+    weight_quantizer = getattr(linear, "_ovtr_quant_weight_quantizer", None)
+    _require_symmetric_per_channel_int4_weight(weight_quantizer, f"{owner}.weight")
+    q_weight = quantize_weight_int4_per_channel(linear.weight, weight_quantizer.scale)
+    _set_buffer(linear, "_ovtr_quant_int4_weight_packed", pack_int4(q_weight).to(linear.weight.device))
+    _set_buffer(linear, "_ovtr_quant_int4_weight_scale", weight_quantizer.scale.detach().float().to(linear.weight.device))
+    _set_buffer(
+        linear,
+        "_ovtr_quant_int4_weight_sum",
+        q_weight.to(torch.int32).sum(dim=1, dtype=torch.int32).to(linear.weight.device),
+    )
+    if linear.bias is None:
+        bias = torch.empty(0, device=linear.weight.device, dtype=torch.float32)
+    else:
+        bias = linear.bias.detach().float().to(linear.weight.device)
+    _set_buffer(linear, "_ovtr_quant_bias_fp32", bias)
+    linear._ovtr_quant_int4_in_features = linear.in_features
+    linear._ovtr_quant_int4_out_features = linear.out_features
+
+
+def _count_int_msda_export_keys(model: nn.Module) -> int:
+    return sum(1 for key in model.state_dict().keys() if "_ovtr_quant_int4_" in key or key.endswith("_ovtr_quant_bias_fp32"))
+
+
 class OVTRQuantController:
     def __init__(
         self,
         model: nn.Module,
         mode: str,
         partition: str,
-        weight_bits: int = 8,
-        activation_bits: int = 6,
-        attention_bits: int = 4,
+        weight_bits: int = 4,
+        activation_bits: int = 4,
+        attention_bits: int = 8,
         range_method: str = "minmax",
         mse_candidates: int = 80,
         mse_bins: int = 2048,
@@ -1706,9 +1867,21 @@ class OVTRQuantController:
                     sample_limit=self.mse_bins,
                 ),
             )
+            module.add_module(
+                "_ovtr_quant_aggregation_output_observer",
+                MSEHistogramObserver(
+                    bit_width=self.activation_bits,
+                    symmetric=False,
+                    axis=None,
+                    sample_limit=self.mse_bins,
+                ),
+            )
             module._ovtr_quant_attention_observer.to(module.value_proj.weight.device)
+            module._ovtr_quant_aggregation_output_observer.to(module.value_proj.weight.device)
             module._ovtr_quant_attention_calibration_enabled = False
             module._ovtr_quant_attention_quant_enabled = False
+            module._ovtr_quant_aggregation_calibration_enabled = False
+            module._ovtr_quant_aggregation_quant_enabled = False
         else:
             module.add_module(
                 "_ovtr_quant_attention_quantizer",
@@ -1720,12 +1893,27 @@ class OVTRQuantController:
                     sample_limit=self.mse_bins,
                 ),
             )
+            module.add_module(
+                "_ovtr_quant_aggregation_output_quantizer",
+                LSQQuantizer(
+                    bit_width=self.activation_bits,
+                    symmetric=False,
+                    axis=None,
+                    param_size=1,
+                    sample_limit=self.mse_bins,
+                ),
+            )
             module._ovtr_quant_attention_quantizer.to(module.value_proj.weight.device)
+            module._ovtr_quant_aggregation_output_quantizer.to(module.value_proj.weight.device)
             module._ovtr_quant_attention_observer_enabled = False
             module._ovtr_quant_attention_quant_enabled = False
+            module._ovtr_quant_aggregation_observer_enabled = False
+            module._ovtr_quant_aggregation_quant_enabled = False
             module._ovtr_quant_force_pytorch_msda = True
 
         module._ovtr_quant_attention_patched = True
+        module._ovtr_quant_deploy_mode = "none"
+        module._ovtr_int_msda_dispatch_count = 0
         self.attention_modules.append(module)
         self.quant_module_names.append(module_name)
 
@@ -1746,6 +1934,13 @@ class OVTRQuantController:
 
         self.model._ovtr_quant_controller = self
         self.model.transformer._ovtr_quant_controller = self
+        self._configure_msda_projection_modules()
+
+    def _configure_msda_projection_modules(self) -> None:
+        for module in self.attention_modules:
+            output_proj = getattr(module, "output_proj", None)
+            if output_proj is not None and getattr(output_proj, "_ovtr_quant_patched", False):
+                output_proj._ovtr_quant_skip_input_quantizer = True
 
     def _iter_recordable_quant_modules(self):
         seen = set()
@@ -1805,8 +2000,10 @@ class OVTRQuantController:
         for module in self.attention_modules:
             if self.mode == "ptq":
                 module._ovtr_quant_attention_observer.reset()
+                module._ovtr_quant_aggregation_output_observer.reset()
             else:
                 module._ovtr_quant_attention_quantizer.reset_observer()
+                module._ovtr_quant_aggregation_output_quantizer.reset_observer()
 
     def initialize_weight_quantizers(self) -> None:
         for module in self.quant_modules:
@@ -2035,8 +2232,13 @@ class OVTRQuantController:
         for module in self.attention_modules:
             if self.mode == "ptq":
                 _finalize(module._ovtr_quant_attention_observer)
+                _finalize(module._ovtr_quant_aggregation_output_observer)
             else:
                 module._ovtr_quant_attention_quantizer.initialize_from_observer(
+                    range_method=self.range_method,
+                    mse_candidates=self.mse_candidates,
+                )
+                module._ovtr_quant_aggregation_output_quantizer.initialize_from_observer(
                     range_method=self.range_method,
                     mse_candidates=self.mse_candidates,
                 )
@@ -2097,10 +2299,16 @@ class OVTRQuantController:
                     return True
         for module in self.attention_modules:
             if self.mode == "ptq":
-                if module._ovtr_quant_attention_observer.initialized.item():
+                if (
+                    module._ovtr_quant_attention_observer.initialized.item()
+                    or module._ovtr_quant_aggregation_output_observer.initialized.item()
+                ):
                     return True
             else:
-                if module._ovtr_quant_attention_quantizer.initialized.item():
+                if (
+                    module._ovtr_quant_attention_quantizer.initialized.item()
+                    or module._ovtr_quant_aggregation_output_quantizer.initialized.item()
+                ):
                     return True
         return False
 
@@ -2189,6 +2397,10 @@ class OVTRQuantController:
                 range_method=self.range_method,
                 mse_candidates=self.mse_candidates,
             )
+            module._ovtr_quant_aggregation_output_quantizer.initialize_from_observer(
+                range_method=self.range_method,
+                mse_candidates=self.mse_candidates,
+            )
 
     def enable_calibration(self, reset: bool = True) -> None:
         if reset:
@@ -2207,6 +2419,8 @@ class OVTRQuantController:
             for module in self.attention_modules:
                 module._ovtr_quant_attention_quant_enabled = False
                 module._ovtr_quant_attention_calibration_enabled = True
+                module._ovtr_quant_aggregation_quant_enabled = False
+                module._ovtr_quant_aggregation_calibration_enabled = True
             return
 
         self.observer_enabled = True
@@ -2219,6 +2433,8 @@ class OVTRQuantController:
         for module in self.attention_modules:
             module._ovtr_quant_attention_quant_enabled = False
             module._ovtr_quant_attention_observer_enabled = True
+            module._ovtr_quant_aggregation_quant_enabled = False
+            module._ovtr_quant_aggregation_observer_enabled = True
 
     def enable_quantization(self) -> None:
         if self.mode != "ptq":
@@ -2235,6 +2451,8 @@ class OVTRQuantController:
         for module in self.attention_modules:
             module._ovtr_quant_attention_quant_enabled = True
             module._ovtr_quant_attention_calibration_enabled = False
+            module._ovtr_quant_aggregation_quant_enabled = True
+            module._ovtr_quant_aggregation_calibration_enabled = False
 
     def enable_qat(self) -> None:
         if self.mode != "qat":
@@ -2252,6 +2470,8 @@ class OVTRQuantController:
         for module in self.attention_modules:
             module._ovtr_quant_attention_quant_enabled = True
             module._ovtr_quant_attention_observer_enabled = False
+            module._ovtr_quant_aggregation_quant_enabled = True
+            module._ovtr_quant_aggregation_observer_enabled = False
 
     def disable(self) -> None:
         self.quant_enabled = False
@@ -2274,8 +2494,56 @@ class OVTRQuantController:
             module._ovtr_quant_attention_quant_enabled = False
             if self.mode == "ptq":
                 module._ovtr_quant_attention_calibration_enabled = False
+                module._ovtr_quant_aggregation_quant_enabled = False
+                module._ovtr_quant_aggregation_calibration_enabled = False
             else:
                 module._ovtr_quant_attention_observer_enabled = False
+                module._ovtr_quant_aggregation_quant_enabled = False
+                module._ovtr_quant_aggregation_observer_enabled = False
+
+    def prepare_int_msda_deploy(self) -> int:
+        if self.mode != "qat":
+            raise RuntimeError("--quant_deploy int_msda requires a QAT checkpoint.")
+        if self.weight_bits != 4 or self.activation_bits != 4 or self.attention_bits != 8:
+            raise RuntimeError(
+                "int_msda requires weight_bits=4, activation_bits=4, attention_bits=8."
+            )
+        if self.model.training:
+            raise RuntimeError("--quant_deploy int_msda is eval/inference only.")
+
+        prepared = 0
+        for module in self.attention_modules:
+            name = getattr(module, "_ovtr_quant_name", module.__class__.__name__)
+            _require_attention_per_head_uint8(
+                getattr(module, "_ovtr_quant_attention_quantizer", None),
+                f"{name}.attention",
+                module.num_heads,
+            )
+            _require_asymmetric_per_tensor_uint4(
+                getattr(module, "_ovtr_quant_aggregation_output_quantizer", None),
+                f"{name}.aggregation_output",
+            )
+            for role in ("value_proj", "sampling_offsets", "attention_weights", "output_proj"):
+                linear = getattr(module, role, None)
+                if not isinstance(linear, nn.Linear):
+                    raise RuntimeError(f"{name}.{role} must be nn.Linear for int_msda.")
+                if role != "output_proj":
+                    _require_asymmetric_per_tensor_uint4(
+                        getattr(linear, "_ovtr_quant_input_quantizer", None),
+                        f"{name}.{role}.input",
+                    )
+                _require_asymmetric_per_tensor_uint4(
+                    getattr(linear, "_ovtr_quant_output_quantizer", None),
+                    f"{name}.{role}.output",
+                )
+                _export_lowbit_linear(linear, f"{name}.{role}")
+            module._ovtr_quant_deploy_mode = "int_msda"
+            module._ovtr_int_msda_dispatch_count = 0
+            prepared += 1
+        if prepared == 0:
+            raise RuntimeError("No MSDeformAttn modules were prepared for int_msda deploy.")
+        self.runtime_state = "int_msda"
+        return prepared
 
     def summary(self) -> str:
         return (
@@ -2290,9 +2558,9 @@ def maybe_prepare_ovtr_quant_controller(
     model: nn.Module,
     mode: str,
     partition: str,
-    weight_bits: int = 8,
-    activation_bits: int = 6,
-    attention_bits: int = 4,
+    weight_bits: int = 4,
+    activation_bits: int = 4,
+    attention_bits: int = 8,
     range_method: str = "minmax",
     mse_candidates: int = 80,
     mse_bins: int = 2048,
@@ -2315,6 +2583,42 @@ def maybe_prepare_ovtr_quant_controller(
         range_method=range_method,
         mse_candidates=mse_candidates,
         mse_bins=mse_bins,
+    )
+
+
+class GroupAQATController(OVTRQuantController):
+    """Compatibility shim; new QAT state is owned by OVTRQuantController and _ovtr_quant_* keys."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        weight_bits: int = 4,
+        activation_bits: int = 4,
+        attention_bits: int = 8,
+    ):
+        super().__init__(
+            model=model,
+            mode="qat",
+            partition="exp_a1",
+            weight_bits=weight_bits,
+            activation_bits=activation_bits,
+            attention_bits=attention_bits,
+        )
+
+
+def maybe_prepare_group_a_qat(
+    model: nn.Module,
+    weight_bits: int = 4,
+    activation_bits: int = 4,
+    attention_bits: int = 8,
+) -> OVTRQuantController:
+    return maybe_prepare_ovtr_quant_controller(
+        model,
+        mode="qat",
+        partition="exp_a1",
+        weight_bits=weight_bits,
+        activation_bits=activation_bits,
+        attention_bits=attention_bits,
     )
 
 
@@ -2345,6 +2649,35 @@ def maybe_observe_and_quantize_attention(module: nn.Module, attention_weights: t
         return attention_weights
 
     return attention_weights
+
+
+def maybe_observe_and_quantize_msda_aggregation(module: nn.Module, output: torch.Tensor) -> torch.Tensor:
+    backend = getattr(module, "_ovtr_quant_backend", None)
+    if backend == "ptq":
+        observer = getattr(module, "_ovtr_quant_aggregation_output_observer", None)
+        if observer is None:
+            return output
+        if getattr(module, "_ovtr_quant_aggregation_calibration_enabled", False):
+            observer.observe(output)
+        if getattr(module, "_ovtr_quant_aggregation_quant_enabled", False):
+            quantized = observer.fake_quant(output)
+            _record_quant_boundary(module, "msda_aggregation_output", output, quantized)
+            return quantized
+        return output
+
+    if backend == "qat":
+        quantizer = getattr(module, "_ovtr_quant_aggregation_output_quantizer", None)
+        if quantizer is None:
+            return output
+        if getattr(module, "_ovtr_quant_aggregation_observer_enabled", False):
+            quantizer.observe(output)
+        if getattr(module, "_ovtr_quant_aggregation_quant_enabled", False):
+            quantized = quantizer.quantize(output)
+            _record_quant_boundary(module, "msda_aggregation_output", output, quantized)
+            return quantized
+        return output
+
+    return output
 
 
 def maybe_get_quantized_embedding_weight(module: nn.Module) -> torch.Tensor:

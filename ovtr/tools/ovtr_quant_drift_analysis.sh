@@ -10,6 +10,9 @@ MODEL_VARIANT="${MODEL_VARIANT:-5_frame}"
 EVAL_SPLIT="${EVAL_SPLIT:-val}"
 QUANT_MODE="${QUANT_MODE:-ptq}"
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a3}"
+QUANT_WEIGHT_BITS="${QUANT_WEIGHT_BITS:-4}"
+QUANT_ACTIVATION_BITS="${QUANT_ACTIVATION_BITS:-4}"
+QUANT_ATTENTION_BITS="${QUANT_ATTENTION_BITS:-8}"
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
 OUTPUT="${OUTPUT:-./results}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -96,6 +99,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python ./analyze_quant_drift.py \
     --calculate_negative_samples \
     --quant_mode "${QUANT_MODE}" \
     --quant_partition "${QUANT_PARTITION}" \
+    --quant_weight_bits "${QUANT_WEIGHT_BITS}" \
+    --quant_activation_bits "${QUANT_ACTIVATION_BITS}" \
+    --quant_attention_bits "${QUANT_ATTENTION_BITS}" \
     --quant_calib_samples "${CALIB_SAMPLES}" \
     --score_thresh ${SCORE_THRESH} \
     --filter_score_thresh ${FILTER_SCORE_THRESH} \

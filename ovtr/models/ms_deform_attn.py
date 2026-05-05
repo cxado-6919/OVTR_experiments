@@ -15,7 +15,12 @@ from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
 from .ops import HAS_MSDA_EXT, MSDA
-from .quant_utils import maybe_observe_and_quantize_attention
+from .quant_utils import (
+    maybe_observe_and_quantize_attention,
+    maybe_observe_and_quantize_msda_aggregation,
+    pack_uint4,
+    quantize_affine_uint,
+)
 
 
 # helpers
@@ -216,6 +221,169 @@ class MultiScaleDeformableAttention(nn.Module):
         self.attention_weights.weight.requires_grad = False
         self.attention_weights.bias.requires_grad = False
 
+    @staticmethod
+    def _require_lowbit_symbol(name: str):
+        if not HAS_MSDA_EXT or MSDA is None:
+            raise RuntimeError(f"--quant_deploy int_msda requires CUDA extension symbol {name}.")
+        if not hasattr(MSDA, name) and name == "ms_deform_attn_lowbit_forward" and hasattr(MSDA, "ms_deform_attn_int_forward"):
+            return getattr(MSDA, "ms_deform_attn_int_forward")
+        if not hasattr(MSDA, name):
+            raise RuntimeError(f"--quant_deploy int_msda requires CUDA extension symbol {name}.")
+        return getattr(MSDA, name)
+
+    @staticmethod
+    def _quantizer_scalar(quantizer: nn.Module, attr: str, device: torch.device) -> torch.Tensor:
+        value = getattr(quantizer, attr)
+        if value is None or value.numel() != 1:
+            raise RuntimeError(f"Expected scalar {attr} for int_msda activation quantizer.")
+        return value.detach().reshape(1).to(device=device, dtype=torch.float32)
+
+    def _lowbit_linear(self, linear: nn.Linear, x: torch.Tensor, input_quantizer: nn.Module) -> torch.Tensor:
+        lowbit_linear_forward = self._require_lowbit_symbol("lowbit_linear_forward")
+        if not x.is_cuda:
+            raise RuntimeError("--quant_deploy int_msda requires CUDA tensors.")
+        if not hasattr(linear, "_ovtr_quant_int4_weight_packed"):
+            raise RuntimeError(f"Missing int_msda export key for {getattr(linear, '_ovtr_quant_name', 'linear')}.")
+
+        rows = x.reshape(-1, linear.in_features).contiguous()
+        x_scale = self._quantizer_scalar(input_quantizer, "scale", rows.device)
+        x_zero_point = self._quantizer_scalar(input_quantizer, "zero_point", rows.device)
+        x_q = quantize_affine_uint(rows.float(), x_scale, x_zero_point, bit_width=4)
+        x_packed = pack_uint4(x_q)
+        out = lowbit_linear_forward(
+            x_packed,
+            linear._ovtr_quant_int4_weight_packed,
+            linear._ovtr_quant_int4_weight_sum,
+            x_scale,
+            x_zero_point,
+            linear._ovtr_quant_int4_weight_scale,
+            linear._ovtr_quant_bias_fp32,
+            rows.shape[0],
+            linear.in_features,
+            linear.out_features,
+        )
+        return out.reshape(*x.shape[:-1], linear.out_features)
+
+    def _quantize_attention_per_head(self, attention_weights: torch.Tensor) -> torch.Tensor:
+        quantizer = getattr(self, "_ovtr_quant_attention_quantizer", None)
+        if quantizer is None or quantizer.scale.numel() != self.num_heads:
+            raise RuntimeError("Missing per-head UINT8 attention qparams for int_msda.")
+        scale = quantizer.scale.detach().to(device=attention_weights.device, dtype=attention_weights.dtype)
+        zero_point = torch.round(
+            quantizer.zero_point.detach().to(device=attention_weights.device, dtype=attention_weights.dtype)
+        ).clamp(0, 255)
+        scale = scale.view(1, 1, self.num_heads, 1).clamp(min=1e-8)
+        zero_point = zero_point.view(1, 1, self.num_heads, 1)
+        q = torch.round(attention_weights / scale + zero_point).clamp(0, 255)
+        return q.to(torch.uint8)
+
+    def _forward_int_msda(
+        self,
+        query: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        reference_points: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training:
+            raise RuntimeError("--quant_deploy int_msda is eval/inference only.")
+        lowbit_msda_forward = self._require_lowbit_symbol("ms_deform_attn_lowbit_forward")
+
+        bs, num_query, _ = query.shape
+        _, num_value, _ = value.shape
+        head_dim = self.embed_dim // self.num_heads
+
+        value_proj_input_q = self.value_proj._ovtr_quant_input_quantizer
+        value_proj_output_q = self.value_proj._ovtr_quant_output_quantizer
+        value_real = self._lowbit_linear(self.value_proj, value, value_proj_input_q)
+        value_real = value_real.view(bs, num_value, self.num_heads, head_dim)
+        value_q = quantize_affine_uint(
+            value_real.float(),
+            self._quantizer_scalar(value_proj_output_q, "scale", value_real.device),
+            self._quantizer_scalar(value_proj_output_q, "zero_point", value_real.device),
+            bit_width=4,
+        )
+        value_zero_point = self._quantizer_scalar(value_proj_output_q, "zero_point", value_real.device)
+        if key_padding_mask is not None:
+            z_v = int(round(float(value_zero_point.item())))
+            value_q = value_q.masked_fill(key_padding_mask[:, :, None, None].to(device=value_q.device), z_v)
+        value_packed = pack_uint4(value_q)
+
+        sampling_offsets = self._lowbit_linear(
+            self.sampling_offsets,
+            query,
+            self.sampling_offsets._ovtr_quant_input_quantizer,
+        ).view(bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        attention_logits = self._lowbit_linear(
+            self.attention_weights,
+            query,
+            self.attention_weights._ovtr_quant_input_quantizer,
+        ).view(bs, num_query, self.num_heads, self.num_levels * self.num_points)
+        attention_weights = attention_logits.softmax(-1)
+        attention_q = self._quantize_attention_per_head(attention_weights).view(
+            bs, num_query, self.num_heads, self.num_levels, self.num_points
+        )
+
+        if reference_points.shape[-1] == 2:
+            offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            sampling_locations = (
+                reference_points[:, :, None, :, None, :]
+                + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            )
+        elif reference_points.shape[-1] == 4:
+            sampling_locations = (
+                reference_points[:, :, None, :, None, :2]
+                + sampling_offsets
+                / self.num_points
+                * reference_points[:, :, None, :, None, 2:]
+                * 0.5
+            )
+        else:
+            raise ValueError(
+                "Last dim of reference_points must be 2 or 4, but get {} instead.".format(
+                    reference_points.shape[-1]
+                )
+            )
+
+        attention_quantizer = self._ovtr_quant_attention_quantizer
+        aggregation = lowbit_msda_forward(
+            value_packed,
+            spatial_shapes.contiguous(),
+            level_start_index.contiguous(),
+            sampling_locations.contiguous(),
+            attention_q.contiguous(),
+            self._quantizer_scalar(value_proj_output_q, "scale", value_real.device),
+            value_zero_point,
+            attention_quantizer.scale.detach().float().to(value_real.device).contiguous(),
+            attention_quantizer.zero_point.detach().float().to(value_real.device).contiguous(),
+            head_dim,
+            self.im2col_step,
+        )
+
+        aggregation_q = self._ovtr_quant_aggregation_output_quantizer
+        aggregation_uint4 = quantize_affine_uint(
+            aggregation.float(),
+            self._quantizer_scalar(aggregation_q, "scale", aggregation.device),
+            self._quantizer_scalar(aggregation_q, "zero_point", aggregation.device),
+            bit_width=4,
+        )
+        aggregation_packed = pack_uint4(aggregation_uint4)
+        output = self._require_lowbit_symbol("lowbit_linear_forward")(
+            aggregation_packed,
+            self.output_proj._ovtr_quant_int4_weight_packed,
+            self.output_proj._ovtr_quant_int4_weight_sum,
+            self._quantizer_scalar(aggregation_q, "scale", aggregation.device),
+            self._quantizer_scalar(aggregation_q, "zero_point", aggregation.device),
+            self.output_proj._ovtr_quant_int4_weight_scale,
+            self.output_proj._ovtr_quant_bias_fp32,
+            bs * num_query,
+            self.output_proj.in_features,
+            self.output_proj.out_features,
+        )
+        self._ovtr_int_msda_dispatch_count = getattr(self, "_ovtr_int_msda_dispatch_count", 0) + 1
+        return output.view(bs, num_query, self.output_proj.out_features)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -272,6 +440,19 @@ class MultiScaleDeformableAttention(nn.Module):
         bs, num_value, _ = value.shape
 
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
+
+        if getattr(self, "_ovtr_quant_deploy_mode", "none") == "int_msda":
+            output = self._forward_int_msda(
+                query,
+                value,
+                key_padding_mask,
+                reference_points,
+                spatial_shapes,
+                level_start_index,
+            )
+            if not self.batch_first:
+                output = output.permute(1, 0, 2)
+            return output
 
         value = self.value_proj(value)
         if key_padding_mask is not None:
@@ -339,6 +520,7 @@ class MultiScaleDeformableAttention(nn.Module):
                 value, spatial_shapes, sampling_locations, attention_weights
             )
 
+        output = maybe_observe_and_quantize_msda_aggregation(self, output)
         output = self.output_proj(output)
 
         if not self.batch_first:

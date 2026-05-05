@@ -34,11 +34,14 @@ from models import build_model
 from util.slconfig import SLConfig
 from util.tool import load_model
 from util.quantization import (
+    build_quant_manifest,
     build_quant_calibration_loader,
     calibrate_quant_controller_on_val_loader,
     enable_loaded_quantization,
+    enable_int_msda_deploy,
     prepare_quant_model_for_calibration,
     setup_quant_controller,
+    write_quant_manifest,
 )
 from main import get_args_parser
 from detectron2.structures import Instances
@@ -447,6 +450,9 @@ def eval(args, cfg):
             )
     model.eval()
     model = model.to(torch.device(args.device))
+    enable_int_msda_deploy(model, args)
+    if quant_controller is not None:
+        write_quant_manifest(model, args)
 
     dataset_val = build_dataset(image_set='val', args=args, cfg=cfg.data.test)
     if args.distributed:
@@ -472,10 +478,11 @@ def eval(args, cfg):
         )
         quant_controller.enable_quantization()
         print(f"[Quant] PTQ calibration complete on {calibrated} samples", flush=True)
+        write_quant_manifest(model, args)
         if args.quant_calibration_only:
             if args.output_dir:
                 utils.save_on_master(
-                    {"model": model.state_dict(), "args": args},
+                    {"model": model.state_dict(), "args": args, "quant_meta": build_quant_manifest(model, args)},
                     Path(args.output_dir) / "checkpoint_quant_calibrated.pth",
                 )
             print("[Quant] Exiting after PTQ calibration as requested.", flush=True)
@@ -527,6 +534,9 @@ def eval(args, cfg):
     else:
         avg_latency_ms = float("nan")
         fps = float("nan")
+
+    if quant_controller is not None:
+        write_quant_manifest(model, args)
 
     resfile_path = tracker.result_path_track
     print('Inference completed')

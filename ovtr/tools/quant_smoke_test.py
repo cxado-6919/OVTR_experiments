@@ -10,8 +10,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.quant_utils import (  # noqa: E402
     MSEHistogramObserver,
+    dequantize_affine_uint,
     is_quant_trainable_param,
     maybe_prepare_ovtr_quant_controller,
+    pack_int4,
+    pack_uint4,
+    quantize_affine_uint,
+    unpack_int4,
+    unpack_uint4,
 )
 from util.quantization import _fold_frozen_batch_norms  # noqa: E402
 from util.quantization import _finalize_bias_correction_stats, _register_bias_correction_hooks  # noqa: E402
@@ -127,6 +133,42 @@ def test_qat_quant_params():
     assert torch.isfinite(model(torch.randn(2, 4))).all()
 
 
+def test_lowbit_pack_layout_and_reconstruction():
+    uint4 = torch.tensor([0, 15, 2], dtype=torch.uint8)
+    packed_uint4 = pack_uint4(uint4)
+    assert packed_uint4.tolist() == [0xF0, 0x02]
+    assert unpack_uint4(packed_uint4, uint4.numel()).tolist() == uint4.tolist()
+
+    int4 = torch.tensor([-8, -1, 0, 7], dtype=torch.int8)
+    packed_int4 = pack_int4(int4)
+    assert packed_int4.tolist() == [0xF8, 0x70]
+    assert unpack_int4(packed_int4, int4.numel()).tolist() == int4.tolist()
+
+    x = torch.tensor([-0.31, 0.0, 0.23, 0.91])
+    scale = torch.tensor([0.1])
+    zero_point = torch.tensor([7.0])
+    q = quantize_affine_uint(x, scale, zero_point, bit_width=4)
+    reconstructed = dequantize_affine_uint(unpack_uint4(pack_uint4(q), q.numel()), scale, zero_point)
+    expected = (torch.round(x / scale + zero_point).clamp(0, 15) - zero_point) * scale
+    assert torch.allclose(reconstructed, expected)
+
+
+def test_uint4_zero_point_correction_formula():
+    x_q = torch.tensor([[7, 8, 9, 10], [5, 7, 11, 15]], dtype=torch.int32)
+    w_q = torch.tensor([[1, -2, 3, -4], [-3, 2, -1, 4]], dtype=torch.int32)
+    z_x = torch.tensor(7, dtype=torch.int32)
+    s_x = torch.tensor(0.125)
+    s_w = torch.tensor([0.25, 0.5])
+    bias = torch.tensor([0.1, -0.2])
+
+    direct = ((x_q - z_x).float()[:, None, :] * w_q.float()[None, :, :]).sum(dim=-1)
+    direct = direct * (s_x * s_w)[None, :] + bias[None, :]
+
+    corrected_acc = x_q @ w_q.T - z_x * w_q.sum(dim=1)
+    corrected = corrected_acc.float() * (s_x * s_w)[None, :] + bias[None, :]
+    assert torch.allclose(corrected, direct)
+
+
 def main():
     torch.manual_seed(0)
     test_bn_folding()
@@ -135,6 +177,8 @@ def main():
     test_ptq_legacy_minmax_path()
     test_bias_correction_stats_path()
     test_qat_quant_params()
+    test_lowbit_pack_layout_and_reconstruction()
+    test_uint4_zero_point_correction_formula()
     print("quant smoke passed")
 
 

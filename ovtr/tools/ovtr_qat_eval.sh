@@ -9,6 +9,9 @@ cd "${PROJECT_DIR}"
 MODEL_VARIANT="${MODEL_VARIANT:-lite}"
 EVAL_SPLIT="${EVAL_SPLIT:-val}"
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a}"
+QUANT_WEIGHT_BITS="${QUANT_WEIGHT_BITS:-4}"
+QUANT_ACTIVATION_BITS="${QUANT_ACTIVATION_BITS:-4}"
+QUANT_ATTENTION_BITS="${QUANT_ATTENTION_BITS:-8}"
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
 MASTER_PORT="${MASTER_PORT:-9988}"
 NPROC_GPU="${NPROC_GPU:-1}"
@@ -87,6 +90,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" -
     --calculate_negative_samples \
     --quant_mode qat \
     --quant_partition "${QUANT_PARTITION}" \
+    --quant_weight_bits "${QUANT_WEIGHT_BITS}" \
+    --quant_activation_bits "${QUANT_ACTIVATION_BITS}" \
+    --quant_attention_bits "${QUANT_ATTENTION_BITS}" \
     --score_thresh ${SCORE_THRESH} \
     --filter_score_thresh ${FILTER_SCORE_THRESH} \
     --ious_thresh ${IOUS_THRESH} \

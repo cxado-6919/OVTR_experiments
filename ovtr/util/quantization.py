@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,12 @@ def add_quant_args(parser) -> None:
         default="none",
         choices=["none", "ptq", "qat"],
         help="full-model quantization mode",
+    )
+    parser.add_argument(
+        "--quant_deploy",
+        default="none",
+        choices=["none", "int_msda"],
+        help="deploy-time quantized inference backend; int_msda is eval/inference only",
     )
     parser.add_argument(
         "--quant_partition",
@@ -157,19 +164,19 @@ def add_quant_args(parser) -> None:
     )
     parser.add_argument(
         "--quant_weight_bits",
-        default=8,
+        default=4,
         type=int,
         help="weight bit width for quantization",
     )
     parser.add_argument(
         "--quant_activation_bits",
-        default=6,
+        default=4,
         type=int,
         help="activation bit width for quantization",
     )
     parser.add_argument(
         "--quant_attention_bits",
-        default=4,
+        default=8,
         type=int,
         help="attention bit width for quantization",
     )
@@ -505,6 +512,111 @@ def setup_quant_controller(model: torch.nn.Module, args) -> Optional[object]:
     )
     print(f"[Quant] {controller.summary()}", flush=True)
     return controller
+
+
+def _quant_module_name_list(modules) -> list:
+    return [getattr(module, "_ovtr_quant_name", "") for module in modules]
+
+
+def _int_msda_dispatch_counts(controller) -> dict:
+    counts = {}
+    if controller is None:
+        return counts
+    for module in getattr(controller, "attention_modules", []):
+        name = getattr(module, "_ovtr_quant_name", "")
+        counts[name] = int(getattr(module, "_ovtr_int_msda_dispatch_count", 0))
+    return counts
+
+
+def build_quant_manifest(model: torch.nn.Module, args) -> dict:
+    model_ref = unwrap_model(model)
+    controller = getattr(model_ref, "_ovtr_quant_controller", None)
+    state_keys = list(model_ref.state_dict().keys())
+    quant_state_keys = [key for key in state_keys if "_ovtr_quant_" in key]
+    int_export_keys = [
+        key
+        for key in state_keys
+        if "_ovtr_quant_int4_" in key or key.endswith("_ovtr_quant_bias_fp32")
+    ]
+    original_trainable = []
+    quant_trainable = []
+    for name, param in model_ref.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "_ovtr_quant_" in name:
+            quant_trainable.append(name)
+        else:
+            original_trainable.append(name)
+
+    manifest = {
+        "quant_mode": getattr(args, "quant_mode", "none"),
+        "quant_deploy": getattr(args, "quant_deploy", "none"),
+        "partition": getattr(args, "quant_partition", None),
+        "controller_summary": controller.summary() if controller is not None else None,
+        "weight_bits": getattr(args, "quant_weight_bits", None),
+        "activation_bits": getattr(args, "quant_activation_bits", None),
+        "attention_bits": getattr(args, "quant_attention_bits", None),
+        "qscheme": {
+            "weight": "4-bit symmetric per-output-channel",
+            "activation": "4-bit asymmetric per-tensor",
+            "attention": "8-bit asymmetric per-head(axis=num_heads)",
+        },
+        "quant_module_names": list(getattr(controller, "quant_module_names", [])) if controller is not None else [],
+        "attention_modules": _quant_module_name_list(getattr(controller, "attention_modules", [])) if controller is not None else [],
+        "original_trainable_params": original_trainable,
+        "quant_trainable_params": quant_trainable,
+        "quant_enabled": bool(getattr(controller, "quant_enabled", False)) if controller is not None else False,
+        "observer_enabled": bool(getattr(controller, "observer_enabled", False)) if controller is not None else False,
+        "runtime_state": getattr(controller, "runtime_state", None) if controller is not None else None,
+        "quant_state_key_count": len(quant_state_keys),
+        "int_msda_export_key_count": len(int_export_keys),
+        "int_msda_dispatch_counter": _int_msda_dispatch_counts(controller),
+    }
+    return manifest
+
+
+def write_quant_manifest(model: torch.nn.Module, args, *, filename: str = "quant_manifest.json") -> Optional[dict]:
+    if not getattr(args, "output_dir", None):
+        return None
+    manifest = build_quant_manifest(model, args)
+    if utils.is_main_process():
+        output_path = Path(args.output_dir) / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+    return manifest
+
+
+def enable_int_msda_deploy(model: torch.nn.Module, args) -> None:
+    if getattr(args, "quant_deploy", "none") != "int_msda":
+        return
+    model_ref = unwrap_model(model)
+    if model_ref.training:
+        raise RuntimeError("--quant_deploy int_msda is eval/inference only.")
+    if not torch.cuda.is_available() or not str(getattr(args, "device", "")).startswith("cuda"):
+        raise RuntimeError("--quant_deploy int_msda requires CUDA.")
+    try:
+        from models.ops import HAS_MSDA_EXT, MSDA
+    except ImportError as exc:
+        raise RuntimeError("Missing CUDA MSDA extension for --quant_deploy int_msda.") from exc
+    if not HAS_MSDA_EXT or MSDA is None:
+        raise RuntimeError("Missing CUDA MSDA extension for --quant_deploy int_msda.")
+    if not (
+        hasattr(MSDA, "ms_deform_attn_lowbit_forward")
+        or hasattr(MSDA, "ms_deform_attn_int_forward")
+    ):
+        raise RuntimeError(
+            "CUDA extension does not expose ms_deform_attn_lowbit_forward/ms_deform_attn_int_forward."
+        )
+    if not hasattr(MSDA, "lowbit_linear_forward"):
+        raise RuntimeError("CUDA extension does not expose lowbit_linear_forward.")
+
+    controller = getattr(model_ref, "_ovtr_quant_controller", None)
+    if controller is None:
+        raise RuntimeError("--quant_deploy int_msda requires OVTRQuantController.")
+    prepared = controller.prepare_int_msda_deploy()
+    if utils.is_main_process():
+        print(f"[Quant] Prepared {prepared} MSDeformAttn modules for int_msda deploy", flush=True)
 
 
 def _cfg_get(cfg_obj, key, default=None):
