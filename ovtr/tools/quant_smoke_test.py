@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.quant_utils import (  # noqa: E402
     MSEHistogramObserver,
     dequantize_affine_uint,
+    is_partition_trainable_param,
     is_quant_trainable_param,
     maybe_prepare_ovtr_quant_controller,
     pack_int4,
@@ -45,6 +46,41 @@ class ToyQuantModel(nn.Module):
 
     def forward(self, x):
         return self.backbone(x)
+
+
+class ToyPartitionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Linear(4, 4)
+        self.input_proj = nn.Linear(4, 4)
+        self.patch2query = nn.Linear(4, 4)
+        self.transformer = nn.Module()
+        self.transformer.encoder = nn.Sequential(nn.Linear(4, 4))
+        self.transformer.encoder.fusion_layers = nn.Sequential(nn.Linear(4, 4))
+        self.transformer.enc_output = nn.Linear(4, 4)
+        self.transformer.enc_out_bbox_embed = nn.Linear(4, 4)
+        self.transformer.decoder = nn.Module()
+        self.transformer.decoder.layers = nn.Sequential(nn.Linear(4, 4))
+        self.transformer.decoder.bbox_embed = nn.Linear(4, 4)
+        self.transformer.tgt_embed = nn.Linear(4, 4)
+        self.feature_align = nn.Linear(4, 4)
+        self.track_embed = nn.Linear(4, 4)
+        self.unrelated = nn.Linear(4, 4)
+
+
+def _partition_quant_module_names(partition):
+    model = ToyPartitionModel()
+    controller = maybe_prepare_ovtr_quant_controller(model, mode="ptq", partition=partition, range_method="minmax")
+    return set(controller.quant_module_names)
+
+
+def _partition_trainable_param_names(partition):
+    model = ToyPartitionModel()
+    return {name for name, _ in model.named_parameters() if is_partition_trainable_param(name, partition)}
+
+
+def _param_names_for_modules(module_names):
+    return {f"{name}.{suffix}" for name in module_names for suffix in ("weight", "bias")}
 
 
 def test_bn_folding():
@@ -133,6 +169,42 @@ def test_qat_quant_params():
     assert torch.isfinite(model(torch.randn(2, 4))).all()
 
 
+def test_combined_partition_coverage():
+    a1_to_b_modules = {
+        "backbone",
+        "input_proj",
+        "patch2query",
+        "transformer.encoder.0",
+        "transformer.enc_output",
+        "transformer.enc_out_bbox_embed",
+        "transformer.decoder.layers.0",
+        "transformer.tgt_embed",
+        "track_embed",
+    }
+    a3_b_modules = {
+        "transformer.decoder.layers.0",
+        "transformer.tgt_embed",
+        "track_embed",
+    }
+
+    assert _partition_quant_module_names("exp_a1_to_b") == a1_to_b_modules
+    assert _partition_trainable_param_names("exp_a1_to_b") == _param_names_for_modules(a1_to_b_modules)
+    assert _partition_quant_module_names("exp_a3_b") == a3_b_modules
+    assert _partition_trainable_param_names("exp_a3_b") == _param_names_for_modules(a3_b_modules)
+
+    exp_a3_modules = {
+        "transformer.decoder.layers.0",
+        "transformer.tgt_embed",
+    }
+    assert _partition_quant_module_names("exp_a3") == exp_a3_modules
+    assert _partition_trainable_param_names("exp_a3") == _param_names_for_modules(exp_a3_modules)
+
+    exp_a_modules = _partition_quant_module_names("exp_a")
+    assert "transformer.decoder.bbox_embed" in exp_a_modules
+    assert "feature_align" in exp_a_modules
+    assert "track_embed" not in exp_a_modules
+
+
 def test_lowbit_pack_layout_and_reconstruction():
     uint4 = torch.tensor([0, 15, 2], dtype=torch.uint8)
     packed_uint4 = pack_uint4(uint4)
@@ -177,6 +249,7 @@ def main():
     test_ptq_legacy_minmax_path()
     test_bias_correction_stats_path()
     test_qat_quant_params()
+    test_combined_partition_coverage()
     test_lowbit_pack_layout_and_reconstruction()
     test_uint4_zero_point_correction_formula()
     print("quant smoke passed")

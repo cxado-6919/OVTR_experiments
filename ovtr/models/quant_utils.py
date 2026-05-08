@@ -1233,7 +1233,16 @@ def _is_quant_module(module: nn.Module) -> bool:
     return isinstance(module, (nn.Conv2d, nn.Linear, nn.MultiheadAttention, nn.Embedding)) or _is_msda(module)
 
 
-SUPPORTED_QUANT_PARTITIONS = ("exp_a", "exp_a1", "exp_a2", "exp_a3", "exp_a3_head", "exp_b")
+SUPPORTED_QUANT_PARTITIONS = (
+    "exp_a",
+    "exp_a1",
+    "exp_a2",
+    "exp_a3",
+    "exp_a3_head",
+    "exp_b",
+    "exp_a1_to_b",
+    "exp_a3_b",
+)
 
 
 def _is_encoder_aggregation_param(name: str) -> bool:
@@ -1298,6 +1307,19 @@ def _is_exp_a_trainable_param(name: str) -> bool:
 
 def _is_exp_b_trainable_param(name: str) -> bool:
     return name.startswith("track_embed")
+
+
+def _is_exp_a1_to_b_trainable_param(name: str) -> bool:
+    return (
+        _is_exp_a1_trainable_param(name)
+        or _is_exp_a2_trainable_param(name)
+        or _is_exp_a3_trainable_param(name)
+        or _is_exp_b_trainable_param(name)
+    )
+
+
+def _is_exp_a3_b_trainable_param(name: str) -> bool:
+    return _is_exp_a3_trainable_param(name) or _is_exp_b_trainable_param(name)
 
 
 def _is_quant_excluded_module(name: str) -> bool:
@@ -1518,13 +1540,13 @@ class OVTRQuantController:
         if not _is_quant_module(module):
             return False
 
-        if self.partition in {"exp_a", "exp_a1"}:
+        if self.partition in {"exp_a", "exp_a1", "exp_a1_to_b"}:
             if name.startswith("backbone") or name.startswith("input_proj") or name.startswith("patch2query"):
                 return True
             if self.partition == "exp_a1":
                 return False
 
-        if self.partition in {"exp_a", "exp_a2"}:
+        if self.partition in {"exp_a", "exp_a2", "exp_a1_to_b"}:
             if (
                 name.startswith("transformer.encoder")
                 and "fusion_layers" not in name
@@ -1533,8 +1555,8 @@ class OVTRQuantController:
             if self.partition == "exp_a2":
                 return False
 
-        if self.partition in {"exp_a", "exp_a3", "exp_a3_head"}:
-            if self.partition == "exp_a3" and _is_exp_a3_output_head_module(name):
+        if self.partition in {"exp_a", "exp_a3", "exp_a3_head", "exp_a1_to_b", "exp_a3_b"}:
+            if self.partition in {"exp_a3", "exp_a1_to_b", "exp_a3_b"} and _is_exp_a3_output_head_module(name):
                 return False
             if (
                 name.startswith("transformer.decoder")
@@ -1548,7 +1570,10 @@ class OVTRQuantController:
         if self.partition == "exp_a":
             return False
 
-        return self.partition == "exp_b" and name.startswith("track_embed")
+        if self.partition in {"exp_b", "exp_a1_to_b", "exp_a3_b"}:
+            return name.startswith("track_embed")
+
+        return False
 
     def _should_patch_module(self, name: str, module: nn.Module) -> bool:
         if not self._matches_partition_module(name, module):
@@ -2708,6 +2733,10 @@ def is_partition_trainable_param(name: str, partition: str) -> bool:
         return _is_exp_a3_head_trainable_param(name)
     if partition == "exp_b":
         return _is_exp_b_trainable_param(name)
+    if partition == "exp_a1_to_b":
+        return _is_exp_a1_to_b_trainable_param(name)
+    if partition == "exp_a3_b":
+        return _is_exp_a3_b_trainable_param(name)
     raise ValueError(f"Unsupported partition: {partition}")
 
 

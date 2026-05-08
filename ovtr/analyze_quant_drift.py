@@ -239,6 +239,8 @@ def default_quant_boundary_module_regex(partition: str) -> Optional[str]:
         return r"^track_embed"
     if partition == "exp_a3":
         return r"^(transformer\.decoder|transformer\.tgt_embed|feature_align)"
+    if partition == "exp_a3_b":
+        return r"^(transformer\.decoder(?!\.bbox_embed)|transformer\.tgt_embed|track_embed)"
     return None
 
 
