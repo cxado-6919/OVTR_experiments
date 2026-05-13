@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
-from util.tool import load_model
+from util.tool import is_mcip_checkpoint_key, load_model
 from util.quantization import (
     add_quant_args,
     build_quant_manifest,
@@ -148,6 +148,22 @@ def get_args_parser():
 
     parser.add_argument('--track_query_iteration', default='CIP', type=str,
                         help="")
+    parser.add_argument('--mcip_enable', default=None, action='store_true')
+    parser.add_argument('--no_mcip_enable', dest='mcip_enable', action='store_false')
+    parser.add_argument('--mcip_detach_memory', dest='mcip_detach_memory', default=None, action='store_true')
+    parser.add_argument('--no_mcip_detach_memory', dest='mcip_detach_memory', action='store_false')
+    parser.add_argument('--mcip_memory_momentum', default=None, type=float)
+    parser.add_argument('--mcip_use_semantic_memory', dest='mcip_use_semantic_memory', default=None, action='store_true')
+    parser.add_argument('--no_mcip_use_semantic_memory', dest='mcip_use_semantic_memory', action='store_false')
+    parser.add_argument('--mcip_use_motion_ref', dest='mcip_use_motion_ref', default=None, action='store_true')
+    parser.add_argument('--no_mcip_use_motion_ref', dest='mcip_use_motion_ref', action='store_false')
+    parser.add_argument('--mcip_motion_momentum', default=None, type=float)
+    parser.add_argument('--mcip_motion_scale_init', default=None, type=float)
+    parser.add_argument('--mcip_gate_use_txt', default=None, action='store_true')
+    parser.add_argument('--debug_mcip', default=None, action='store_true')
+    parser.add_argument('--attention_protection_mode', default=None, choices=['kl', 'topk', 'none'])
+    parser.add_argument('--attention_protection_topk', default=None, type=int)
+    parser.add_argument('--attention_protection_conf_thresh', default=None, type=float)
     parser.add_argument('--sample_mode', type=str, default='fixed_interval')
     parser.add_argument('--sample_interval', type=int, default=1)
     parser.add_argument('--random_drop', type=float, default=0)
@@ -416,6 +432,15 @@ def main(args):
         if not param.requires_grad:
             print("requires_grad: False ", name)
 
+    if getattr(args, "debug_mcip", False) and getattr(args, "mcip_enable", False):
+        mcip_trainable = [
+            name for name, param in model.named_parameters()
+            if param.requires_grad and is_mcip_checkpoint_key(name)
+        ]
+        print("[M-CIP] Trainable M-CIP parameters:")
+        for name in mcip_trainable:
+            print("[M-CIP]   ", name)
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -442,7 +467,11 @@ def main(args):
 
     if args.pretrained is not None:
         ddp_debug(f"before pretrained load: {args.pretrained}")
-        load_model(model_without_ddp, args.pretrained)
+        load_model(
+            model_without_ddp,
+            args.pretrained,
+            allow_mcip_missing=getattr(args, "mcip_enable", False),
+        )
         ddp_debug("after pretrained load")
 
     if args.resume:
@@ -458,6 +487,12 @@ def main(args):
             print(f"Materialized {materialized} checkpoint bias parameters.")
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(model_state, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
+        allowed_mcip_missing = []
+        if getattr(args, "mcip_enable", False):
+            allowed_mcip_missing = [k for k in missing_keys if is_mcip_checkpoint_key(k)]
+            missing_keys = [k for k in missing_keys if not is_mcip_checkpoint_key(k)]
+        if len(allowed_mcip_missing) > 0:
+            print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:

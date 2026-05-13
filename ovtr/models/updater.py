@@ -12,6 +12,64 @@ from util.misc import inverse_sigmoid
 from detectron2.structures import Boxes, Instances, pairwise_iou
 
 
+MCIP_MEMORY_FIELDS = {
+    'img_memory': ('hidden',),
+    'semantic_memory': ('hidden',),
+    'cls_conf_memory': (),
+    'cls_entropy_memory': (),
+    'prev_boxes': (4,),
+    'box_velocity': (4,),
+    'memory_age': (),
+}
+
+
+def ensure_mcip_track_fields(track_instances: Instances, hidden_dim: int, device=None, dtype=None) -> Instances:
+    """Ensure M-CIP persistent memory fields exist and match the current track set."""
+    if len(track_instances) == 0:
+        return track_instances
+
+    if device is None:
+        if track_instances.has('query_tgt'):
+            device = track_instances.query_tgt.device
+        elif track_instances.has('scores'):
+            device = track_instances.scores.device
+        else:
+            device = torch.device('cpu')
+    if dtype is None:
+        if track_instances.has('query_tgt'):
+            dtype = track_instances.query_tgt.dtype
+        else:
+            dtype = torch.float32
+
+    num_tracks = len(track_instances)
+    field_shapes = {
+        'img_memory': (num_tracks, hidden_dim),
+        'semantic_memory': (num_tracks, hidden_dim),
+        'cls_conf_memory': (num_tracks,),
+        'cls_entropy_memory': (num_tracks,),
+        'prev_boxes': (num_tracks, 4),
+        'box_velocity': (num_tracks, 4),
+        'memory_age': (num_tracks,),
+    }
+
+    for name, shape in field_shapes.items():
+        needs_init = not track_instances.has(name)
+        if not needs_init:
+            value = track_instances.get(name)
+            needs_init = (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != tuple(shape)
+                or value.device != device
+            )
+        if needs_init:
+            track_instances.set(name, torch.zeros(shape, device=device, dtype=dtype))
+        else:
+            value = track_instances.get(name)
+            if value.dtype != dtype:
+                track_instances.set(name, value.to(dtype=dtype))
+    return track_instances
+
+
 def random_drop_tracks(track_instances: Instances, drop_probability: float) -> Instances:
     if drop_probability > 0 and len(track_instances) > 0:
         keep_idxes = torch.rand_like(track_instances.scores) > drop_probability
@@ -294,10 +352,160 @@ class Category_Information_Propagator(QueryInteractionModule):
         return merged_track_instances
 
 
+class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propagator):
+    """M-CIP: opt-in category propagation with detached compact track memory."""
+
+    def _build_layers(self, args, dim_in, hidden_dim, dim_out):
+        super()._build_layers(args, dim_in, hidden_dim, dim_out)
+        self.mcip_detach_memory = getattr(args, 'mcip_detach_memory', True)
+        self.mcip_memory_momentum = getattr(args, 'mcip_memory_momentum', 0.8)
+        self.mcip_use_semantic_memory = getattr(args, 'mcip_use_semantic_memory', True)
+        self.mcip_use_motion_ref = getattr(args, 'mcip_use_motion_ref', True)
+        self.mcip_motion_momentum = getattr(args, 'mcip_motion_momentum', 0.7)
+        self.debug_mcip = getattr(args, 'debug_mcip', False)
+
+        gate_input_dim = dim_in * 4 + 3 + 4
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+        self.memory_img_proj = nn.Linear(dim_in, dim_in)
+        self.memory_sem_proj = nn.Linear(dim_in, dim_in)
+        self.motion_scale = nn.Parameter(
+            torch.tensor(float(getattr(args, 'mcip_motion_scale_init', 0.0)))
+        )
+        self.last_debug_stats = {}
+
+    def _reset_parameters(self):
+        super()._reset_parameters()
+        nn.init.zeros_(self.memory_img_proj.weight)
+        nn.init.zeros_(self.memory_img_proj.bias)
+        nn.init.zeros_(self.memory_sem_proj.weight)
+        nn.init.zeros_(self.memory_sem_proj.bias)
+
+    def _detach_if_needed(self, tensor):
+        return tensor.detach() if self.mcip_detach_memory else tensor
+
+    def _get_observation(self, track_instances: Instances, name: str, like: torch.Tensor) -> torch.Tensor:
+        if track_instances.has(name):
+            value = track_instances.get(name)
+            if value.shape[0] == len(track_instances):
+                return value.to(device=like.device, dtype=like.dtype)
+        return torch.zeros((len(track_instances),) + tuple(like.shape[1:]), device=like.device, dtype=like.dtype)
+
+    def _aggregate_category_info(self, track_instances: Instances) -> Instances:
+        if len(track_instances) == 0:
+            return track_instances
+
+        dim = track_instances.output_embedding_img.shape[1]
+        ensure_mcip_track_fields(
+            track_instances,
+            dim,
+            device=track_instances.output_embedding_img.device,
+            dtype=track_instances.output_embedding_img.dtype,
+        )
+
+        out_embed_img = track_instances.output_embedding_img
+        semantic_obs = self._get_observation(track_instances, 'semantic_obs', out_embed_img)
+        cls_conf_obs = self._get_observation(track_instances, 'cls_conf_obs', track_instances.scores).reshape(-1)
+        cls_entropy_obs = self._get_observation(track_instances, 'cls_entropy_obs', track_instances.scores).reshape(-1)
+
+        img_memory_old = track_instances.img_memory
+        semantic_memory_old = track_instances.semantic_memory
+        box_velocity_old = track_instances.box_velocity
+        scores = track_instances.scores.to(dtype=out_embed_img.dtype)
+
+        gate_input = torch.cat([
+            out_embed_img,
+            img_memory_old,
+            semantic_obs,
+            semantic_memory_old,
+            cls_conf_obs[:, None],
+            cls_entropy_obs[:, None],
+            scores[:, None],
+            box_velocity_old,
+        ], dim=-1)
+        gate = self.gate_mlp(gate_input)
+        # Momentum damps the learned overwrite gate so memory changes slowly by default.
+        effective_gate = gate * (1.0 - float(self.mcip_memory_momentum))
+
+        img_memory_new = (1.0 - effective_gate) * img_memory_old + effective_gate * out_embed_img
+        semantic_memory_new = (
+            (1.0 - effective_gate) * semantic_memory_old + effective_gate * semantic_obs
+            if self.mcip_use_semantic_memory
+            else semantic_memory_old
+        )
+        gate_scalar = effective_gate.squeeze(-1)
+        cls_conf_memory_new = (
+            (1.0 - gate_scalar) * track_instances.cls_conf_memory + gate_scalar * cls_conf_obs
+        )
+        cls_entropy_memory_new = (
+            (1.0 - gate_scalar) * track_instances.cls_entropy_memory + gate_scalar * cls_entropy_obs
+        )
+
+        pred_boxes = self._detach_if_needed(track_instances.pred_boxes[:, :4])
+        prev_boxes_old = track_instances.prev_boxes
+        box_delta = pred_boxes - prev_boxes_old
+        box_velocity_new = (
+            float(self.mcip_motion_momentum) * box_velocity_old
+            + (1.0 - float(self.mcip_motion_momentum)) * box_delta
+        )
+        memory_age_new = track_instances.memory_age + 1
+
+        query_pos = track_instances.query_pos
+        query_feat = track_instances.query_tgt
+        mcip_img = out_embed_img + self.memory_img_proj(img_memory_new) + self.memory_sem_proj(semantic_memory_new)
+        q = k = query_pos + mcip_img
+        tgt = mcip_img
+
+        tgt2 = self.self_attn(q[:, None], k[:, None], value=tgt[:, None])[0][:, 0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
+        query_feat = query_feat + self.dropout_feat2(query_feat2)
+        query_feat = self.norm_feat(query_feat)
+        track_instances.query_tgt = query_feat
+
+        if self.mcip_use_motion_ref:
+            next_boxes = pred_boxes + self.motion_scale * box_velocity_new
+            next_boxes = next_boxes.clamp(1e-4, 1.0 - 1e-4)
+            track_instances.ref_pts = inverse_sigmoid(next_boxes.detach().clone())
+        else:
+            track_instances.ref_pts = inverse_sigmoid(
+                track_instances.pred_boxes[:, :4].detach().clone().clamp(1e-4, 1.0 - 1e-4)
+            )
+
+        track_instances.img_memory = self._detach_if_needed(img_memory_new)
+        track_instances.semantic_memory = self._detach_if_needed(semantic_memory_new)
+        track_instances.cls_conf_memory = self._detach_if_needed(cls_conf_memory_new)
+        track_instances.cls_entropy_memory = self._detach_if_needed(cls_entropy_memory_new)
+        track_instances.prev_boxes = self._detach_if_needed(pred_boxes).clone()
+        track_instances.box_velocity = self._detach_if_needed(box_velocity_new)
+        track_instances.memory_age = self._detach_if_needed(memory_age_new)
+
+        if self.debug_mcip:
+            self.last_debug_stats = {
+                'avg_gate': gate.detach().mean().item(),
+                'avg_cls_entropy_memory': track_instances.cls_entropy_memory.detach().mean().item(),
+                'avg_box_velocity_norm': track_instances.box_velocity.detach().norm(dim=-1).mean().item(),
+                'num_active_tracks': len(track_instances),
+            }
+        return track_instances
+
+
 def build(args, layer_name, dim_in, hidden_dim, dim_out):
     embedding_layers = {
         'CIP': Category_Information_Propagator,
         'QIM': QueryInteractionModule,
     }
     assert layer_name in embedding_layers, 'invalid updater: {}'.format(layer_name)
+    if layer_name == 'CIP' and getattr(args, 'mcip_enable', False):
+        return MemoryCalibratedCategoryInformationPropagator(args, dim_in, hidden_dim, dim_out)
     return embedding_layers[layer_name](args, dim_in, hidden_dim, dim_out)

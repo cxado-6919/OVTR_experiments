@@ -438,7 +438,11 @@ def eval(args, cfg):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    model = load_model(model, args.pretrained)
+    model = load_model(
+        model,
+        args.pretrained,
+        allow_mcip_missing=getattr(args, "mcip_enable", False),
+    )
     quant_state_loaded = False
     if quant_controller is not None:
         quant_state_loaded = enable_loaded_quantization(model, require_state=False)

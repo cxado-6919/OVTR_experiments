@@ -4,7 +4,21 @@ from .utils import clean_state_dict
 from models.quant_utils import apply_ovtr_quant_state_dict, materialize_checkpoint_bias_parameters
 
 
-def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None):
+MCIP_CHECKPOINT_KEY_MARKERS = (
+    "track_embed.gate_mlp.",
+    "track_embed.memory_img_proj.",
+    "track_embed.memory_sem_proj.",
+    "track_embed.motion_scale",
+)
+
+
+def is_mcip_checkpoint_key(name):
+    if name.startswith("module."):
+        name = name[7:]
+    return any(marker in name for marker in MCIP_CHECKPOINT_KEY_MARKERS)
+
+
+def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, allow_mcip_missing=False):
     start_epoch = 0
     checkpoint = torch.load(
         model_path,
@@ -31,6 +45,7 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
         else:
             if "_group_a_" not in k:
                 print('Drop parameter {}.'.format(k))
+    allowed_mcip_missing = []
     for k in model_state_dict:
         if not (k in state_dict):
             if "_ovtr_quant_" in k:
@@ -39,9 +54,14 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                 # avoids feeding empty default observer buffers back through
                 # torch.load_state_dict().
                 continue
-            print('No param {}.'.format(k))
+            if allow_mcip_missing and is_mcip_checkpoint_key(k):
+                allowed_mcip_missing.append(k)
+            else:
+                print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
+    if allowed_mcip_missing:
+        print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
     print("|| Weights have been checked completely ||")
     # resume optimizer parameters
     if optimizer is not None and resume:

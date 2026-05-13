@@ -58,6 +58,9 @@ class Transformer(nn.Module):
         log_scale=0.0, 
         text_dim=256,
         attention_protection=False,
+        attention_protection_mode="kl",
+        attention_protection_topk=3,
+        attention_protection_conf_thresh=0.25,
         computed_aux=None,
     ):
         super().__init__()
@@ -123,6 +126,9 @@ class Transformer(nn.Module):
             text_dim=text_dim,
             num_queries=num_queries,
             attention_protection=attention_protection,
+            attention_protection_mode=attention_protection_mode,
+            attention_protection_topk=attention_protection_topk,
+            attention_protection_conf_thresh=attention_protection_conf_thresh,
             computed_aux=computed_aux,
             use_transformer_ckpt=use_transformer_ckpt,
         )
@@ -545,6 +551,9 @@ class TransformerDecoder(nn.Module):
         text_dim=256,
         num_queries=900,
         attention_protection=False,
+        attention_protection_mode="kl",
+        attention_protection_topk=3,
+        attention_protection_conf_thresh=0.25,
         computed_aux=None,
         use_transformer_ckpt=False,
     ):
@@ -571,6 +580,9 @@ class TransformerDecoder(nn.Module):
 
         self.computed_aux = computed_aux
         self.attention_protection = attention_protection
+        self.attention_protection_mode = attention_protection_mode
+        self.attention_protection_topk = attention_protection_topk
+        self.attention_protection_conf_thresh = attention_protection_conf_thresh
         self.use_transformer_ckpt = use_transformer_ckpt
         self.num_queries_det = num_queries
         self.isol_ratio = 10
@@ -734,7 +746,15 @@ class TransformerDecoder(nn.Module):
 
             pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
             if self.attention_protection:
-                tgt_mask = attention_protection(pre_outputs_class, self.num_queries_det, layer_id, isol_ratio=self.isol_ratio)
+                tgt_mask = attention_protection(
+                    pre_outputs_class,
+                    self.num_queries_det,
+                    layer_id,
+                    isol_ratio=self.isol_ratio,
+                    mode=self.attention_protection_mode,
+                    topk=self.attention_protection_topk,
+                    conf_thresh=self.attention_protection_conf_thresh,
+                )
             else:
                 tgt_mask = None
 
@@ -1022,5 +1042,8 @@ def build_transformer(args):
         log_scale=args.log_scale, 
         text_dim=args.text_dim,
         attention_protection=getattr(args, "attention_protection", False),
+        attention_protection_mode=getattr(args, "attention_protection_mode", "kl"),
+        attention_protection_topk=getattr(args, "attention_protection_topk", 3),
+        attention_protection_conf_thresh=getattr(args, "attention_protection_conf_thresh", 0.25),
         computed_aux=args.computed_aux
     )
