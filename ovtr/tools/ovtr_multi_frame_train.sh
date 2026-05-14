@@ -11,7 +11,7 @@ NPROC_GPU="${NPROC_GPU:-4}"
 PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_det_pretrain.pth}"
 OUTPUT="${OUTPUT:-./weights}"
 CONFIG_FILE="${CONFIG_FILE:-./config/ovtr_5_frame_train_val.py}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 printf 'CONFIG_FILE=%s\n' "${CONFIG_FILE}"
