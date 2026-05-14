@@ -364,7 +364,7 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         self.mcip_motion_momentum = getattr(args, 'mcip_motion_momentum', 0.7)
         self.debug_mcip = getattr(args, 'debug_mcip', False)
 
-        gate_input_dim = dim_in * 4 + 3 + 4
+        gate_input_dim = dim_in * 4 + 6 + 4
         self.gate_mlp = nn.Sequential(
             nn.Linear(gate_input_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -415,15 +415,29 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         img_memory_old = track_instances.img_memory
         semantic_memory_old = track_instances.semantic_memory
         box_velocity_old = track_instances.box_velocity
+        memory_age = track_instances.memory_age
+        cls_conf_memory_old = track_instances.cls_conf_memory
+        cls_entropy_memory_old = track_instances.cls_entropy_memory
         scores = track_instances.scores.to(dtype=out_embed_img.dtype)
+        memory_age_normalized = memory_age.float().clamp(max=100.0).to(dtype=out_embed_img.dtype) / 100.0
+
+        if self.mcip_use_semantic_memory:
+            semantic_obs_for_gate = semantic_obs
+            semantic_memory_for_gate = semantic_memory_old
+        else:
+            semantic_obs_for_gate = torch.zeros_like(semantic_obs)
+            semantic_memory_for_gate = torch.zeros_like(semantic_memory_old)
 
         gate_input = torch.cat([
             out_embed_img,
             img_memory_old,
-            semantic_obs,
-            semantic_memory_old,
+            semantic_obs_for_gate,
+            semantic_memory_for_gate,
             cls_conf_obs[:, None],
             cls_entropy_obs[:, None],
+            cls_conf_memory_old[:, None],
+            cls_entropy_memory_old[:, None],
+            memory_age_normalized[:, None],
             scores[:, None],
             box_velocity_old,
         ], dim=-1)
@@ -439,24 +453,32 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         )
         gate_scalar = effective_gate.squeeze(-1)
         cls_conf_memory_new = (
-            (1.0 - gate_scalar) * track_instances.cls_conf_memory + gate_scalar * cls_conf_obs
+            (1.0 - gate_scalar) * cls_conf_memory_old + gate_scalar * cls_conf_obs
         )
         cls_entropy_memory_new = (
-            (1.0 - gate_scalar) * track_instances.cls_entropy_memory + gate_scalar * cls_entropy_obs
+            (1.0 - gate_scalar) * cls_entropy_memory_old + gate_scalar * cls_entropy_obs
         )
 
-        pred_boxes = self._detach_if_needed(track_instances.pred_boxes[:, :4])
+        pred_boxes_det = track_instances.pred_boxes[:, :4].detach()
         prev_boxes_old = track_instances.prev_boxes
-        box_delta = pred_boxes - prev_boxes_old
+        is_new = memory_age <= 0
+        box_delta = pred_boxes_det - prev_boxes_old
+        box_delta = torch.where(is_new[:, None], torch.zeros_like(box_delta), box_delta)
         box_velocity_new = (
             float(self.mcip_motion_momentum) * box_velocity_old
             + (1.0 - float(self.mcip_motion_momentum)) * box_delta
         )
-        memory_age_new = track_instances.memory_age + 1
+        box_velocity_new = torch.where(is_new[:, None], torch.zeros_like(box_velocity_new), box_velocity_new)
+        memory_age_new = memory_age + 1
 
         query_pos = track_instances.query_pos
         query_feat = track_instances.query_tgt
-        mcip_img = out_embed_img + self.memory_img_proj(img_memory_new) + self.memory_sem_proj(semantic_memory_new)
+        semantic_memory_contrib = (
+            self.memory_sem_proj(semantic_memory_new)
+            if self.mcip_use_semantic_memory
+            else torch.zeros_like(out_embed_img)
+        )
+        mcip_img = out_embed_img + self.memory_img_proj(img_memory_new) + semantic_memory_contrib
         q = k = query_pos + mcip_img
         tgt = mcip_img
 
@@ -474,19 +496,29 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         track_instances.query_tgt = query_feat
 
         if self.mcip_use_motion_ref:
-            next_boxes = pred_boxes + self.motion_scale * box_velocity_new
+            velocity_det = box_velocity_new.detach()
+            valid_motion = (memory_age > 0).to(pred_boxes_det.dtype)[:, None]
+            current_reliability = cls_conf_obs * (1.0 - cls_entropy_obs)
+            memory_reliability = cls_conf_memory_old * (1.0 - cls_entropy_memory_old)
+            motion_reliability = torch.where(
+                (memory_age > 0),
+                0.5 * current_reliability + 0.5 * memory_reliability,
+                current_reliability,
+            )
+            motion_reliability = motion_reliability.clamp(0.0, 1.0)
+            next_boxes = pred_boxes_det + valid_motion * motion_reliability[:, None] * self.motion_scale * velocity_det
             next_boxes = next_boxes.clamp(1e-4, 1.0 - 1e-4)
-            track_instances.ref_pts = inverse_sigmoid(next_boxes.detach().clone())
+            track_instances.ref_pts = inverse_sigmoid(next_boxes)
         else:
             track_instances.ref_pts = inverse_sigmoid(
-                track_instances.pred_boxes[:, :4].detach().clone().clamp(1e-4, 1.0 - 1e-4)
+                pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
             )
 
         track_instances.img_memory = self._detach_if_needed(img_memory_new)
         track_instances.semantic_memory = self._detach_if_needed(semantic_memory_new)
         track_instances.cls_conf_memory = self._detach_if_needed(cls_conf_memory_new)
         track_instances.cls_entropy_memory = self._detach_if_needed(cls_entropy_memory_new)
-        track_instances.prev_boxes = self._detach_if_needed(pred_boxes).clone()
+        track_instances.prev_boxes = pred_boxes_det.clone()
         track_instances.box_velocity = self._detach_if_needed(box_velocity_new)
         track_instances.memory_age = self._detach_if_needed(memory_age_new)
 

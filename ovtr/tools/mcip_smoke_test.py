@@ -9,15 +9,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from detectron2.structures import Instances  # noqa: E402
-from models.ovtr import RuntimeTrackerBase  # noqa: E402
+from models.ovtr import OVTR, RuntimeTrackerBase  # noqa: E402
 from models.updater import (  # noqa: E402
+    Category_Information_Propagator,
     MemoryCalibratedCategoryInformationPropagator,
+    build as build_updater,
     ensure_mcip_track_fields,
 )
 
 
-def _make_args():
-    return SimpleNamespace(
+def _make_args(**overrides):
+    args = SimpleNamespace(
         random_drop=0.0,
         fp_ratio=0.0,
         update_query_pos=False,
@@ -32,6 +34,9 @@ def _make_args():
         mcip_gate_use_txt=False,
         debug_mcip=True,
     )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
 
 
 def _empty_init(num_classes, hidden_dim, device):
@@ -109,6 +114,127 @@ def test_mcip_updater_dummy_forward():
         assert torch.isfinite(out.get(name)).all(), name
 
 
+def test_motion_scale_gradient():
+    device = torch.device("cpu")
+    hidden_dim = 32
+    updater = MemoryCalibratedCategoryInformationPropagator(
+        _make_args(),
+        dim_in=hidden_dim,
+        hidden_dim=hidden_dim,
+        dim_out=hidden_dim * 2,
+    ).to(device)
+    updater.train()
+
+    track_instances = _tracks(2, hidden_dim, 5, device)
+    track_instances.memory_age = torch.ones((2,), device=device)
+    track_instances.prev_boxes = (track_instances.pred_boxes - 0.05).clamp(1e-3, 1 - 1e-3)
+    track_instances.box_velocity = torch.full((2, 4), 0.03, device=device)
+    track_instances.cls_conf_obs = torch.ones((2,), device=device)
+    track_instances.cls_entropy_obs = torch.zeros((2,), device=device)
+    track_instances.cls_conf_memory = torch.ones((2,), device=device)
+    track_instances.cls_entropy_memory = torch.zeros((2,), device=device)
+
+    out = updater({
+        "track_instances": track_instances,
+        "init_track_instances": _empty_init(5, hidden_dim, device),
+    })
+    loss = out.ref_pts.sum()
+    loss.backward()
+
+    assert updater.motion_scale.grad is not None
+    assert torch.isfinite(updater.motion_scale.grad).all()
+    grad_abs_sum = updater.motion_scale.grad.abs().sum().item()
+    assert grad_abs_sum > 0.0, f"motion_scale gradient is zero: {grad_abs_sum}"
+    print(f"motion_scale_grad_abs_sum={grad_abs_sum:.12g}")
+
+
+def test_first_velocity_update():
+    device = torch.device("cpu")
+    hidden_dim = 32
+    args = _make_args(mcip_motion_momentum=0.7)
+    updater = MemoryCalibratedCategoryInformationPropagator(
+        args,
+        dim_in=hidden_dim,
+        hidden_dim=hidden_dim,
+        dim_out=hidden_dim * 2,
+    ).to(device)
+    updater.eval()
+
+    first_track = _tracks(1, hidden_dim, 5, device)
+    first_track.memory_age = torch.zeros((1,), device=device)
+    first_track.prev_boxes = torch.zeros((1, 4), device=device)
+    first_track.box_velocity = torch.ones((1, 4), device=device)
+    with torch.no_grad():
+        first_out = updater({
+            "track_instances": first_track,
+            "init_track_instances": _empty_init(5, hidden_dim, device),
+        })
+    assert torch.allclose(first_out.box_velocity, torch.zeros_like(first_out.box_velocity), atol=1e-6)
+    assert torch.allclose(first_out.prev_boxes, first_track.pred_boxes[:, :4].detach(), atol=1e-6)
+
+    next_track = _tracks(1, hidden_dim, 5, device)
+    delta = torch.tensor([[0.04, -0.02, 0.03, -0.01]], device=device)
+    next_track.memory_age = torch.ones((1,), device=device)
+    next_track.prev_boxes = (next_track.pred_boxes[:, :4] - delta).clamp(1e-3, 1 - 1e-3)
+    next_track.box_velocity = torch.zeros((1, 4), device=device)
+    expected_delta = next_track.pred_boxes[:, :4].detach() - next_track.prev_boxes
+    expected_velocity = (1.0 - args.mcip_motion_momentum) * expected_delta
+    with torch.no_grad():
+        next_out = updater({
+            "track_instances": next_track,
+            "init_track_instances": _empty_init(5, hidden_dim, device),
+        })
+    assert torch.allclose(next_out.box_velocity, expected_velocity, atol=1e-6)
+
+
+def _call_semantic_helper(track_instances, text_feat, debug_mcip=True):
+    holder = SimpleNamespace(
+        mcip_enable=True,
+        mcip_detach_memory=True,
+        debug_mcip=debug_mcip,
+        mcip_debug_stats={},
+    )
+    OVTR._mcip_attach_semantic_observations(holder, {"text_feat": text_feat}, track_instances)
+    return holder
+
+
+def test_semantic_observation_length_mismatch():
+    device = torch.device("cpu")
+    hidden_dim = 32
+
+    more_logits = _tracks(3, hidden_dim, 7, device)
+    holder = _call_semantic_helper(more_logits, torch.randn((5, hidden_dim), device=device), debug_mcip=True)
+    assert more_logits.semantic_obs.shape == (3, hidden_dim)
+    assert torch.isfinite(more_logits.semantic_obs).all()
+    assert holder.mcip_debug_stats["semantic_cls_len_mismatch"] == {
+        "pred_logits": 7,
+        "text_feat": 5,
+        "used": 5,
+    }
+
+    fewer_logits = _tracks(3, hidden_dim, 4, device)
+    holder = _call_semantic_helper(fewer_logits, torch.randn((6, hidden_dim), device=device), debug_mcip=True)
+    assert fewer_logits.semantic_obs.shape == (3, hidden_dim)
+    assert torch.isfinite(fewer_logits.cls_conf_obs).all()
+    assert holder.mcip_debug_stats["semantic_cls_len_mismatch"] == {
+        "pred_logits": 4,
+        "text_feat": 6,
+        "used": 4,
+    }
+
+    no_debug = _tracks(3, hidden_dim, 7, device)
+    holder = _call_semantic_helper(no_debug, torch.randn((5, hidden_dim), device=device), debug_mcip=False)
+    assert "semantic_cls_len_mismatch" not in holder.mcip_debug_stats
+
+    zero_classes = _tracks(3, hidden_dim, 0, device)
+    try:
+        _call_semantic_helper(zero_classes, torch.randn((0, hidden_dim), device=device), debug_mcip=True)
+    except RuntimeError as exc:
+        assert "zero classes" in str(exc)
+    else:
+        raise AssertionError("cls_len == 0 should raise RuntimeError")
+
+
 def test_runtime_tracker_preserves_mcip_fields():
     device = torch.device("cpu")
     hidden_dim = 256
@@ -130,6 +256,7 @@ def test_runtime_tracker_preserves_mcip_fields():
         assert updated.has(name), name
         assert len(updated.get(name)) == len(updated)
         assert updated.get(name).device == updated.scores.device
+        assert torch.isfinite(updated.get(name)).all(), name
 
     updated.remove("semantic_memory")
     ensure_mcip_track_fields(updated, hidden_dim, device=updated.scores.device, dtype=updated.query_tgt.dtype)
@@ -137,9 +264,25 @@ def test_runtime_tracker_preserves_mcip_fields():
     assert tuple(updated.semantic_memory.shape) == (len(updated), hidden_dim)
 
 
+def test_factory_preserves_baseline_cip():
+    hidden_dim = 32
+    updater = build_updater(
+        _make_args(mcip_enable=False),
+        "CIP",
+        dim_in=hidden_dim,
+        hidden_dim=hidden_dim,
+        dim_out=hidden_dim * 2,
+    )
+    assert type(updater) is Category_Information_Propagator
+
+
 def main():
     test_mcip_updater_dummy_forward()
+    test_motion_scale_gradient()
+    test_first_velocity_update()
+    test_semantic_observation_length_mismatch()
     test_runtime_tracker_preserves_mcip_fields()
+    test_factory_preserves_baseline_cip()
     print("M-CIP smoke passed")
 
 

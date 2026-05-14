@@ -737,7 +737,7 @@ class OVTR(nn.Module):
         text_feat = frame_res['text_feat'].to(pred_logits.device)
         cls_len = min(pred_logits.shape[-1], text_feat.shape[0])
         if cls_len == 0:
-            raise ValueError("M-CIP semantic memory received zero classes.")
+            raise RuntimeError("M-CIP semantic memory received zero classes.")
         if self.debug_mcip and pred_logits.shape[-1] != text_feat.shape[0]:
             self.mcip_debug_stats['semantic_cls_len_mismatch'] = {
                 'pred_logits': int(pred_logits.shape[-1]),
