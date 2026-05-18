@@ -13,9 +13,20 @@ PRETRAIN_MODEL="${PRETRAIN_MODEL:-../model_zoo/ovtr_5_frame.pth}"
 OUTPUT="${OUTPUT:-./results}"
 VIS_OUTPUT="${VIS_OUTPUT:-./results/vis_output_track_5_frame_val}"
 RESULT_PATH="${RESULT_PATH:-./results/teta_results_5_frame_val}"
+CONFIG_FILE="${CONFIG_FILE:-./config/ovtr_5_frame_train_val.py}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+printf 'CONFIG_FILE=%s\n' "${CONFIG_FILE}"
+printf 'PRETRAIN_MODEL=%s\n' "${PRETRAIN_MODEL}"
+printf 'RESULT_PATH=%s\n' "${RESULT_PATH}"
+if [ -n "${EXTRA_ARGS}" ]; then
+    printf 'EXTRA_ARGS=%s\n' "${EXTRA_ARGS}"
+fi
+
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" --nproc_per_node="${NPROC_GPU}" \
     ./eval.py \
-    --config_file ./config/ovtr_5_frame_train_val.py \
+    --config_file "${CONFIG_FILE}" \
     --dataset_file lvis_generated_img_seqs \
     --epochs 16 \
     --with_box_refine \
@@ -26,7 +37,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" -
     --pretrain "${PRETRAIN_MODEL}" \
     --output_dir "${OUTPUT}" \
     --num_workers 48 \
-    --batch_size 1 \
+    --batch_size "${BATCH_SIZE}" \
     --sample_mode random_interval \
     --sample_interval 1 \
     --sampler_steps 4 7 14 \
@@ -42,4 +53,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --master_port="${MASTER_PORT}" -
     --miss_tolerance 5 5 5 5 5 5 5 \
     --maximum_quantity 160 \
     --result_path_track "${RESULT_PATH}" \
-    --vis_output "${VIS_OUTPUT}"
+    --vis_output "${VIS_OUTPUT}" \
+    ${EXTRA_ARGS}

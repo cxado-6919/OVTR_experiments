@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from typing import List
 import copy
+import math
 from util import box_ops, checkpoint
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list, get_world_size,
                        is_dist_avail_and_initialized, inverse_sigmoid, all_reduce_tensor,)
@@ -20,7 +21,7 @@ from detectron2.structures import Instances, Boxes, matched_boxlist_iou
 from .backbone import build_backbone
 from .matcher import build_matcher
 from .transformer import build_transformer
-from .updater import build as build_updater
+from .updater import build as build_updater, ensure_mcip_track_fields
 from .deformable_detr import SetCriterion
 from .segmentation import sigmoid_focal_loss
 from .quant_utils import maybe_get_quantized_embedding_weight
@@ -28,6 +29,32 @@ from .quant_utils import maybe_get_quantized_embedding_weight
 from util.clip_utils import load_embeddings
 from .utils import MLP, protect_det_preds, protect_track_preds, preprocess_for_masks
 from util.list_LVIS import Frequency_list_total_1, Frequency_list_70, novel_class
+
+
+MCIP_OPTION_DEFAULTS = {
+    'mcip_enable': False,
+    'mcip_detach_memory': True,
+    'mcip_memory_momentum': 0.8,
+    'mcip_use_semantic_memory': True,
+    'mcip_use_motion_ref': True,
+    'mcip_motion_momentum': 0.7,
+    'mcip_motion_scale_init': 0.0,
+    'mcip_gate_use_txt': False,
+    'debug_mcip': False,
+    'attention_protection_mode': 'kl',
+    'attention_protection_topk': 3,
+    'attention_protection_conf_thresh': 0.25,
+}
+
+
+def resolve_mcip_options(args, cfg):
+    """Apply config/CLI/default M-CIP options to both args and cfg."""
+    for name, default in MCIP_OPTION_DEFAULTS.items():
+        value = getattr(args, name, None)
+        if value is None:
+            value = getattr(cfg, name, default)
+        setattr(args, name, value)
+        setattr(cfg, name, value)
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
@@ -547,6 +574,9 @@ class OVTR(nn.Module):
                     filter_score_thresh=None,
                     miss_tolerance=None,
                     train_with_artificial_img_seqs=False,
+                    mcip_enable=False,
+                    mcip_detach_memory=True,
+                    debug_mcip=False,
                  ):
         """ Initializes the model.
         Parameters:
@@ -657,6 +687,12 @@ class OVTR(nn.Module):
         self.criterion = criterion
         self.train_with_artificial_img_seqs = train_with_artificial_img_seqs
         self.supports_mot_batch = (not use_checkpoint) and (len(self.transformer.encoder.fusion_layers) == 0)
+        self.mcip_enable = mcip_enable
+        self.mcip_detach_memory = mcip_detach_memory
+        self.debug_mcip = debug_mcip
+        self.mcip_debug_stats = {
+            'attention_protection_mode': getattr(self.transformer.decoder, 'attention_protection_mode', 'kl')
+        } if mcip_enable else {}
 
     def _generate_empty_tracks(self, cls_pad_len=1203):
         track_instances = Instances((1, 1))
@@ -678,10 +714,62 @@ class OVTR(nn.Module):
         if not self.training:
             track_instances.cls_idxes = torch.full((num_queries,), -1, dtype=torch.long, device=device)
             track_instances.disappear_time = torch.zeros((num_queries, ), dtype=torch.long, device=device)
+        if self.mcip_enable:
+            ensure_mcip_track_fields(track_instances, dim_h, device=device, dtype=track_instances.query_tgt.dtype)
         return track_instances.to(device)
 
     def clear(self):
         self.track_base.clear()
+
+    def _mcip_store_text_feat(self, out, text_dict):
+        if not self.mcip_enable:
+            return
+        text_feat = text_dict.get('encoded_text', text_dict['text_features'])[0]
+        out['text_feat'] = text_feat.detach() if self.mcip_detach_memory else text_feat
+
+    def _mcip_attach_semantic_observations(self, frame_res, track_instances):
+        if not self.mcip_enable:
+            return
+        if 'text_feat' not in frame_res:
+            raise KeyError("M-CIP requires frame_res['text_feat'] for semantic memory.")
+
+        pred_logits = track_instances.pred_logits
+        text_feat = frame_res['text_feat'].to(pred_logits.device)
+        cls_len = min(pred_logits.shape[-1], text_feat.shape[0])
+        if cls_len == 0:
+            raise RuntimeError("M-CIP semantic memory received zero classes.")
+        if self.debug_mcip and pred_logits.shape[-1] != text_feat.shape[0]:
+            self.mcip_debug_stats['semantic_cls_len_mismatch'] = {
+                'pred_logits': int(pred_logits.shape[-1]),
+                'text_feat': int(text_feat.shape[0]),
+                'used': int(cls_len),
+            }
+
+        logits_for_memory = pred_logits[..., :cls_len]
+        text_feat_for_memory = text_feat[:cls_len]
+        prob = torch.softmax(logits_for_memory.float(), dim=-1)
+        semantic_obs = prob @ text_feat_for_memory.float()
+        cls_conf_obs = prob.max(dim=-1).values
+        entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=-1)
+        entropy = entropy / (math.log(cls_len) if cls_len > 1 else 1.0)
+
+        if self.mcip_detach_memory:
+            semantic_obs = semantic_obs.detach()
+            cls_conf_obs = cls_conf_obs.detach()
+            entropy = entropy.detach()
+        track_instances.semantic_obs = semantic_obs.to(dtype=track_instances.output_embedding_img.dtype)
+        track_instances.cls_conf_obs = cls_conf_obs.to(dtype=track_instances.scores.dtype)
+        track_instances.cls_entropy_obs = entropy.to(dtype=track_instances.scores.dtype)
+
+    def _mcip_verify_track_fields(self, track_instances):
+        if self.mcip_enable and track_instances is not None and len(track_instances) > 0:
+            ensure_mcip_track_fields(
+                track_instances,
+                self.transformer.d_model,
+                device=track_instances.scores.device,
+                dtype=track_instances.query_tgt.dtype,
+            )
+        return track_instances
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord, outputs_embed):
@@ -849,6 +937,7 @@ class OVTR(nn.Module):
             'image_feat': image_feat_ori,
             'extra_labels': extra_labels,
         }
+        self._mcip_store_text_feat(out, text_dict)
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_embed)
@@ -982,6 +1071,7 @@ class OVTR(nn.Module):
             "image_feat": image_feat_ori,
             "extra_labels": extra_labels,
             }
+        self._mcip_store_text_feat(out, text_dict)
             
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_embed)
@@ -1004,6 +1094,7 @@ class OVTR(nn.Module):
         track_instances.output_embedding_txt = frame_res['hs_cti'][0]
         track_instances.output_embedding_img = frame_res['hs_ofa'][0]
         track_instances.query_pos = frame_res["query_pos_track"][0]
+        self._mcip_attach_semantic_observations(frame_res, track_instances)
 
         if self.training:
             # the track id will be assigned by the mather.
@@ -1017,6 +1108,7 @@ class OVTR(nn.Module):
             if is_first:
                 self.track_base.clear()
             track_instances = self.track_base.update(track_instances, _track_discard, is_repeat=is_repeat)
+            track_instances = self._mcip_verify_track_fields(track_instances)
 
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks(cls_pad_len=track_instances.pred_logits.shape[1])
@@ -1106,7 +1198,7 @@ class OVTR(nn.Module):
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
                     frame_res = self._forward_single_image(frame, tmp, targets, extra_labels, is_first, cls_num)
-                    return (
+                    ret = (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
                         frame_res['ref_pts'],
@@ -1117,6 +1209,10 @@ class OVTR(nn.Module):
                         frame_res['query_pos_track'],
                         frame_res['hs_cti'],
                         frame_res['hs_ofa'],
+                    )
+                    if self.mcip_enable:
+                        ret = ret + (frame_res['text_feat'],)
+                    return ret + (
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_embed'] for aux in frame_res['aux_outputs']],
@@ -1137,14 +1233,20 @@ class OVTR(nn.Module):
                     'query_pos_track': tmp[7],
                     'hs_cti': tmp[8],
                     'hs_ofa': tmp[9],
-                    'aux_outputs': [{
-                        'pred_logits': tmp[10+i],
-                        'pred_boxes': tmp[10+5+i],
-                        'pred_embed': tmp[10+10+i],
-                        'select_id': tmp[10+15+i],
-                        'image_feat': tmp[10+20+i],
-                    } for i in range(len(self.computed_aux)-1)],
                 }
+                aux_offset = 10
+                if self.mcip_enable:
+                    frame_res['text_feat'] = tmp[10]
+                    aux_offset = 11
+                frame_res.update({
+                    'aux_outputs': [{
+                        'pred_logits': tmp[aux_offset+i],
+                        'pred_boxes': tmp[aux_offset+5+i],
+                        'pred_embed': tmp[aux_offset+10+i],
+                        'select_id': tmp[aux_offset+15+i],
+                        'image_feat': tmp[aux_offset+20+i],
+                    } for i in range(len(self.computed_aux)-1)],
+                })
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances, targets, extra_labels, is_first, cls_num)
@@ -1160,6 +1262,7 @@ class OVTR(nn.Module):
 
 
 def build(args, cfg):
+    resolve_mcip_options(args, cfg)
     
     assert cfg.Clip_text_embeddings and cfg.Clip_image_embeddings, "Clip_text_embeddings or Clip_image_embeddings should not be None"
     text_embeddings, image_embeddings = load_embeddings(cfg.Clip_text_embeddings, cfg.Clip_image_embeddings)  
@@ -1219,6 +1322,9 @@ def build(args, cfg):
         computed_aux=cfg.computed_aux,
         score_thresh=args.score_thresh,
         filter_score_thresh=args.filter_score_thresh,
-        miss_tolerance=args.miss_tolerance
+        miss_tolerance=args.miss_tolerance,
+        mcip_enable=args.mcip_enable,
+        mcip_detach_memory=args.mcip_detach_memory,
+        debug_mcip=args.debug_mcip,
     )
     return model, criterion

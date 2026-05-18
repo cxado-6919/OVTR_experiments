@@ -302,21 +302,33 @@ class OVTR_inference(object):
 
     def visualize_img_with_bbox(self, save_path, ori_frame, dt_instances: Instances, ref_pts=None, vis_points=None):
         img = ori_frame
+        img_show = img
         if dt_instances.has('scores'):
             img_show = draw_bboxes(img, np.concatenate(
                 [dt_instances.boxes, dt_instances.scores.reshape(-1, 1), dt_instances.cls_idxes.reshape(-1, 1)],
                 axis=-1), dt_instances.obj_idxes)
         self.video_writer.write(img_show)
 
-    def init_video_writer(self, output_path, frame_width, frame_height, fps):
+    def init_video_writer(self, output_path, frame_width, frame_height, fps, video_path=None):
         """Initialize the VideoWriter object."""
+        output_path = Path(output_path)
+        if output_path.suffix.lower() == ".mp4":
+            output_video = output_path
+        else:
+            stem = Path(video_path).stem if video_path is not None else "demo"
+            output_video = output_path / f"{stem}_ovtr.mp4"
+        output_video.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
-        os.makedirs(output_path, exist_ok = True)
-        self.video_writer = cv2.VideoWriter(output_path + '/demo_output.mp4', fourcc, fps, (frame_width, frame_height))
+        self.video_writer = cv2.VideoWriter(str(output_video), fourcc, fps, (frame_width, frame_height))
         if not self.video_writer.isOpened():
-            print("Error: Could not initialize VideoWriter.")
+            print(f"Error: Could not initialize VideoWriter for {output_video}.")
             return False
+        self.output_video = output_video
         return True
+
+    def close_video_writer(self):
+        if hasattr(self, "video_writer"):
+            self.video_writer.release()
     
     def detect(self, prob_threshold=0.6, score_threshold=0.5, filter_score_thresh=0.5, miss_tolerance=5, maximum_quantity=60, area_threshold=100, ious_thresh=0.3,
                vis=False, data=None, track_instances=None, info=None, ori_frame=None, frame_id=None, frame_width=640, frame_height=480):
@@ -377,42 +389,67 @@ def eval(args, cfg, video_path):
 
     torch.manual_seed(args.seed)
 
+    video_path = os.path.abspath(video_path)
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Video file does not exist: {video_path}")
+
     track_instances = None
     frame_id = 0
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if frame_width <= 0 or frame_height <= 0:
+        cap.release()
+        raise RuntimeError(f"Could not read valid frame size from video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if args.max_frames is not None:
+        total_frames = min(total_frames, args.max_frames) if total_frames > 0 else args.max_frames
 
-    if not tracker.init_video_writer(args.vis_output, frame_width, frame_height, fps):
+    output_path = args.output_video if args.output_video is not None else args.vis_output
+    if output_path is None:
+        output_path = './results'
+    if not tracker.init_video_writer(output_path, frame_width, frame_height, fps, video_path=video_path):
+        cap.release()
         return
-    
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        return
 
-    with torch.no_grad():
-        with tqdm(total=total_frames, desc="Processing Video", unit="frame") as pbar:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+    try:
+        with torch.no_grad():
+            with tqdm(total=total_frames, desc="Processing Video", unit="frame") as pbar:
+                while True:
+                    if args.max_frames is not None and frame_id >= args.max_frames:
+                        break
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                cur_frame, ori_frame = tracker.init_img(frame)
-                track_instances = tracker.detect(vis=args.vis, data=cur_frame.to(device).float(), track_instances=track_instances,
-                                                prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh, 
-                                                miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
-                                                frame_id=frame_id, ori_frame=ori_frame, frame_width=frame_width, frame_height=frame_height
-                                                )
-                pbar.update(1)
-                frame_id += 1             
-    print('demo inference complete')
+                    cur_frame, ori_frame = tracker.init_img(frame)
+                    track_instances = tracker.detect(vis=args.vis, data=cur_frame.to(device).float(), track_instances=track_instances,
+                                                    prob_threshold=args.score_thresh, score_threshold=args.score_thresh, filter_score_thresh=args.filter_score_thresh, 
+                                                    miss_tolerance=args.miss_tolerance, maximum_quantity=args.maximum_quantity, area_threshold=1, ious_thresh=args.ious_thresh,
+                                                    frame_id=frame_id, ori_frame=ori_frame, frame_width=frame_width, frame_height=frame_height
+                                                    )
+                    pbar.update(1)
+                    frame_id += 1
+    finally:
+        cap.release()
+        tracker.close_video_writer()
+    print(f'demo inference complete: {tracker.output_video}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('OVTR demo', parents=[get_args_parser()])
+    parser.add_argument('--video_path', default='../video/track_demo.mp4', type=str,
+                        help='path to a single mp4 video for demo inference')
+    parser.add_argument('--output_video', default=None, type=str,
+                        help='optional output mp4 path; defaults to <vis_output>/<input_stem>_ovtr.mp4')
+    parser.add_argument('--max_frames', default=None, type=int,
+                        help='optional maximum number of frames to process for quick demo checks')
     args = parser.parse_args()
     cfg = SLConfig.fromfile(args.config_file)
-    video_path = '../video/track_demo.mp4'
 
-    eval(args, cfg, video_path)
+    eval(args, cfg, args.video_path)

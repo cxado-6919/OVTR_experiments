@@ -530,8 +530,7 @@ class LVIS_seqs_Dataset_val(TaoDataset):
         return gt_instances
 
     def _get_eval_ann_info(self, img_info):
-        # Calibration can use LVIS-derived held-out splits while final eval uses
-        # TAO-style annotations. Pick the parser that TaoDataset initialized.
+        # Pick the annotation parser initialized for the current dataset source.
         if hasattr(self, "lvis"):
             return self.get_lvis_ann_info(img_info)
         return self.get_ann_info(img_info)

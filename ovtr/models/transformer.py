@@ -58,6 +58,9 @@ class Transformer(nn.Module):
         log_scale=0.0, 
         text_dim=256,
         attention_protection=False,
+        attention_protection_mode="kl",
+        attention_protection_topk=3,
+        attention_protection_conf_thresh=0.25,
         computed_aux=None,
     ):
         super().__init__()
@@ -123,7 +126,11 @@ class Transformer(nn.Module):
             text_dim=text_dim,
             num_queries=num_queries,
             attention_protection=attention_protection,
+            attention_protection_mode=attention_protection_mode,
+            attention_protection_topk=attention_protection_topk,
+            attention_protection_conf_thresh=attention_protection_conf_thresh,
             computed_aux=computed_aux,
+            use_transformer_ckpt=use_transformer_ckpt,
         )
 
         self.d_model = d_model
@@ -544,7 +551,11 @@ class TransformerDecoder(nn.Module):
         text_dim=256,
         num_queries=900,
         attention_protection=False,
+        attention_protection_mode="kl",
+        attention_protection_topk=3,
+        attention_protection_conf_thresh=0.25,
         computed_aux=None,
+        use_transformer_ckpt=False,
     ):
         super().__init__()
         if num_layers > 0:
@@ -569,6 +580,10 @@ class TransformerDecoder(nn.Module):
 
         self.computed_aux = computed_aux
         self.attention_protection = attention_protection
+        self.attention_protection_mode = attention_protection_mode
+        self.attention_protection_topk = attention_protection_topk
+        self.attention_protection_conf_thresh = attention_protection_conf_thresh
+        self.use_transformer_ckpt = use_transformer_ckpt
         self.num_queries_det = num_queries
         self.isol_ratio = 10
 
@@ -653,24 +668,66 @@ class TransformerDecoder(nn.Module):
             pos_scale = self.query_scale(output) if self.query_scale is not None else 1
             query_pos = pos_scale * raw_query_pos
 
+            def _run_decoder_layer(
+                tgt_arg,
+                query_pos_arg,
+                query_sine_arg,
+                reference_points_arg,
+                memory_text_arg,
+                memory_arg,
+                memory_pos_arg,
+                *,
+                decoder_layer=layer,
+                tgt_key_padding_mask_arg=tgt_key_padding_mask,
+                text_attention_mask_arg=text_attention_mask,
+                memory_key_padding_mask_arg=src_padding_mask,
+                memory_level_start_index_arg=src_level_start_index,
+                memory_spatial_shapes_arg=src_spatial_shapes,
+                self_attn_mask_arg=tgt_mask,
+                cross_attn_mask_arg=memory_mask,
+                num_arg=num,
+            ):
+                return decoder_layer(
+                    tgt=tgt_arg,
+                    tgt_query_pos=query_pos_arg,
+                    tgt_query_sine_embed=query_sine_arg,
+                    tgt_key_padding_mask=tgt_key_padding_mask_arg,
+                    tgt_reference_points=reference_points_arg,
+                    memory_text=memory_text_arg,
+                    text_attention_mask=text_attention_mask_arg,
+                    memory=memory_arg,
+                    memory_key_padding_mask=memory_key_padding_mask_arg,
+                    memory_level_start_index=memory_level_start_index_arg,
+                    memory_spatial_shapes=memory_spatial_shapes_arg,
+                    memory_pos=memory_pos_arg,
+                    self_attn_mask=self_attn_mask_arg,
+                    cross_attn_mask=cross_attn_mask_arg,
+                    num=num_arg,
+                )
+
             # main process
-            output, output_ofa = layer(
-                tgt=output,
-                tgt_query_pos=query_pos,
-                tgt_query_sine_embed=query_sine_embed,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                tgt_reference_points=reference_points_input,
-                memory_text=text_dict["encoded_text"],
-                text_attention_mask=text_attention_mask,
-                memory=src,
-                memory_key_padding_mask=src_padding_mask,
-                memory_level_start_index=src_level_start_index,
-                memory_spatial_shapes=src_spatial_shapes,
-                memory_pos=pos,
-                self_attn_mask=tgt_mask,
-                cross_attn_mask=memory_mask,
-                num=num
-            )
+            if self.training and self.use_transformer_ckpt:
+                output, output_ofa = checkpoint.checkpoint(
+                    _run_decoder_layer,
+                    output,
+                    query_pos,
+                    query_sine_embed,
+                    reference_points_input,
+                    text_dict["encoded_text"],
+                    src,
+                    pos,
+                    use_reentrant=False,
+                )
+            else:
+                output, output_ofa = _run_decoder_layer(
+                    output,
+                    query_pos,
+                    query_sine_embed,
+                    reference_points_input,
+                    text_dict["encoded_text"],
+                    src,
+                    pos,
+                )
 
             # iter update
             if self.bbox_embed is not None:
@@ -689,7 +746,15 @@ class TransformerDecoder(nn.Module):
 
             pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
             if self.attention_protection:
-                tgt_mask = attention_protection(pre_outputs_class, self.num_queries_det, layer_id, isol_ratio=self.isol_ratio)
+                tgt_mask = attention_protection(
+                    pre_outputs_class,
+                    self.num_queries_det,
+                    layer_id,
+                    isol_ratio=self.isol_ratio,
+                    mode=self.attention_protection_mode,
+                    topk=self.attention_protection_topk,
+                    conf_thresh=self.attention_protection_conf_thresh,
+                )
             else:
                 tgt_mask = None
 
@@ -977,5 +1042,8 @@ def build_transformer(args):
         log_scale=args.log_scale, 
         text_dim=args.text_dim,
         attention_protection=getattr(args, "attention_protection", False),
+        attention_protection_mode=getattr(args, "attention_protection_mode", "kl"),
+        attention_protection_topk=getattr(args, "attention_protection_topk", 3),
+        attention_protection_conf_thresh=getattr(args, "attention_protection_conf_thresh", 0.25),
         computed_aux=args.computed_aux
     )

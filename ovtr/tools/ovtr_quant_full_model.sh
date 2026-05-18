@@ -8,13 +8,24 @@ cd "${PROJECT_DIR}"
 
 MODEL_VARIANT="${MODEL_VARIANT:-lite}"
 QUANT_MODE="${QUANT_MODE:-ptq}"
-# Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_b
+QUANT_PIPELINE="${QUANT_PIPELINE:-standard}"
+QUANT_RANGE_METHOD="${QUANT_RANGE_METHOD:-}"
+QUANT_WEIGHT_BITS="${QUANT_WEIGHT_BITS:-4}"
+QUANT_ACTIVATION_BITS="${QUANT_ACTIVATION_BITS:-4}"
+QUANT_ATTENTION_BITS="${QUANT_ATTENTION_BITS:-8}"
+# Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_a3_head, exp_b, exp_a1_to_b, exp_a3_b
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a}"
 MASTER_PORT="${MASTER_PORT:-9987}"
 OUTPUT="${OUTPUT:-./results_quant}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 CALIB_SAMPLES="${CALIB_SAMPLES:-512}"
+QUANT_CALIB_SEQUENCE_LENGTH="${QUANT_CALIB_SEQUENCE_LENGTH:-3}"
+QUANT_CALIB_MAX_TRANSLATE="${QUANT_CALIB_MAX_TRANSLATE:-0.08}"
+QUANT_CALIB_MAX_ROTATE="${QUANT_CALIB_MAX_ROTATE:-6.0}"
+QUANT_CALIB_SCALE_JITTER="${QUANT_CALIB_SCALE_JITTER:-0.08}"
+QUANT_CALIB_MOTION_BLUR="${QUANT_CALIB_MOTION_BLUR:-3}"
+QUANT_DISABLE_PSEUDO_SEQUENCE_CALIB="${QUANT_DISABLE_PSEUDO_SEQUENCE_CALIB:-0}"
 QAT_EPOCHS="${QAT_EPOCHS:-1}"
 QAT_LR="${QAT_LR:-4e-5}"
 QAT_LR_BACKBONE="${QAT_LR_BACKBONE:-4e-6}"
@@ -77,9 +88,26 @@ COMMON_ARGS=(
     --track_query_iteration CIP
     --calculate_negative_samples
     --quant_mode "${QUANT_MODE}"
+    --quant_pipeline "${QUANT_PIPELINE}"
     --quant_partition "${QUANT_PARTITION}"
+    --quant_weight_bits "${QUANT_WEIGHT_BITS}"
+    --quant_activation_bits "${QUANT_ACTIVATION_BITS}"
+    --quant_attention_bits "${QUANT_ATTENTION_BITS}"
     --quant_calib_samples "${CALIB_SAMPLES}"
+    --quant_calib_sequence_length "${QUANT_CALIB_SEQUENCE_LENGTH}"
+    --quant_calib_max_translate "${QUANT_CALIB_MAX_TRANSLATE}"
+    --quant_calib_max_rotate "${QUANT_CALIB_MAX_ROTATE}"
+    --quant_calib_scale_jitter "${QUANT_CALIB_SCALE_JITTER}"
+    --quant_calib_motion_blur "${QUANT_CALIB_MOTION_BLUR}"
 )
+
+if [ -n "${QUANT_RANGE_METHOD}" ]; then
+    COMMON_ARGS+=(--quant_range_method "${QUANT_RANGE_METHOD}")
+fi
+
+if [ "${QUANT_DISABLE_PSEUDO_SEQUENCE_CALIB}" = "1" ]; then
+    COMMON_ARGS+=(--quant_disable_pseudo_sequence_calib)
+fi
 
 if [ "${QUANT_MODE}" = "qat" ]; then
     CMD=(

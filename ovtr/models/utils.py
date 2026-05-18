@@ -231,7 +231,7 @@ def gen_sineembed_for_position(pos_tensor):
     return pos
 
 
-def attention_protection(outputs_class, num_queries, layer_id, isol_ratio=None):
+def _attention_protection_kl(outputs_class, num_queries, layer_id, isol_ratio=None):
     # Category Isolation Strategy.
     outputs_class = F.softmax(outputs_class, dim=-1)
     class_probs_row = outputs_class.unsqueeze(2)
@@ -247,6 +247,46 @@ def attention_protection(outputs_class, num_queries, layer_id, isol_ratio=None):
     else:
         isolate_mask = None
     return isolate_mask
+
+
+def attention_protection(
+    outputs_class,
+    num_queries,
+    layer_id,
+    isol_ratio=None,
+    mode="kl",
+    topk=3,
+    conf_thresh=0.25,
+):
+    if mode == "kl":
+        return _attention_protection_kl(outputs_class, num_queries, layer_id, isol_ratio=isol_ratio)
+    if mode == "none":
+        return None
+    if mode != "topk":
+        raise ValueError(f"Unknown attention_protection mode: {mode}")
+
+    if layer_id == 5 or layer_id == -1:
+        return None
+
+    outputs_prob = F.softmax(outputs_class, dim=-1)
+    topk = min(int(topk), outputs_prob.shape[-1])
+    if topk <= 0:
+        return None
+
+    topk_conf, topk_idx = torch.topk(outputs_prob, k=topk, dim=-1)
+    top1_conf = topk_conf[..., 0]
+    shared_classes = (
+        topk_idx.unsqueeze(2).unsqueeze(-1) == topk_idx.unsqueeze(1).unsqueeze(-2)
+    ).any(dim=(-1, -2))
+    confident_pair = (
+        (top1_conf >= conf_thresh).unsqueeze(2)
+        & (top1_conf >= conf_thresh).unsqueeze(1)
+    )
+    isolate_mask = (~shared_classes) & confident_pair
+    if outputs_class.shape[1] != num_queries:
+        isolate_mask[:, num_queries:, num_queries:] = False
+    return isolate_mask
+
 
 def protect_track_preds(track_instances, num_queries=900, miss_tolerance=5, ious_thresh = 0.3):  
     '''Lightweight processing due to the limitations of the manually generated dataset.
