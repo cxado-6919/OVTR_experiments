@@ -376,7 +376,9 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         self.motion_scale = nn.Parameter(
             torch.tensor(float(getattr(args, 'mcip_motion_scale_init', 0.0)))
         )
-        self.last_debug_stats = {}
+        self.mcip_debug_stats = {}
+        self.last_mcip_debug_stats = self.mcip_debug_stats
+        self.last_debug_stats = self.mcip_debug_stats
 
     def _reset_parameters(self):
         super()._reset_parameters()
@@ -388,6 +390,24 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
     def _detach_if_needed(self, tensor):
         return tensor.detach() if self.mcip_detach_memory else tensor
 
+    def _update_debug_stats(self, **stats):
+        clean_stats = {}
+        for name, value in stats.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach()
+                if value.numel() != 1:
+                    value = value.float().mean()
+                value = value.item()
+            if isinstance(value, bool):
+                clean_stats[name] = value
+            elif isinstance(value, int):
+                clean_stats[name] = int(value)
+            else:
+                clean_stats[name] = float(value)
+        self.mcip_debug_stats = clean_stats
+        self.last_mcip_debug_stats = clean_stats
+        self.last_debug_stats = clean_stats
+
     def _get_observation(self, track_instances: Instances, name: str, like: torch.Tensor) -> torch.Tensor:
         if track_instances.has(name):
             value = track_instances.get(name)
@@ -397,6 +417,32 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
 
     def _aggregate_category_info(self, track_instances: Instances) -> Instances:
         if len(track_instances) == 0:
+            if getattr(self, "debug_mcip", False):
+                self._update_debug_stats(
+                    img_proj_norm_ratio=0.0,
+                    sem_proj_norm_ratio=0.0,
+                    total_delta_norm_ratio=0.0,
+                    mcip_img_cosine=0.0,
+                    motion_offset_l1_mean=0.0,
+                    motion_offset_l1_max=0.0,
+                    motion_offset_norm_mean=0.0,
+                    motion_offset_norm_max=0.0,
+                    motion_scale=self.motion_scale,
+                    effective_gate_mean=0.0,
+                    effective_gate_max=0.0,
+                    effective_gate_min=0.0,
+                    cls_conf_obs_mean=0.0,
+                    cls_conf_obs_min=0.0,
+                    cls_conf_obs_max=0.0,
+                    cls_entropy_obs_mean=0.0,
+                    cls_entropy_obs_min=0.0,
+                    cls_entropy_obs_max=0.0,
+                    current_reliability_mean=0.0,
+                    memory_reliability_mean=0.0,
+                    motion_reliability_mean=0.0,
+                    motion_reliability_max=0.0,
+                    active_track_count=0,
+                )
             return track_instances
 
         dim = track_instances.output_embedding_img.shape[1]
@@ -473,12 +519,13 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
 
         query_pos = track_instances.query_pos
         query_feat = track_instances.query_tgt
+        img_memory_contrib = self.memory_img_proj(img_memory_new)
         semantic_memory_contrib = (
             self.memory_sem_proj(semantic_memory_new)
             if self.mcip_use_semantic_memory
             else torch.zeros_like(out_embed_img)
         )
-        mcip_img = out_embed_img + self.memory_img_proj(img_memory_new) + semantic_memory_contrib
+        mcip_img = out_embed_img + img_memory_contrib + semantic_memory_contrib
         q = k = query_pos + mcip_img
         tgt = mcip_img
 
@@ -510,6 +557,11 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
             next_boxes = next_boxes.clamp(1e-4, 1.0 - 1e-4)
             track_instances.ref_pts = inverse_sigmoid(next_boxes)
         else:
+            if getattr(self, "debug_mcip", False):
+                current_reliability = cls_conf_obs * (1.0 - cls_entropy_obs)
+                memory_reliability = cls_conf_memory_old * (1.0 - cls_entropy_memory_old)
+                motion_reliability = current_reliability.clamp(0.0, 1.0)
+                next_boxes = pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
             track_instances.ref_pts = inverse_sigmoid(
                 pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
             )
@@ -522,13 +574,52 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         track_instances.box_velocity = self._detach_if_needed(box_velocity_new)
         track_instances.memory_age = self._detach_if_needed(memory_age_new)
 
-        if self.debug_mcip:
-            self.last_debug_stats = {
-                'avg_gate': gate.detach().mean().item(),
-                'avg_cls_entropy_memory': track_instances.cls_entropy_memory.detach().mean().item(),
-                'avg_box_velocity_norm': track_instances.box_velocity.detach().norm(dim=-1).mean().item(),
-                'num_active_tracks': len(track_instances),
-            }
+        if getattr(self, "debug_mcip", False):
+            with torch.no_grad():
+                eps = 1e-6
+                out_norm = out_embed_img.detach().float().norm(dim=-1).clamp_min(eps)
+                img_proj_norm = img_memory_contrib.detach().float().norm(dim=-1)
+                if self.mcip_use_semantic_memory:
+                    sem_proj_norm_ratio = (
+                        semantic_memory_contrib.detach().float().norm(dim=-1) / out_norm
+                    ).mean()
+                else:
+                    sem_proj_norm_ratio = 0.0
+                total_delta_norm = (mcip_img.detach() - out_embed_img.detach()).float().norm(dim=-1)
+                mcip_img_cosine = F.cosine_similarity(
+                    mcip_img.detach().float(),
+                    out_embed_img.detach().float(),
+                    dim=-1,
+                ).mean()
+                motion_offset = next_boxes.detach() - pred_boxes_det.detach()
+                motion_offset_abs = motion_offset.float().abs()
+                motion_offset_norm = motion_offset.float().norm(dim=-1)
+
+                self._update_debug_stats(
+                    img_proj_norm_ratio=(img_proj_norm / out_norm).mean(),
+                    sem_proj_norm_ratio=sem_proj_norm_ratio,
+                    total_delta_norm_ratio=(total_delta_norm / out_norm).mean(),
+                    mcip_img_cosine=mcip_img_cosine,
+                    motion_offset_l1_mean=motion_offset_abs.mean(),
+                    motion_offset_l1_max=motion_offset_abs.max(),
+                    motion_offset_norm_mean=motion_offset_norm.mean(),
+                    motion_offset_norm_max=motion_offset_norm.max(),
+                    motion_scale=self.motion_scale.detach(),
+                    effective_gate_mean=effective_gate.detach().float().mean(),
+                    effective_gate_max=effective_gate.detach().float().max(),
+                    effective_gate_min=effective_gate.detach().float().min(),
+                    cls_conf_obs_mean=cls_conf_obs.detach().float().mean(),
+                    cls_conf_obs_min=cls_conf_obs.detach().float().min(),
+                    cls_conf_obs_max=cls_conf_obs.detach().float().max(),
+                    cls_entropy_obs_mean=cls_entropy_obs.detach().float().mean(),
+                    cls_entropy_obs_min=cls_entropy_obs.detach().float().min(),
+                    cls_entropy_obs_max=cls_entropy_obs.detach().float().max(),
+                    current_reliability_mean=current_reliability.detach().float().mean(),
+                    memory_reliability_mean=memory_reliability.detach().float().mean(),
+                    motion_reliability_mean=motion_reliability.detach().float().mean(),
+                    motion_reliability_max=motion_reliability.detach().float().max(),
+                    active_track_count=len(track_instances),
+                )
         return track_instances
 
 

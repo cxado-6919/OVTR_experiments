@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,6 +113,48 @@ def test_mcip_updater_dummy_forward():
         assert out.has(name), name
         assert tuple(out.get(name).shape) == shape
         assert torch.isfinite(out.get(name)).all(), name
+
+    required_debug_keys = [
+        "img_proj_norm_ratio",
+        "sem_proj_norm_ratio",
+        "total_delta_norm_ratio",
+        "mcip_img_cosine",
+        "motion_offset_l1_mean",
+        "motion_offset_l1_max",
+        "motion_offset_norm_mean",
+        "motion_offset_norm_max",
+        "motion_scale",
+        "effective_gate_mean",
+        "effective_gate_max",
+        "effective_gate_min",
+        "cls_conf_obs_mean",
+        "cls_conf_obs_min",
+        "cls_conf_obs_max",
+        "cls_entropy_obs_mean",
+        "cls_entropy_obs_min",
+        "cls_entropy_obs_max",
+        "current_reliability_mean",
+        "memory_reliability_mean",
+        "motion_reliability_mean",
+        "motion_reliability_max",
+        "active_track_count",
+    ]
+    assert isinstance(updater.mcip_debug_stats, dict)
+    for key in required_debug_keys:
+        assert key in updater.mcip_debug_stats, key
+        value = updater.mcip_debug_stats[key]
+        assert isinstance(value, (float, int)), (key, type(value))
+        assert math.isfinite(float(value)), (key, value)
+
+    assert updater.mcip_debug_stats["active_track_count"] > 0
+    assert -1.0 <= updater.mcip_debug_stats["mcip_img_cosine"] <= 1.0
+    for key in [
+        "effective_gate_mean",
+        "cls_conf_obs_mean",
+        "cls_entropy_obs_mean",
+        "motion_reliability_mean",
+    ]:
+        assert 0.0 <= updater.mcip_debug_stats[key] <= 1.0, (key, updater.mcip_debug_stats[key])
 
 
 def test_motion_scale_gradient():
