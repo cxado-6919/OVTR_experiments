@@ -1,5 +1,7 @@
+import json
 import math
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,33 +88,6 @@ def test_mcip_updater_dummy_forward():
     hidden_dim = 256
     num_tracks = 5
     num_classes = 7
-    updater = MemoryCalibratedCategoryInformationPropagator(
-        _make_args(),
-        dim_in=hidden_dim,
-        hidden_dim=hidden_dim,
-        dim_out=hidden_dim * 2,
-    ).to(device)
-    updater.eval()
-
-    track_instances = _tracks(num_tracks, hidden_dim, num_classes, device)
-    init_track_instances = _empty_init(num_classes, hidden_dim, device)
-    with torch.no_grad():
-        out = updater({
-            "track_instances": track_instances,
-            "init_track_instances": init_track_instances,
-        })
-
-    assert len(out) == num_tracks
-    for name, shape in {
-        "ref_pts": (num_tracks, 4),
-        "query_tgt": (num_tracks, hidden_dim),
-        "img_memory": (num_tracks, hidden_dim),
-        "semantic_memory": (num_tracks, hidden_dim),
-        "box_velocity": (num_tracks, 4),
-    }.items():
-        assert out.has(name), name
-        assert tuple(out.get(name).shape) == shape
-        assert torch.isfinite(out.get(name)).all(), name
 
     required_debug_keys = [
         "img_proj_norm_ratio",
@@ -139,22 +114,60 @@ def test_mcip_updater_dummy_forward():
         "motion_reliability_max",
         "active_track_count",
     ]
-    assert isinstance(updater.mcip_debug_stats, dict)
-    for key in required_debug_keys:
-        assert key in updater.mcip_debug_stats, key
-        value = updater.mcip_debug_stats[key]
-        assert isinstance(value, (float, int)), (key, type(value))
-        assert math.isfinite(float(value)), (key, value)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        debug_stats_file = Path(tmpdir) / "mcip_debug_stats.jsonl"
+        updater = MemoryCalibratedCategoryInformationPropagator(
+            _make_args(mcip_debug_stats_file=str(debug_stats_file)),
+            dim_in=hidden_dim,
+            hidden_dim=hidden_dim,
+            dim_out=hidden_dim * 2,
+        ).to(device)
+        updater.eval()
 
-    assert updater.mcip_debug_stats["active_track_count"] > 0
-    assert -1.0 <= updater.mcip_debug_stats["mcip_img_cosine"] <= 1.0
-    for key in [
-        "effective_gate_mean",
-        "cls_conf_obs_mean",
-        "cls_entropy_obs_mean",
-        "motion_reliability_mean",
-    ]:
-        assert 0.0 <= updater.mcip_debug_stats[key] <= 1.0, (key, updater.mcip_debug_stats[key])
+        track_instances = _tracks(num_tracks, hidden_dim, num_classes, device)
+        init_track_instances = _empty_init(num_classes, hidden_dim, device)
+        with torch.no_grad():
+            out = updater({
+                "track_instances": track_instances,
+                "init_track_instances": init_track_instances,
+            })
+
+        assert len(out) == num_tracks
+        for name, shape in {
+            "ref_pts": (num_tracks, 4),
+            "query_tgt": (num_tracks, hidden_dim),
+            "img_memory": (num_tracks, hidden_dim),
+            "semantic_memory": (num_tracks, hidden_dim),
+            "box_velocity": (num_tracks, 4),
+        }.items():
+            assert out.has(name), name
+            assert tuple(out.get(name).shape) == shape
+            assert torch.isfinite(out.get(name)).all(), name
+
+        assert isinstance(updater.mcip_debug_stats, dict)
+        for key in required_debug_keys:
+            assert key in updater.mcip_debug_stats, key
+            value = updater.mcip_debug_stats[key]
+            assert isinstance(value, (float, int)), (key, type(value))
+            assert math.isfinite(float(value)), (key, value)
+
+        assert updater.mcip_debug_stats["active_track_count"] > 0
+        assert -1.0 <= updater.mcip_debug_stats["mcip_img_cosine"] <= 1.0
+        for key in [
+            "effective_gate_mean",
+            "cls_conf_obs_mean",
+            "cls_entropy_obs_mean",
+            "motion_reliability_mean",
+        ]:
+            assert 0.0 <= updater.mcip_debug_stats[key] <= 1.0, (key, updater.mcip_debug_stats[key])
+
+        assert debug_stats_file.exists()
+        debug_lines = debug_stats_file.read_text().strip().splitlines()
+        assert len(debug_lines) == 1
+        debug_record = json.loads(debug_lines[0])
+        for key in required_debug_keys:
+            assert key in debug_record, key
+            assert math.isfinite(float(debug_record[key])), (key, debug_record[key])
 
 
 def test_motion_scale_gradient():

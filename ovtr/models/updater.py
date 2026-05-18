@@ -3,12 +3,15 @@
 # Modified from MOTR (https://github.com/megvii-research/MOTR)
 # Copyright (c) 2021 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
+import json
+import os
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from util import box_ops
-from util.misc import inverse_sigmoid
+from util.misc import get_rank, inverse_sigmoid
 from detectron2.structures import Boxes, Instances, pairwise_iou
 
 
@@ -363,6 +366,11 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         self.mcip_use_motion_ref = getattr(args, 'mcip_use_motion_ref', True)
         self.mcip_motion_momentum = getattr(args, 'mcip_motion_momentum', 0.7)
         self.debug_mcip = getattr(args, 'debug_mcip', False)
+        self.mcip_debug_log_interval = max(1, int(getattr(args, 'mcip_debug_log_interval', 1) or 1))
+        self.mcip_debug_log_calls = 0
+        self.mcip_debug_stats_file = None
+        if self.debug_mcip:
+            self.mcip_debug_stats_file = self._resolve_debug_stats_file(args)
 
         gate_input_dim = dim_in * 4 + 6 + 4
         self.gate_mlp = nn.Sequential(
@@ -379,6 +387,21 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         self.mcip_debug_stats = {}
         self.last_mcip_debug_stats = self.mcip_debug_stats
         self.last_debug_stats = self.mcip_debug_stats
+
+    def _resolve_debug_stats_file(self, args):
+        debug_stats_file = getattr(args, 'mcip_debug_stats_file', None)
+        output_dir = getattr(args, 'output_dir', None)
+        if debug_stats_file is None and output_dir:
+            debug_stats_file = os.path.join(output_dir, 'mcip_debug_stats.jsonl')
+        if not debug_stats_file:
+            return None
+
+        rank = get_rank()
+        if rank == 0:
+            return debug_stats_file
+
+        base, ext = os.path.splitext(debug_stats_file)
+        return '{}_rank{}{}'.format(base, rank, ext or '.jsonl')
 
     def _reset_parameters(self):
         super()._reset_parameters()
@@ -407,6 +430,20 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         self.mcip_debug_stats = clean_stats
         self.last_mcip_debug_stats = clean_stats
         self.last_debug_stats = clean_stats
+        self._write_debug_stats(clean_stats)
+
+    def _write_debug_stats(self, stats):
+        if not self.mcip_debug_stats_file:
+            return
+        self.mcip_debug_log_calls += 1
+        if self.mcip_debug_log_calls % self.mcip_debug_log_interval != 0:
+            return
+
+        stats_dir = os.path.dirname(self.mcip_debug_stats_file)
+        if stats_dir:
+            os.makedirs(stats_dir, exist_ok=True)
+        with open(self.mcip_debug_stats_file, 'a') as handle:
+            handle.write(json.dumps(stats, sort_keys=True) + '\n')
 
     def _get_observation(self, track_instances: Instances, name: str, like: torch.Tensor) -> torch.Tensor:
         if track_instances.has(name):
