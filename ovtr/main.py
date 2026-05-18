@@ -161,6 +161,8 @@ def get_args_parser():
     parser.add_argument('--mcip_motion_scale_init', default=None, type=float)
     parser.add_argument('--mcip_gate_use_txt', default=None, action='store_true')
     parser.add_argument('--debug_mcip', default=None, action='store_true')
+    parser.add_argument('--mcip_debug_stats_file', default=None, type=str)
+    parser.add_argument('--mcip_debug_log_interval', default=1, type=int)
     parser.add_argument('--attention_protection_mode', default=None, choices=['kl', 'topk', 'none'])
     parser.add_argument('--attention_protection_topk', default=None, type=int)
     parser.add_argument('--attention_protection_conf_thresh', default=None, type=float)
