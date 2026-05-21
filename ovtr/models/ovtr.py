@@ -55,6 +55,15 @@ OV_DPTD_OPTION_DEFAULTS = {
     'ov_dptd_store_debug': False,
     'use_dptd_update_suppression': False,
     'dptd_update_suppression_thresh': 0.4,
+    'dptd_update_suppression_restore_fields': [
+        'query_tgt',
+        'query_pos',
+        'ref_pts',
+        'dptd_sampling_offsets',
+        'output_embedding_img',
+        'output_embedding_txt',
+    ],
+    'dptd_update_suppression_track_id_based': True,
 }
 
 
@@ -77,6 +86,14 @@ def resolve_ov_dptd_options(args, cfg):
         setattr(args, name, value)
         setattr(cfg, name, value)
 
+    if getattr(args, 'use_dptd_update_suppression', False) and not getattr(args, 'use_ov_dptd', False):
+        raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
+    if (
+        getattr(args, 'use_dptd_update_suppression', False)
+        and not getattr(args, 'dptd_update_suppression_track_id_based', True)
+    ):
+        raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
+
     if not getattr(args, 'use_ov_dptd', False):
         return
 
@@ -90,8 +107,6 @@ def resolve_ov_dptd_options(args, cfg):
         raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_fusion='linear_sum'.")
     if getattr(args, 'ov_dptd_id_path_text', 'none') != 'none':
         raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
-    if getattr(args, 'use_dptd_update_suppression', False):
-        raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
@@ -618,6 +633,8 @@ class OVTR(nn.Module):
                     ov_dptd_store_debug=False,
                     use_dptd_update_suppression=False,
                     dptd_update_suppression_thresh=0.4,
+                    dptd_update_suppression_restore_fields=None,
+                    dptd_update_suppression_track_id_based=True,
                  ):
         """ Initializes the model.
         Parameters:
@@ -731,10 +748,18 @@ class OVTR(nn.Module):
         self.ov_dptd_store_debug = ov_dptd_store_debug
         self.use_dptd_update_suppression = use_dptd_update_suppression
         self.dptd_update_suppression_thresh = dptd_update_suppression_thresh
+        self.dptd_update_suppression_restore_fields = (
+            list(dptd_update_suppression_restore_fields)
+            if dptd_update_suppression_restore_fields is not None
+            else list(OV_DPTD_OPTION_DEFAULTS['dptd_update_suppression_restore_fields'])
+        )
+        self.dptd_update_suppression_track_id_based = dptd_update_suppression_track_id_based
         if self.use_ov_dptd and self.use_checkpoint:
             raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
-        if self.use_ov_dptd and self.use_dptd_update_suppression:
-            raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
+        if self.use_dptd_update_suppression and not self.use_ov_dptd:
+            raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
+        if self.use_dptd_update_suppression and not self.dptd_update_suppression_track_id_based:
+            raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
         self.supports_mot_batch = (
             (not use_checkpoint)
             and (len(self.transformer.encoder.fusion_layers) == 0)
@@ -752,7 +777,10 @@ class OVTR(nn.Module):
             'ov_dptd_historical_offset_used_count': 0,
             'ov_dptd_historical_offset_fallback_count': 0,
             'dptd_update_suppressed_count': 0,
-        } if self.use_ov_dptd and self.ov_dptd_store_debug else {}
+            'dptd_update_suppressed_ids': [],
+            'dptd_update_suppression_restore_success_count': 0,
+            'dptd_update_suppression_restore_skip_count': 0,
+        } if self.use_ov_dptd and (self.ov_dptd_store_debug or self.use_dptd_update_suppression) else {}
 
     def _dptd_offset_shape(self, num_queries):
         decoder_layers = getattr(self.transformer.decoder, 'layers', [])
@@ -803,6 +831,120 @@ class OVTR(nn.Module):
         ]:
             if key in debug:
                 self.ov_dptd_debug_stats[key] = debug[key]
+
+    def _reset_dptd_update_suppression_debug(self):
+        if not self.ov_dptd_debug_stats:
+            return
+        self.ov_dptd_debug_stats['dptd_update_suppressed_count'] = 0
+        self.ov_dptd_debug_stats['dptd_update_suppressed_ids'] = []
+        self.ov_dptd_debug_stats['dptd_update_suppression_restore_success_count'] = 0
+        self.ov_dptd_debug_stats['dptd_update_suppression_restore_skip_count'] = 0
+
+    def _add_dptd_update_suppression_debug(self, success_count=0, skip_count=0):
+        if not self.ov_dptd_debug_stats:
+            return
+        self.ov_dptd_debug_stats['dptd_update_suppression_restore_success_count'] += int(success_count)
+        self.ov_dptd_debug_stats['dptd_update_suppression_restore_skip_count'] += int(skip_count)
+
+    def _snapshot_dptd_update_suppression_state(self, track_instances):
+        if not self.use_dptd_update_suppression:
+            return None
+        if self.training:
+            raise RuntimeError('DPTD update suppression is inference-only.')
+        if not self.use_ov_dptd:
+            raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
+        if not self.dptd_update_suppression_track_id_based:
+            raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
+
+        self._reset_dptd_update_suppression_debug()
+        if not track_instances.has('obj_idxes') or len(track_instances) == 0:
+            return {'ids': torch.empty(0, dtype=torch.long), 'fields': {}, 'suppressed_ids': torch.empty(0, dtype=torch.long)}
+
+        valid_mask = track_instances.obj_idxes >= 0
+        old_ids = track_instances.obj_idxes[valid_mask].detach().clone()
+        snapshot = {
+            'ids': old_ids,
+            'fields': {},
+            'suppressed_ids': old_ids.new_empty((0,)),
+        }
+        if old_ids.numel() == 0:
+            return snapshot
+
+        for field_name in self.dptd_update_suppression_restore_fields:
+            if not track_instances.has(field_name):
+                continue
+            value = track_instances.get(field_name)
+            if not isinstance(value, torch.Tensor) or value.shape[0] != len(track_instances):
+                continue
+            snapshot['fields'][field_name] = value[valid_mask].detach().clone()
+        return snapshot
+
+    def _select_dptd_update_suppressed_ids(self, snapshot, track_instances):
+        if snapshot is None:
+            return None
+        if snapshot['ids'].numel() == 0 or not track_instances.has('obj_idxes') or not track_instances.has('scores'):
+            snapshot['suppressed_ids'] = snapshot['ids'].new_empty((0,))
+            return snapshot['suppressed_ids']
+
+        suppressed_ids = []
+        current_ids = track_instances.obj_idxes
+        current_scores = track_instances.scores
+        for track_id in snapshot['ids'].detach().cpu().tolist():
+            matches = torch.nonzero(current_ids == int(track_id), as_tuple=False).flatten()
+            if matches.numel() == 0:
+                continue
+            current_idx = int(matches[0].item())
+            if float(current_scores[current_idx].detach().item()) < float(self.dptd_update_suppression_thresh):
+                suppressed_ids.append(int(track_id))
+
+        device = current_ids.device
+        dtype = current_ids.dtype
+        snapshot['suppressed_ids'] = torch.tensor(suppressed_ids, device=device, dtype=dtype)
+        if self.ov_dptd_debug_stats:
+            self.ov_dptd_debug_stats['dptd_update_suppressed_count'] = len(suppressed_ids)
+            self.ov_dptd_debug_stats['dptd_update_suppressed_ids'] = suppressed_ids
+        return snapshot['suppressed_ids']
+
+    def _restore_dptd_update_suppressed_state(self, snapshot, track_instances):
+        if snapshot is None:
+            return track_instances
+        suppressed_ids = snapshot.get('suppressed_ids')
+        if suppressed_ids is None or suppressed_ids.numel() == 0:
+            return track_instances
+        if not track_instances.has('obj_idxes'):
+            self._add_dptd_update_suppression_debug(skip_count=len(snapshot.get('fields', {})) * int(suppressed_ids.numel()))
+            return track_instances
+
+        success_count = 0
+        skip_count = 0
+        current_ids = track_instances.obj_idxes
+        snapshot_ids = snapshot['ids'].to(device=current_ids.device, dtype=current_ids.dtype)
+        for track_id in suppressed_ids.to(device=current_ids.device, dtype=current_ids.dtype).detach().cpu().tolist():
+            current_matches = torch.nonzero(current_ids == int(track_id), as_tuple=False).flatten()
+            snapshot_matches = torch.nonzero(snapshot_ids == int(track_id), as_tuple=False).flatten()
+            if current_matches.numel() == 0 or snapshot_matches.numel() == 0:
+                skip_count += max(1, len(snapshot.get('fields', {})))
+                continue
+            current_idx = int(current_matches[0].item())
+            snapshot_idx = int(snapshot_matches[0].item())
+
+            for field_name, old_values in snapshot.get('fields', {}).items():
+                if not track_instances.has(field_name):
+                    skip_count += 1
+                    continue
+                current_value = track_instances.get(field_name)
+                if not isinstance(current_value, torch.Tensor) or current_value.shape[0] != len(track_instances):
+                    skip_count += 1
+                    continue
+                old_value = old_values[snapshot_idx].to(device=current_value.device, dtype=current_value.dtype)
+                if tuple(current_value[current_idx].shape) != tuple(old_value.shape):
+                    skip_count += 1
+                    continue
+                current_value[current_idx] = old_value
+                success_count += 1
+
+        self._add_dptd_update_suppression_debug(success_count=success_count, skip_count=skip_count)
+        return track_instances
 
     def _generate_empty_tracks(self, cls_pad_len=1203):
         track_instances = Instances((1, 1))
@@ -1232,6 +1374,8 @@ class OVTR(nn.Module):
         with torch.no_grad():
             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
 
+        dptd_suppression_snapshot = self._snapshot_dptd_update_suppression_state(track_instances)
+
         track_instances.scores = track_scores
         track_instances.pred_logits = frame_res['pred_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
@@ -1240,6 +1384,8 @@ class OVTR(nn.Module):
         track_instances.query_pos = frame_res["query_pos_track"][0]
         self._attach_dptd_sampling_offsets(frame_res, track_instances)
         self._mcip_attach_semantic_observations(frame_res, track_instances)
+        self._select_dptd_update_suppressed_ids(dptd_suppression_snapshot, track_instances)
+        track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
 
         if self.training:
             # the track id will be assigned by the mather.
@@ -1253,6 +1399,7 @@ class OVTR(nn.Module):
             if is_first:
                 self.track_base.clear()
             track_instances = self.track_base.update(track_instances, _track_discard, is_repeat=is_repeat)
+            track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
             track_instances = self._mcip_verify_track_fields(track_instances)
 
         tmp = {}
@@ -1261,6 +1408,10 @@ class OVTR(nn.Module):
 
         if not is_last:
             out_track_instances = self.track_embed(tmp)
+            out_track_instances = self._restore_dptd_update_suppressed_state(
+                dptd_suppression_snapshot,
+                out_track_instances,
+            )
             frame_res['track_instances'] = out_track_instances
         else:
             frame_res['track_instances'] = None
@@ -1313,8 +1464,10 @@ class OVTR(nn.Module):
             raise RuntimeError('OV-DPTD v1 does not support batch_size > 1 training.')
         if self.use_ov_dptd and self.use_checkpoint:
             raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
-        if self.use_ov_dptd and self.use_dptd_update_suppression:
-            raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
+        if self.training and self.use_dptd_update_suppression:
+            raise RuntimeError('DPTD update suppression is inference-only.')
+        if self.use_dptd_update_suppression and not self.use_ov_dptd:
+            raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
 
     def forward(self, data):
         frames_by_time, targets_by_time, batch_size = self._transpose_batch_inputs(data)
@@ -1480,5 +1633,7 @@ def build(args, cfg):
         ov_dptd_store_debug=args.ov_dptd_store_debug,
         use_dptd_update_suppression=args.use_dptd_update_suppression,
         dptd_update_suppression_thresh=args.dptd_update_suppression_thresh,
+        dptd_update_suppression_restore_fields=args.dptd_update_suppression_restore_fields,
+        dptd_update_suppression_track_id_based=args.dptd_update_suppression_track_id_based,
     )
     return model, criterion

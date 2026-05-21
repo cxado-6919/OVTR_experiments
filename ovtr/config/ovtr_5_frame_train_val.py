@@ -50,6 +50,15 @@ ov_dptd_fuse_cti = False
 ov_dptd_store_debug = False
 use_dptd_update_suppression = False
 dptd_update_suppression_thresh = 0.4
+dptd_update_suppression_restore_fields = [
+    "query_tgt",
+    "query_pos",
+    "ref_pts",
+    "dptd_sampling_offsets",
+    "output_embedding_img",
+    "output_embedding_txt",
+]
+dptd_update_suppression_track_id_based = True
 
 # scaling
 prior_prob = 0.005

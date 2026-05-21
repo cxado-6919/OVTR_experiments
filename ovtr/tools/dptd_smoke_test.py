@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from detectron2.structures import Instances  # noqa: E402
-from models.ovtr import OVTR, resolve_ov_dptd_options  # noqa: E402
+from models.ovtr import OVTR, RuntimeTrackerBase, resolve_ov_dptd_options  # noqa: E402
 from models.transformer import DeformableTransformerDecoderLayer, TransformerDecoder  # noqa: E402
 
 
@@ -155,6 +155,15 @@ def _args_cfg(**overrides):
         ov_dptd_store_debug=False,
         use_dptd_update_suppression=False,
         dptd_update_suppression_thresh=0.4,
+        dptd_update_suppression_restore_fields=[
+            "query_tgt",
+            "query_pos",
+            "ref_pts",
+            "dptd_sampling_offsets",
+            "output_embedding_img",
+            "output_embedding_txt",
+        ],
+        dptd_update_suppression_track_id_based=True,
         use_checkpoint_track=False,
         use_transformer_ckpt=False,
     )
@@ -177,7 +186,8 @@ def test_dptd_guards():
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_checkpoint_track=True)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_transformer_ckpt=True)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(args__quant_deploy="int_msda")))
-    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_update_suppression=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_ov_dptd=False, use_dptd_update_suppression=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_update_suppression=True, dptd_update_suppression_track_id_based=False)))
 
     fake_model = OVTR.__new__(OVTR)
     fake_model.training = True
@@ -187,12 +197,118 @@ def test_dptd_guards():
     _assert_raises(RuntimeError, lambda: OVTR._check_ov_dptd_forward_supported(fake_model, 2))
     _assert_raises(RuntimeError, lambda: OVTR._forward_hybrid_batched(fake_model, [], []))
 
+    fake_model.use_dptd_update_suppression = True
+    _assert_raises(RuntimeError, lambda: OVTR._check_ov_dptd_forward_supported(fake_model, 1))
+
+
+def _make_suppression_model():
+    fake_model = OVTR.__new__(OVTR)
+    fake_model.training = False
+    fake_model.use_ov_dptd = True
+    fake_model.use_dptd_update_suppression = True
+    fake_model.dptd_update_suppression_thresh = 0.4
+    fake_model.dptd_update_suppression_restore_fields = [
+        "query_tgt",
+        "query_pos",
+        "ref_pts",
+        "dptd_sampling_offsets",
+        "output_embedding_img",
+        "output_embedding_txt",
+    ]
+    fake_model.dptd_update_suppression_track_id_based = True
+    fake_model.ov_dptd_debug_stats = {
+        "dptd_update_suppressed_count": 0,
+        "dptd_update_suppressed_ids": [],
+        "dptd_update_suppression_restore_success_count": 0,
+        "dptd_update_suppression_restore_skip_count": 0,
+    }
+    return fake_model
+
+
+def _make_suppression_tracks():
+    num_tracks = 3
+    hidden_dim = 4
+    inst = Instances((1, 1))
+    inst.obj_idxes = torch.tensor([10, 11, -1], dtype=torch.long)
+    inst.scores = torch.zeros(num_tracks)
+    inst.query_tgt = torch.arange(num_tracks * hidden_dim, dtype=torch.float32).view(num_tracks, hidden_dim)
+    inst.query_pos = inst.query_tgt + 10.0
+    inst.ref_pts = torch.arange(num_tracks * 4, dtype=torch.float32).view(num_tracks, 4) + 20.0
+    inst.dptd_sampling_offsets = torch.arange(num_tracks * 2 * 1 * 2 * 2, dtype=torch.float32).view(num_tracks, 2, 1, 2, 2)
+    inst.output_embedding_img = inst.query_tgt + 30.0
+    inst.output_embedding_txt = inst.query_tgt + 40.0
+    inst.pred_boxes = torch.zeros(num_tracks, 4)
+    inst.pred_logits = torch.zeros(num_tracks, 5)
+    inst.disappear_time = torch.zeros(num_tracks, dtype=torch.long)
+    inst.cls_idxes = torch.zeros(num_tracks, dtype=torch.long)
+    return inst
+
+
+def test_dptd_update_suppression_restore_by_track_id():
+    model = _make_suppression_model()
+    tracks = _make_suppression_tracks()
+    old_values = {
+        name: tracks.get(name).detach().clone()
+        for name in model.dptd_update_suppression_restore_fields
+    }
+
+    snapshot = OVTR._snapshot_dptd_update_suppression_state(model, tracks)
+    for name in model.dptd_update_suppression_restore_fields:
+        tracks.set(name, tracks.get(name) + 1000.0)
+    tracks.scores = torch.tensor([0.2, 0.9, 0.95])
+
+    suppressed_ids = OVTR._select_dptd_update_suppressed_ids(model, snapshot, tracks)
+    assert suppressed_ids.detach().cpu().tolist() == [10]
+
+    restored = OVTR._restore_dptd_update_suppressed_state(model, snapshot, tracks)
+    for name in model.dptd_update_suppression_restore_fields:
+        value = restored.get(name)
+        assert torch.equal(value[0], old_values[name][0]), name
+        assert torch.equal(value[1], old_values[name][1] + 1000.0), name
+        assert torch.equal(value[2], old_values[name][2] + 1000.0), name
+
+    assert model.ov_dptd_debug_stats["dptd_update_suppressed_count"] == 1
+    assert model.ov_dptd_debug_stats["dptd_update_suppressed_ids"] == [10]
+    assert model.ov_dptd_debug_stats["dptd_update_suppression_restore_success_count"] == len(model.dptd_update_suppression_restore_fields)
+
+
+def test_dptd_update_suppression_after_track_base_update():
+    model = _make_suppression_model()
+    tracks = _make_suppression_tracks()
+    old_values = {
+        name: tracks.get(name).detach().clone()
+        for name in model.dptd_update_suppression_restore_fields
+    }
+    snapshot = OVTR._snapshot_dptd_update_suppression_state(model, tracks)
+
+    for name in model.dptd_update_suppression_restore_fields:
+        tracks.set(name, tracks.get(name) + 1000.0)
+    tracks.scores = torch.tensor([0.2, 0.9, 0.95])
+    OVTR._select_dptd_update_suppressed_ids(model, snapshot, tracks)
+
+    tracker = RuntimeTrackerBase(score_thresh=0.6, filter_score_thresh=0.4, miss_tolerance=5)
+    tracker.max_obj_id = 100
+    updated = tracker.update(tracks, torch.zeros(len(tracks), dtype=torch.bool))
+    restored = OVTR._restore_dptd_update_suppressed_state(model, snapshot, updated)
+
+    ids = restored.obj_idxes.detach().cpu().tolist()
+    low_idx = ids.index(10)
+    high_idx = ids.index(11)
+    new_idx = ids.index(100)
+    for name in model.dptd_update_suppression_restore_fields:
+        value = restored.get(name)
+        assert torch.equal(value[low_idx], old_values[name][0]), name
+        assert torch.equal(value[high_idx], old_values[name][1] + 1000.0), name
+        assert torch.equal(value[new_idx], old_values[name][2] + 1000.0), name
+
 
 def main():
     torch.manual_seed(0)
     test_baseline_decoder_contract()
     test_dptd_first_and_second_frame_offsets()
     test_dptd_guards()
+    test_dptd_update_suppression_restore_by_track_id()
+    test_dptd_update_suppression_after_track_base_update()
     print("DPTD smoke passed")
 
 
