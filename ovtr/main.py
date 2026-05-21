@@ -159,6 +159,10 @@ def get_args_parser():
     parser.add_argument('--no_mcip_use_motion_ref', dest='mcip_use_motion_ref', action='store_false')
     parser.add_argument('--mcip_motion_momentum', default=None, type=float)
     parser.add_argument('--mcip_motion_scale_init', default=None, type=float)
+    parser.add_argument('--mcip_max_memory_update', default=None, type=float)
+    parser.add_argument('--mcip_max_residual_ratio', default=None, type=float)
+    parser.add_argument('--mcip_motion_offset_cap', default=None, type=float)
+    parser.add_argument('--mcip_semantic_topk', default=None, type=int)
     parser.add_argument('--mcip_gate_use_txt', default=None, action='store_true')
     parser.add_argument('--debug_mcip', default=None, action='store_true')
     parser.add_argument('--mcip_debug_stats_file', default=None, type=str)
@@ -490,11 +494,16 @@ def main(args):
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(model_state, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         allowed_mcip_missing = []
+        allowed_mcip_unexpected = []
         if getattr(args, "mcip_enable", False):
             allowed_mcip_missing = [k for k in missing_keys if is_mcip_checkpoint_key(k)]
             missing_keys = [k for k in missing_keys if not is_mcip_checkpoint_key(k)]
+            allowed_mcip_unexpected = [k for k in unexpected_keys if is_mcip_checkpoint_key(k)]
+            unexpected_keys = [k for k in unexpected_keys if not is_mcip_checkpoint_key(k)]
         if len(allowed_mcip_missing) > 0:
             print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
+        if len(allowed_mcip_unexpected) > 0:
+            print('Allowed unexpected M-CIP Keys: {}'.format(allowed_mcip_unexpected))
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:

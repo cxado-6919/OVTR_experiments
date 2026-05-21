@@ -36,9 +36,13 @@ MCIP_OPTION_DEFAULTS = {
     'mcip_detach_memory': True,
     'mcip_memory_momentum': 0.8,
     'mcip_use_semantic_memory': True,
-    'mcip_use_motion_ref': True,
+    'mcip_use_motion_ref': False,
     'mcip_motion_momentum': 0.7,
     'mcip_motion_scale_init': 0.0,
+    'mcip_max_memory_update': 0.05,
+    'mcip_max_residual_ratio': 0.05,
+    'mcip_motion_offset_cap': 0.02,
+    'mcip_semantic_topk': 5,
     'mcip_gate_use_txt': False,
     'debug_mcip': False,
     'attention_protection_mode': 'kl',
@@ -576,6 +580,7 @@ class OVTR(nn.Module):
                     train_with_artificial_img_seqs=False,
                     mcip_enable=False,
                     mcip_detach_memory=True,
+                    mcip_semantic_topk=5,
                     debug_mcip=False,
                  ):
         """ Initializes the model.
@@ -689,6 +694,7 @@ class OVTR(nn.Module):
         self.supports_mot_batch = (not use_checkpoint) and (len(self.transformer.encoder.fusion_layers) == 0)
         self.mcip_enable = mcip_enable
         self.mcip_detach_memory = mcip_detach_memory
+        self.mcip_semantic_topk = 5 if mcip_semantic_topk is None else int(mcip_semantic_topk)
         self.debug_mcip = debug_mcip
         self.mcip_debug_stats = {
             'attention_protection_mode': getattr(self.transformer.decoder, 'attention_protection_mode', 'kl')
@@ -748,10 +754,20 @@ class OVTR(nn.Module):
         logits_for_memory = pred_logits[..., :cls_len]
         text_feat_for_memory = text_feat[:cls_len]
         prob = torch.softmax(logits_for_memory.float(), dim=-1)
-        semantic_obs = prob @ text_feat_for_memory.float()
+        semantic_topk = int(getattr(self, 'mcip_semantic_topk', 5) or 0)
+        if semantic_topk > 0:
+            k = min(semantic_topk, cls_len)
+            topk_prob, topk_idx = prob.topk(k, dim=-1)
+            topk_prob = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            topk_text_feat = text_feat_for_memory.float()[topk_idx]
+            semantic_obs = (topk_prob[..., None] * topk_text_feat).sum(dim=-2)
+        else:
+            semantic_obs = prob @ text_feat_for_memory.float()
+        semantic_obs = F.normalize(semantic_obs, dim=-1)
         cls_conf_obs = prob.max(dim=-1).values
         entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=-1)
         entropy = entropy / (math.log(cls_len) if cls_len > 1 else 1.0)
+        entropy = entropy.clamp(0.0, 1.0)
 
         if self.mcip_detach_memory:
             semantic_obs = semantic_obs.detach()
@@ -1325,6 +1341,7 @@ def build(args, cfg):
         miss_tolerance=args.miss_tolerance,
         mcip_enable=args.mcip_enable,
         mcip_detach_memory=args.mcip_detach_memory,
+        mcip_semantic_topk=args.mcip_semantic_topk,
         debug_mcip=args.debug_mcip,
     )
     return model, criterion

@@ -9,6 +9,11 @@ MCIP_CHECKPOINT_KEY_MARKERS = (
     "track_embed.memory_img_proj.",
     "track_embed.memory_sem_proj.",
     "track_embed.motion_scale",
+    "track_embed.mcip_img_obs_norm.",
+    "track_embed.mcip_img_memory_norm.",
+    "track_embed.mcip_sem_memory_norm.",
+    "track_embed.memory_residual_adapter.",
+    "track_embed.memory_inject_logit",
 )
 
 
@@ -44,7 +49,10 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                 state_dict[k] = model_state_dict[k]
         else:
             if "_group_a_" not in k:
-                print('Drop parameter {}.'.format(k))
+                if allow_mcip_missing and is_mcip_checkpoint_key(k):
+                    print('Allowed unexpected M-CIP Key: {}'.format(k))
+                else:
+                    print('Drop parameter {}.'.format(k))
     allowed_mcip_missing = []
     for k in model_state_dict:
         if not (k in state_dict):

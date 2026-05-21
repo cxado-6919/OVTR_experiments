@@ -4,6 +4,7 @@
 # Copyright (c) 2021 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
 import json
+import math
 import os
 
 import torch
@@ -271,23 +272,14 @@ class Category_Information_Propagator(QueryInteractionModule):
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        
-        # if args.update_query_pos:
-        # self.dropout3 = nn.Dropout(dropout)
-        # self.dropout4 = nn.Dropout(dropout)
-
         self.activation = F.relu
 
-    def _aggregate_category_info(self, track_instances: Instances) -> Instances:
-        if len(track_instances) == 0:
-            return track_instances
-        
-        out_embed_img = track_instances.output_embedding_img
+    def _cip_core(self, track_instances: Instances, cip_img: torch.Tensor) -> torch.Tensor:
         query_pos = track_instances.query_pos
         query_feat = track_instances.query_tgt
-        q = k = query_pos + out_embed_img
-        tgt = out_embed_img
-        
+        q = k = query_pos + cip_img
+        tgt = cip_img
+
         tgt2 = self.self_attn(q[:, None], k[:, None], value=tgt[:, None])[0][:, 0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -299,17 +291,24 @@ class Category_Information_Propagator(QueryInteractionModule):
         query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
         query_feat = query_feat + self.dropout_feat2(query_feat2)
         query_feat = self.norm_feat(query_feat)
-        track_instances.query_tgt = query_feat
+        return query_feat
 
+    def _aggregate_category_info(self, track_instances: Instances) -> Instances:
+        if len(track_instances) == 0:
+            return track_instances
+
+        track_instances.query_tgt = self._cip_core(
+            track_instances,
+            track_instances.output_embedding_img,
+        )
         track_instances.ref_pts = inverse_sigmoid(track_instances.pred_boxes[:, :4].detach().clone())
         return track_instances
-    
+
     def _select_active_tracks(self, data: dict, id_gt=None) -> Instances:
         track_instances: Instances = data['track_instances']
         if self.training:
             active_idxes = (track_instances.obj_idxes >= 0) & (track_instances.iou > 0.5)
             active_track_instances = track_instances[active_idxes]
-            # set -2 instead of -1 to ensure that these tracks will not be selected in matching.
             active_track_instances = self._random_drop_tracks(active_track_instances)
             if self.fp_ratio > 0:
                 active_track_instances = self._add_fp_tracks(track_instances, active_track_instances)
@@ -319,11 +318,10 @@ class Category_Information_Propagator(QueryInteractionModule):
 
     def _random_drop_tracks(self, track_instances: Instances) -> Instances:
         return random_drop_tracks(track_instances, self.random_drop)
-    
+
     def _add_fp_tracks(self, track_instances: Instances, active_track_instances: Instances) -> Instances:
         inactive_instances = track_instances[track_instances.obj_idxes < 0]
 
-        # add fp for each active track in a specific probability.
         fp_prob = torch.ones_like(active_track_instances.scores) * self.fp_ratio
         selected_active_track_instances = active_track_instances[torch.bernoulli(fp_prob).bool()]
 
@@ -335,10 +333,7 @@ class Category_Information_Propagator(QueryInteractionModule):
                 inactive_boxes = Boxes(box_ops.box_cxcywh_to_xyxy(inactive_instances.pred_boxes))
                 selected_active_boxes = Boxes(box_ops.box_cxcywh_to_xyxy(selected_active_track_instances.pred_boxes))
                 ious = pairwise_iou(inactive_boxes, selected_active_boxes)
-                # select the fp with the largest IoU for each active track.
                 fp_indexes = ious.max(dim=0).indices
-
-                # remove duplicate fp.
                 fp_indexes = torch.unique(fp_indexes)
                 fp_track_instances = inactive_instances[fp_indexes]
 
@@ -346,7 +341,7 @@ class Category_Information_Propagator(QueryInteractionModule):
             return merged_track_instances
 
         return active_track_instances
-    
+
     def forward(self, data, id_gt=None) -> Instances:
         active_track_instances = self._select_active_tracks(data, id_gt=id_gt)
         active_track_instances = self._aggregate_category_info(active_track_instances)
@@ -356,34 +351,41 @@ class Category_Information_Propagator(QueryInteractionModule):
 
 
 class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propagator):
-    """M-CIP: opt-in category propagation with detached compact track memory."""
+    """Safe Residual M-CIP v2: opt-in bounded memory bias after baseline CIP."""
 
     def _build_layers(self, args, dim_in, hidden_dim, dim_out):
         super()._build_layers(args, dim_in, hidden_dim, dim_out)
-        self.mcip_detach_memory = getattr(args, 'mcip_detach_memory', True)
-        self.mcip_memory_momentum = getattr(args, 'mcip_memory_momentum', 0.8)
-        self.mcip_use_semantic_memory = getattr(args, 'mcip_use_semantic_memory', True)
-        self.mcip_use_motion_ref = getattr(args, 'mcip_use_motion_ref', True)
-        self.mcip_motion_momentum = getattr(args, 'mcip_motion_momentum', 0.7)
-        self.debug_mcip = getattr(args, 'debug_mcip', False)
-        self.mcip_debug_log_interval = max(1, int(getattr(args, 'mcip_debug_log_interval', 1) or 1))
+
+        def opt(name, default):
+            value = getattr(args, name, default)
+            return default if value is None else value
+
+        self.mcip_detach_memory = bool(opt('mcip_detach_memory', True))
+        self.mcip_memory_momentum = float(opt('mcip_memory_momentum', 0.8))
+        self.mcip_use_semantic_memory = bool(opt('mcip_use_semantic_memory', True))
+        self.mcip_use_motion_ref = bool(opt('mcip_use_motion_ref', False))
+        self.mcip_motion_momentum = float(opt('mcip_motion_momentum', 0.7))
+        self.mcip_max_memory_update = float(opt('mcip_max_memory_update', 0.05))
+        self.mcip_max_residual_ratio = float(opt('mcip_max_residual_ratio', 0.05))
+        self.mcip_motion_offset_cap = float(opt('mcip_motion_offset_cap', 0.02))
+        self.debug_mcip = bool(opt('debug_mcip', False))
+        self.mcip_debug_log_interval = max(1, int(opt('mcip_debug_log_interval', 1) or 1))
         self.mcip_debug_log_calls = 0
         self.mcip_debug_stats_file = None
         if self.debug_mcip:
             self.mcip_debug_stats_file = self._resolve_debug_stats_file(args)
 
-        gate_input_dim = dim_in * 4 + 6 + 4
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(gate_input_dim, hidden_dim),
+        self.mcip_img_obs_norm = nn.LayerNorm(dim_in)
+        self.mcip_img_memory_norm = nn.LayerNorm(dim_in)
+        self.mcip_sem_memory_norm = nn.LayerNorm(dim_in)
+        adapter_input_dim = dim_in * 3 + 3
+        self.memory_residual_adapter = nn.Sequential(
+            nn.Linear(adapter_input_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
+            nn.Linear(hidden_dim, dim_in),
         )
-        self.memory_img_proj = nn.Linear(dim_in, dim_in)
-        self.memory_sem_proj = nn.Linear(dim_in, dim_in)
-        self.motion_scale = nn.Parameter(
-            torch.tensor(float(getattr(args, 'mcip_motion_scale_init', 0.0)))
-        )
+        self.memory_inject_logit = nn.Parameter(torch.tensor(-4.0))
+        self.motion_scale = nn.Parameter(torch.tensor(float(opt('mcip_motion_scale_init', 0.0))))
         self.mcip_debug_stats = {}
         self.last_mcip_debug_stats = self.mcip_debug_stats
         self.last_debug_stats = self.mcip_debug_stats
@@ -405,13 +407,33 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
 
     def _reset_parameters(self):
         super()._reset_parameters()
-        nn.init.zeros_(self.memory_img_proj.weight)
-        nn.init.zeros_(self.memory_img_proj.bias)
-        nn.init.zeros_(self.memory_sem_proj.weight)
-        nn.init.zeros_(self.memory_sem_proj.bias)
+        final = self.memory_residual_adapter[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
 
     def _detach_if_needed(self, tensor):
         return tensor.detach() if self.mcip_detach_memory else tensor
+
+    def _normalize_entropy(self, entropy: torch.Tensor, track_instances: Instances) -> torch.Tensor:
+        entropy_norm = entropy.to(device=track_instances.scores.device, dtype=track_instances.scores.dtype)
+        num_classes = 0
+        if track_instances.has('pred_logits'):
+            num_classes = int(track_instances.pred_logits.shape[-1])
+        if num_classes > 1:
+            log_classes = math.log(num_classes)
+            entropy_norm = torch.where(entropy_norm > 1.0, entropy_norm / log_classes, entropy_norm)
+        return entropy_norm.clamp(0.0, 1.0)
+
+    def _clamp_residual_delta(self, delta: torch.Tensor, base_query_tgt: torch.Tensor) -> torch.Tensor:
+        eps = 1e-6
+        delta_norm = delta.float().norm(dim=-1, keepdim=True)
+        base_norm = base_query_tgt.detach().float().norm(dim=-1, keepdim=True)
+        max_norm = float(self.mcip_max_residual_ratio) * base_norm
+        scale = torch.minimum(
+            torch.ones_like(delta_norm),
+            max_norm / delta_norm.clamp_min(eps),
+        ).to(dtype=delta.dtype)
+        return delta * scale
 
     def _update_debug_stats(self, **stats):
         clean_stats = {}
@@ -454,26 +476,29 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
 
     def _aggregate_category_info(self, track_instances: Instances) -> Instances:
         if len(track_instances) == 0:
-            if getattr(self, "debug_mcip", False):
+            if getattr(self, 'debug_mcip', False):
                 self._update_debug_stats(
-                    img_proj_norm_ratio=0.0,
-                    sem_proj_norm_ratio=0.0,
-                    total_delta_norm_ratio=0.0,
-                    mcip_img_cosine=0.0,
+                    residual_norm_ratio_mean=0.0,
+                    residual_norm_ratio_max=0.0,
+                    residual_cosine_to_base=0.0,
+                    query_tgt_cosine_to_baseline=1.0,
+                    relative_query_tgt_l2_error=0.0,
+                    gate_saturation_frac=0.0,
+                    memory_update_gate_mean=0.0,
+                    memory_update_gate_max=0.0,
+                    memory_update_gate_min=0.0,
+                    inject_gate_mean=0.0,
+                    inject_gate_max=0.0,
+                    inject_gate_min=0.0,
                     motion_offset_l1_mean=0.0,
                     motion_offset_l1_max=0.0,
-                    motion_offset_norm_mean=0.0,
-                    motion_offset_norm_max=0.0,
-                    motion_scale=self.motion_scale,
-                    effective_gate_mean=0.0,
-                    effective_gate_max=0.0,
-                    effective_gate_min=0.0,
+                    motion_scale=0.0,
                     cls_conf_obs_mean=0.0,
                     cls_conf_obs_min=0.0,
                     cls_conf_obs_max=0.0,
-                    cls_entropy_obs_mean=0.0,
-                    cls_entropy_obs_min=0.0,
-                    cls_entropy_obs_max=0.0,
+                    cls_entropy_norm_mean=0.0,
+                    cls_entropy_norm_min=0.0,
+                    cls_entropy_norm_max=0.0,
                     current_reliability_mean=0.0,
                     memory_reliability_mean=0.0,
                     motion_reliability_mean=0.0,
@@ -499,52 +524,80 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         semantic_memory_old = track_instances.semantic_memory
         box_velocity_old = track_instances.box_velocity
         memory_age = track_instances.memory_age
-        cls_conf_memory_old = track_instances.cls_conf_memory
-        cls_entropy_memory_old = track_instances.cls_entropy_memory
-        scores = track_instances.scores.to(dtype=out_embed_img.dtype)
+        cls_conf_memory_old = track_instances.cls_conf_memory.to(dtype=out_embed_img.dtype)
+        cls_entropy_memory_old = track_instances.cls_entropy_memory.to(dtype=out_embed_img.dtype)
+        scores = track_instances.scores.to(dtype=out_embed_img.dtype).clamp(0.0, 1.0)
         memory_age_normalized = memory_age.float().clamp(max=100.0).to(dtype=out_embed_img.dtype) / 100.0
 
-        if self.mcip_use_semantic_memory:
-            semantic_obs_for_gate = semantic_obs
-            semantic_memory_for_gate = semantic_memory_old
-        else:
-            semantic_obs_for_gate = torch.zeros_like(semantic_obs)
-            semantic_memory_for_gate = torch.zeros_like(semantic_memory_old)
+        base_query_tgt = self._cip_core(track_instances, out_embed_img)
+        cls_entropy_norm = self._normalize_entropy(cls_entropy_obs, track_instances).to(dtype=out_embed_img.dtype)
+        cls_entropy_memory_norm = self._normalize_entropy(cls_entropy_memory_old, track_instances).to(dtype=out_embed_img.dtype)
+        current_reliability = (scores * (1.0 - cls_entropy_norm)).clamp(0.0, 1.0)
+        memory_reliability = (
+            cls_conf_memory_old.clamp(0.0, 1.0) * (1.0 - cls_entropy_memory_norm)
+        ).clamp(0.0, 1.0)
+        img_consistency = (
+            F.cosine_similarity(out_embed_img.float(), img_memory_old.float(), dim=-1)
+            .to(dtype=out_embed_img.dtype)
+            .add(1.0)
+            .mul(0.5)
+            .clamp(0.0, 1.0)
+        )
+        valid_mem = (memory_age > 0).to(dtype=out_embed_img.dtype)
 
-        gate_input = torch.cat([
-            out_embed_img,
-            img_memory_old,
-            semantic_obs_for_gate,
-            semantic_memory_for_gate,
-            cls_conf_obs[:, None],
-            cls_entropy_obs[:, None],
-            cls_conf_memory_old[:, None],
-            cls_entropy_memory_old[:, None],
+        semantic_memory_for_adapter = semantic_memory_old if self.mcip_use_semantic_memory else torch.zeros_like(semantic_memory_old)
+        adapter_input = torch.cat([
+            self.mcip_img_obs_norm(out_embed_img),
+            self.mcip_img_memory_norm(img_memory_old),
+            self.mcip_sem_memory_norm(semantic_memory_for_adapter),
+            current_reliability[:, None],
+            img_consistency[:, None],
             memory_age_normalized[:, None],
-            scores[:, None],
-            box_velocity_old,
         ], dim=-1)
-        gate = self.gate_mlp(gate_input)
-        # Momentum damps the learned overwrite gate so memory changes slowly by default.
-        effective_gate = gate * (1.0 - float(self.mcip_memory_momentum))
+        delta = self.memory_residual_adapter(adapter_input)
+        delta = self._clamp_residual_delta(delta, base_query_tgt)
+        inject_gate = (
+            valid_mem
+            * current_reliability
+            * img_consistency
+            * torch.sigmoid(self.memory_inject_logit).to(dtype=out_embed_img.dtype)
+        )
+        residual = inject_gate[:, None] * delta
+        track_instances.query_tgt = base_query_tgt + residual
 
-        img_memory_new = (1.0 - effective_gate) * img_memory_old + effective_gate * out_embed_img
-        semantic_memory_new = (
-            (1.0 - effective_gate) * semantic_memory_old + effective_gate * semantic_obs
-            if self.mcip_use_semantic_memory
-            else semantic_memory_old
+        update_gate = (
+            valid_mem
+            * float(self.mcip_max_memory_update)
+            * current_reliability
+            * img_consistency
+        ).clamp(0.0, float(self.mcip_max_memory_update))
+        update_gate_col = update_gate[:, None]
+        is_new = memory_age <= 0
+        img_memory_updated = (1.0 - update_gate_col) * img_memory_old + update_gate_col * out_embed_img
+        img_memory_new = torch.where(is_new[:, None], out_embed_img, img_memory_updated)
+        if self.mcip_use_semantic_memory:
+            semantic_memory_updated = (
+                (1.0 - update_gate_col) * semantic_memory_old
+                + update_gate_col * semantic_obs
+            )
+            semantic_memory_new = torch.where(is_new[:, None], semantic_obs, semantic_memory_updated)
+        else:
+            semantic_memory_new = torch.where(is_new[:, None], semantic_obs, semantic_memory_old)
+
+        cls_conf_obs = cls_conf_obs.to(dtype=out_embed_img.dtype).clamp(0.0, 1.0)
+        cls_conf_memory_new = torch.where(
+            is_new,
+            cls_conf_obs,
+            (1.0 - update_gate) * cls_conf_memory_old + update_gate * cls_conf_obs,
         )
-        gate_scalar = effective_gate.squeeze(-1)
-        cls_conf_memory_new = (
-            (1.0 - gate_scalar) * cls_conf_memory_old + gate_scalar * cls_conf_obs
-        )
-        cls_entropy_memory_new = (
-            (1.0 - gate_scalar) * cls_entropy_memory_old + gate_scalar * cls_entropy_obs
+        cls_entropy_memory_new = torch.where(
+            is_new,
+            cls_entropy_norm,
+            (1.0 - update_gate) * cls_entropy_memory_norm + update_gate * cls_entropy_norm,
         )
 
         pred_boxes_det = track_instances.pred_boxes[:, :4].detach()
         prev_boxes_old = track_instances.prev_boxes
-        is_new = memory_age <= 0
         box_delta = pred_boxes_det - prev_boxes_old
         box_delta = torch.where(is_new[:, None], torch.zeros_like(box_delta), box_delta)
         box_velocity_new = (
@@ -554,54 +607,27 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         box_velocity_new = torch.where(is_new[:, None], torch.zeros_like(box_velocity_new), box_velocity_new)
         memory_age_new = memory_age + 1
 
-        query_pos = track_instances.query_pos
-        query_feat = track_instances.query_tgt
-        img_memory_contrib = self.memory_img_proj(img_memory_new)
-        semantic_memory_contrib = (
-            self.memory_sem_proj(semantic_memory_new)
-            if self.mcip_use_semantic_memory
-            else torch.zeros_like(out_embed_img)
-        )
-        mcip_img = out_embed_img + img_memory_contrib + semantic_memory_contrib
-        q = k = query_pos + mcip_img
-        tgt = mcip_img
-
-        tgt2 = self.self_attn(q[:, None], k[:, None], value=tgt[:, None])[0][:, 0]
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-
-        query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
-        query_feat = query_feat + self.dropout_feat2(query_feat2)
-        query_feat = self.norm_feat(query_feat)
-        track_instances.query_tgt = query_feat
-
-        if self.mcip_use_motion_ref:
+        next_boxes = pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
+        motion_offset = torch.zeros_like(pred_boxes_det)
+        motion_reliability = current_reliability
+        if self.mcip_use_motion_ref and not self.training:
             velocity_det = box_velocity_new.detach()
             valid_motion = (memory_age > 0).to(pred_boxes_det.dtype)[:, None]
-            current_reliability = cls_conf_obs * (1.0 - cls_entropy_obs)
-            memory_reliability = cls_conf_memory_old * (1.0 - cls_entropy_memory_old)
             motion_reliability = torch.where(
-                (memory_age > 0),
+                memory_age > 0,
                 0.5 * current_reliability + 0.5 * memory_reliability,
                 current_reliability,
+            ).clamp(0.0, 1.0)
+            xy_offset = (
+                valid_motion
+                * motion_reliability[:, None].to(dtype=pred_boxes_det.dtype)
+                * torch.tanh(self.motion_scale).to(dtype=pred_boxes_det.dtype)
+                * velocity_det[:, :2]
             )
-            motion_reliability = motion_reliability.clamp(0.0, 1.0)
-            next_boxes = pred_boxes_det + valid_motion * motion_reliability[:, None] * self.motion_scale * velocity_det
-            next_boxes = next_boxes.clamp(1e-4, 1.0 - 1e-4)
-            track_instances.ref_pts = inverse_sigmoid(next_boxes)
-        else:
-            if getattr(self, "debug_mcip", False):
-                current_reliability = cls_conf_obs * (1.0 - cls_entropy_obs)
-                memory_reliability = cls_conf_memory_old * (1.0 - cls_entropy_memory_old)
-                motion_reliability = current_reliability.clamp(0.0, 1.0)
-                next_boxes = pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
-            track_instances.ref_pts = inverse_sigmoid(
-                pred_boxes_det.clamp(1e-4, 1.0 - 1e-4)
-            )
+            xy_offset = xy_offset.clamp(-float(self.mcip_motion_offset_cap), float(self.mcip_motion_offset_cap))
+            motion_offset[:, :2] = xy_offset
+            next_boxes = (pred_boxes_det + motion_offset).clamp(1e-4, 1.0 - 1e-4)
+        track_instances.ref_pts = inverse_sigmoid(next_boxes)
 
         track_instances.img_memory = self._detach_if_needed(img_memory_new)
         track_instances.semantic_memory = self._detach_if_needed(semantic_memory_new)
@@ -611,46 +637,49 @@ class MemoryCalibratedCategoryInformationPropagator(Category_Information_Propaga
         track_instances.box_velocity = self._detach_if_needed(box_velocity_new)
         track_instances.memory_age = self._detach_if_needed(memory_age_new)
 
-        if getattr(self, "debug_mcip", False):
+        if getattr(self, 'debug_mcip', False):
             with torch.no_grad():
                 eps = 1e-6
-                out_norm = out_embed_img.detach().float().norm(dim=-1).clamp_min(eps)
-                img_proj_norm = img_memory_contrib.detach().float().norm(dim=-1)
-                if self.mcip_use_semantic_memory:
-                    sem_proj_norm_ratio = (
-                        semantic_memory_contrib.detach().float().norm(dim=-1) / out_norm
-                    ).mean()
-                else:
-                    sem_proj_norm_ratio = 0.0
-                total_delta_norm = (mcip_img.detach() - out_embed_img.detach()).float().norm(dim=-1)
-                mcip_img_cosine = F.cosine_similarity(
-                    mcip_img.detach().float(),
-                    out_embed_img.detach().float(),
+                base_norm = base_query_tgt.detach().float().norm(dim=-1).clamp_min(eps)
+                delta_norm_ratio = delta.detach().float().norm(dim=-1) / base_norm
+                residual_cosine_to_base = F.cosine_similarity(
+                    delta.detach().float(),
+                    base_query_tgt.detach().float(),
                     dim=-1,
                 ).mean()
-                motion_offset = next_boxes.detach() - pred_boxes_det.detach()
-                motion_offset_abs = motion_offset.float().abs()
-                motion_offset_norm = motion_offset.float().norm(dim=-1)
+                query_tgt_cosine = F.cosine_similarity(
+                    track_instances.query_tgt.detach().float(),
+                    base_query_tgt.detach().float(),
+                    dim=-1,
+                ).mean()
+                relative_query_tgt_l2_error = (
+                    (track_instances.query_tgt.detach().float() - base_query_tgt.detach().float()).norm()
+                    / base_query_tgt.detach().float().norm().clamp_min(eps)
+                )
+                motion_offset_abs = motion_offset.detach().float().abs()
 
                 self._update_debug_stats(
-                    img_proj_norm_ratio=(img_proj_norm / out_norm).mean(),
-                    sem_proj_norm_ratio=sem_proj_norm_ratio,
-                    total_delta_norm_ratio=(total_delta_norm / out_norm).mean(),
-                    mcip_img_cosine=mcip_img_cosine,
+                    residual_norm_ratio_mean=delta_norm_ratio.mean(),
+                    residual_norm_ratio_max=delta_norm_ratio.max(),
+                    residual_cosine_to_base=residual_cosine_to_base,
+                    query_tgt_cosine_to_baseline=query_tgt_cosine,
+                    relative_query_tgt_l2_error=relative_query_tgt_l2_error,
+                    gate_saturation_frac=0.0,
+                    memory_update_gate_mean=update_gate.detach().float().mean(),
+                    memory_update_gate_max=update_gate.detach().float().max(),
+                    memory_update_gate_min=update_gate.detach().float().min(),
+                    inject_gate_mean=inject_gate.detach().float().mean(),
+                    inject_gate_max=inject_gate.detach().float().max(),
+                    inject_gate_min=inject_gate.detach().float().min(),
                     motion_offset_l1_mean=motion_offset_abs.mean(),
                     motion_offset_l1_max=motion_offset_abs.max(),
-                    motion_offset_norm_mean=motion_offset_norm.mean(),
-                    motion_offset_norm_max=motion_offset_norm.max(),
-                    motion_scale=self.motion_scale.detach(),
-                    effective_gate_mean=effective_gate.detach().float().mean(),
-                    effective_gate_max=effective_gate.detach().float().max(),
-                    effective_gate_min=effective_gate.detach().float().min(),
+                    motion_scale=torch.tanh(self.motion_scale.detach()),
                     cls_conf_obs_mean=cls_conf_obs.detach().float().mean(),
                     cls_conf_obs_min=cls_conf_obs.detach().float().min(),
                     cls_conf_obs_max=cls_conf_obs.detach().float().max(),
-                    cls_entropy_obs_mean=cls_entropy_obs.detach().float().mean(),
-                    cls_entropy_obs_min=cls_entropy_obs.detach().float().min(),
-                    cls_entropy_obs_max=cls_entropy_obs.detach().float().max(),
+                    cls_entropy_norm_mean=cls_entropy_norm.detach().float().mean(),
+                    cls_entropy_norm_min=cls_entropy_norm.detach().float().min(),
+                    cls_entropy_norm_max=cls_entropy_norm.detach().float().max(),
                     current_reliability_mean=current_reliability.detach().float().mean(),
                     memory_reliability_mean=memory_reliability.detach().float().mean(),
                     motion_reliability_mean=motion_reliability.detach().float().mean(),
