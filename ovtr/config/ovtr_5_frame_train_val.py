@@ -41,6 +41,16 @@ attention_protection = True
 
 computed_aux = [0, 1, 2, 3, 4, 5]
 
+# OV-DPTD v1
+use_ov_dptd = False
+ov_dptd_use_historical_offsets = True
+ov_dptd_fusion = "linear_sum"
+ov_dptd_id_path_text = "none"
+ov_dptd_fuse_cti = False
+ov_dptd_store_debug = False
+use_dptd_update_suppression = False
+dptd_update_suppression_thresh = 0.4
+
 # scaling
 prior_prob = 0.005
 log_scale = 0.0

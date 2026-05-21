@@ -46,6 +46,17 @@ MCIP_OPTION_DEFAULTS = {
     'attention_protection_conf_thresh': 0.25,
 }
 
+OV_DPTD_OPTION_DEFAULTS = {
+    'use_ov_dptd': False,
+    'ov_dptd_use_historical_offsets': True,
+    'ov_dptd_fusion': 'linear_sum',
+    'ov_dptd_id_path_text': 'none',
+    'ov_dptd_fuse_cti': False,
+    'ov_dptd_store_debug': False,
+    'use_dptd_update_suppression': False,
+    'dptd_update_suppression_thresh': 0.4,
+}
+
 
 def resolve_mcip_options(args, cfg):
     """Apply config/CLI/default M-CIP options to both args and cfg."""
@@ -55,6 +66,32 @@ def resolve_mcip_options(args, cfg):
             value = getattr(cfg, name, default)
         setattr(args, name, value)
         setattr(cfg, name, value)
+
+
+def resolve_ov_dptd_options(args, cfg):
+    """Apply config/CLI/default OV-DPTD options and reject unsupported v1 combinations."""
+    for name, default in OV_DPTD_OPTION_DEFAULTS.items():
+        value = getattr(args, name, None)
+        if value is None:
+            value = getattr(cfg, name, default)
+        setattr(args, name, value)
+        setattr(cfg, name, value)
+
+    if not getattr(args, 'use_ov_dptd', False):
+        return
+
+    if getattr(cfg, 'use_checkpoint_track', False):
+        raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
+    if getattr(cfg, 'use_transformer_ckpt', False):
+        raise RuntimeError('OV-DPTD v1 does not support use_transformer_ckpt=True.')
+    if getattr(args, 'quant_deploy', 'none') == 'int_msda':
+        raise RuntimeError('OV-DPTD v1 does not support --quant_deploy int_msda.')
+    if getattr(args, 'ov_dptd_fusion', 'linear_sum') != 'linear_sum':
+        raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_fusion='linear_sum'.")
+    if getattr(args, 'ov_dptd_id_path_text', 'none') != 'none':
+        raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+    if getattr(args, 'use_dptd_update_suppression', False):
+        raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
@@ -577,6 +614,10 @@ class OVTR(nn.Module):
                     mcip_enable=False,
                     mcip_detach_memory=True,
                     debug_mcip=False,
+                    use_ov_dptd=False,
+                    ov_dptd_store_debug=False,
+                    use_dptd_update_suppression=False,
+                    dptd_update_suppression_thresh=0.4,
                  ):
         """ Initializes the model.
         Parameters:
@@ -686,13 +727,82 @@ class OVTR(nn.Module):
         self.distribution_based_sampling = distribution_based_sampling
         self.criterion = criterion
         self.train_with_artificial_img_seqs = train_with_artificial_img_seqs
-        self.supports_mot_batch = (not use_checkpoint) and (len(self.transformer.encoder.fusion_layers) == 0)
+        self.use_ov_dptd = use_ov_dptd
+        self.ov_dptd_store_debug = ov_dptd_store_debug
+        self.use_dptd_update_suppression = use_dptd_update_suppression
+        self.dptd_update_suppression_thresh = dptd_update_suppression_thresh
+        if self.use_ov_dptd and self.use_checkpoint:
+            raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
+        if self.use_ov_dptd and self.use_dptd_update_suppression:
+            raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
+        self.supports_mot_batch = (
+            (not use_checkpoint)
+            and (len(self.transformer.encoder.fusion_layers) == 0)
+            and (not self.use_ov_dptd)
+        )
         self.mcip_enable = mcip_enable
         self.mcip_detach_memory = mcip_detach_memory
         self.debug_mcip = debug_mcip
         self.mcip_debug_stats = {
             'attention_protection_mode': getattr(self.transformer.decoder, 'attention_protection_mode', 'kl')
         } if mcip_enable else {}
+        self.ov_dptd_debug_stats = {
+            'ov_dptd_enabled': bool(self.use_ov_dptd),
+            'ov_dptd_num_track_queries': 0,
+            'ov_dptd_historical_offset_used_count': 0,
+            'ov_dptd_historical_offset_fallback_count': 0,
+            'dptd_update_suppressed_count': 0,
+        } if self.use_ov_dptd and self.ov_dptd_store_debug else {}
+
+    def _dptd_offset_shape(self, num_queries):
+        decoder_layers = getattr(self.transformer.decoder, 'layers', [])
+        if len(decoder_layers) == 0:
+            raise RuntimeError('OV-DPTD requires at least one decoder layer.')
+        cross_attn = decoder_layers[0].cross_attn
+        return (
+            num_queries,
+            cross_attn.num_heads,
+            cross_attn.num_levels,
+            cross_attn.num_points,
+            2,
+        )
+
+    def _make_empty_dptd_sampling_offsets(self, num_queries, device, dtype):
+        return torch.zeros(self._dptd_offset_shape(num_queries), device=device, dtype=dtype)
+
+    def _attach_dptd_sampling_offsets(self, frame_res, track_instances):
+        if not self.use_ov_dptd:
+            return
+        if 'dptd_sampling_offsets' not in frame_res:
+            raise RuntimeError('OV-DPTD decoder did not return dptd_sampling_offsets.')
+        offsets = frame_res['dptd_sampling_offsets']
+        if offsets.dim() == 6:
+            offsets = offsets[0]
+        expected_shape = self._dptd_offset_shape(len(track_instances))
+        if tuple(offsets.shape) != expected_shape:
+            raise RuntimeError(
+                'OV-DPTD sampling offset shape mismatch: '
+                f'expected {expected_shape}, got {tuple(offsets.shape)}'
+            )
+        track_instances.dptd_sampling_offsets = offsets.to(
+            device=track_instances.query_tgt.device,
+            dtype=track_instances.query_tgt.dtype,
+        )
+
+    def _update_ov_dptd_debug_stats(self, dptd_info):
+        if not (self.use_ov_dptd and self.ov_dptd_store_debug and dptd_info is not None):
+            return
+        debug = dptd_info.get('debug') if isinstance(dptd_info, dict) else None
+        if not debug:
+            return
+        for key in [
+            'ov_dptd_enabled',
+            'ov_dptd_num_track_queries',
+            'ov_dptd_historical_offset_used_count',
+            'ov_dptd_historical_offset_fallback_count',
+        ]:
+            if key in debug:
+                self.ov_dptd_debug_stats[key] = debug[key]
 
     def _generate_empty_tracks(self, cls_pad_len=1203):
         track_instances = Instances((1, 1))
@@ -710,6 +820,12 @@ class OVTR(nn.Module):
         track_instances.scores = torch.zeros((num_queries,), dtype=torch.float, device=device)
         track_instances.pred_boxes = torch.zeros((num_queries, 4), dtype=torch.float, device=device)
         track_instances.pred_logits = torch.zeros((num_queries, cls_pad_len), dtype=torch.float, device=device)
+        if self.use_ov_dptd:
+            track_instances.dptd_sampling_offsets = self._make_empty_dptd_sampling_offsets(
+                num_queries,
+                device,
+                track_instances.query_tgt.dtype,
+            )
 
         if not self.training:
             track_instances.cls_idxes = torch.full((num_queries,), -1, dtype=torch.long, device=device)
@@ -883,6 +999,8 @@ class OVTR(nn.Module):
         return [[frame] for frame in frames], [[target] for target in targets], 1
 
     def _forward_single_image_from_memory(self, encoder_cache, sample_idx, track_instances: Instances, targets=None, extra_labels=None, is_first=True, cls_num=0):
+        if self.use_ov_dptd:
+            raise RuntimeError('OV-DPTD v1 does not support _forward_single_image_from_memory.')
         text_dict, image_feat_ori, select_id, extra_labels = self._prepare_text_conditioning(
             targets, extra_labels, is_first, cls_num, batch_size=1
         )
@@ -951,6 +1069,8 @@ class OVTR(nn.Module):
         return out
 
     def _forward_hybrid_batched(self, frames_by_time, targets_by_time):
+        if self.use_ov_dptd:
+            raise RuntimeError('OV-DPTD v1 does not support hybrid batched training.')
         batch_size = len(targets_by_time[0])
         sample_gt_instances = [
             [targets_by_time[frame_idx][sample_idx] for frame_idx in range(len(targets_by_time))]
@@ -1033,8 +1153,27 @@ class OVTR(nn.Module):
         select_id = torch.tensor(select_id).to(text_query.device)
         text_dict = preprocess_for_masks(srcs[0].shape[0], select_id, text_query)
 
-        (hs_cti, hs_ofa, init_reference, inter_references, pre_outputs_classes, query_pos_track) = self.transformer(
-            srcs, masks, pos, track_instances.query_pos, track_instances.query_tgt, ref_pts=track_instances.ref_pts, text_dict=text_dict)
+        dptd_sampling_offsets = (
+            track_instances.dptd_sampling_offsets
+            if self.use_ov_dptd and track_instances.has('dptd_sampling_offsets')
+            else None
+        )
+        transformer_outputs = self.transformer(
+            srcs,
+            masks,
+            pos,
+            track_instances.query_pos,
+            track_instances.query_tgt,
+            ref_pts=track_instances.ref_pts,
+            text_dict=text_dict,
+            dptd_sampling_offsets=dptd_sampling_offsets,
+            return_dptd_info=self.use_ov_dptd,
+        )
+        dptd_info = None
+        if self.use_ov_dptd:
+            (hs_cti, hs_ofa, init_reference, inter_references, pre_outputs_classes, query_pos_track, dptd_info) = transformer_outputs
+        else:
+            (hs_cti, hs_ofa, init_reference, inter_references, pre_outputs_classes, query_pos_track) = transformer_outputs
 
         outputs_coords = []
         outputs_embeds = []
@@ -1071,6 +1210,11 @@ class OVTR(nn.Module):
             "image_feat": image_feat_ori,
             "extra_labels": extra_labels,
             }
+        if self.use_ov_dptd:
+            if dptd_info is None or dptd_info.get('sampling_offsets') is None:
+                raise RuntimeError('OV-DPTD decoder did not return final sampling offsets.')
+            out['dptd_sampling_offsets'] = dptd_info['sampling_offsets']
+            self._update_ov_dptd_debug_stats(dptd_info)
         self._mcip_store_text_feat(out, text_dict)
             
         if self.aux_loss:
@@ -1094,6 +1238,7 @@ class OVTR(nn.Module):
         track_instances.output_embedding_txt = frame_res['hs_cti'][0]
         track_instances.output_embedding_img = frame_res['hs_ofa'][0]
         track_instances.query_pos = frame_res["query_pos_track"][0]
+        self._attach_dptd_sampling_offsets(frame_res, track_instances)
         self._mcip_attach_semantic_observations(frame_res, track_instances)
 
         if self.training:
@@ -1163,14 +1308,18 @@ class OVTR(nn.Module):
             ret['ref_pts'] = ref_pts
         return ret
 
+    def _check_ov_dptd_forward_supported(self, batch_size):
+        if self.training and self.use_ov_dptd and batch_size > 1:
+            raise RuntimeError('OV-DPTD v1 does not support batch_size > 1 training.')
+        if self.use_ov_dptd and self.use_checkpoint:
+            raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
+        if self.use_ov_dptd and self.use_dptd_update_suppression:
+            raise NotImplementedError('Confidence-guided DPTD update suppression is not implemented in v1.')
+
     def forward(self, data):
         frames_by_time, targets_by_time, batch_size = self._transpose_batch_inputs(data)
-        if (
-            self.training
-            and batch_size > 1
-            and not self.use_checkpoint
-            and not self.transformer.encoder.fusion_layers
-        ):
+        self._check_ov_dptd_forward_supported(batch_size)
+        if self.training and batch_size > 1 and self.supports_mot_batch:
             return self._forward_hybrid_batched(frames_by_time, targets_by_time)
 
         if self.training:
@@ -1263,6 +1412,7 @@ class OVTR(nn.Module):
 
 def build(args, cfg):
     resolve_mcip_options(args, cfg)
+    resolve_ov_dptd_options(args, cfg)
     
     assert cfg.Clip_text_embeddings and cfg.Clip_image_embeddings, "Clip_text_embeddings or Clip_image_embeddings should not be None"
     text_embeddings, image_embeddings = load_embeddings(cfg.Clip_text_embeddings, cfg.Clip_image_embeddings)  
@@ -1326,5 +1476,9 @@ def build(args, cfg):
         mcip_enable=args.mcip_enable,
         mcip_detach_memory=args.mcip_detach_memory,
         debug_mcip=args.debug_mcip,
+        use_ov_dptd=args.use_ov_dptd,
+        ov_dptd_store_debug=args.ov_dptd_store_debug,
+        use_dptd_update_suppression=args.use_dptd_update_suppression,
+        dptd_update_suppression_thresh=args.dptd_update_suppression_thresh,
     )
     return model, criterion

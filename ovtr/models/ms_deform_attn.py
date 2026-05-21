@@ -394,6 +394,8 @@ class MultiScaleDeformableAttention(nn.Module):
         reference_points: Optional[torch.Tensor] = None,
         spatial_shapes: Optional[torch.Tensor] = None,
         level_start_index: Optional[torch.Tensor] = None,
+        override_sampling_offsets: Optional[torch.Tensor] = None,
+        return_sampling_offsets: bool = False,
         **kwargs
     ) -> torch.Tensor:
 
@@ -442,6 +444,11 @@ class MultiScaleDeformableAttention(nn.Module):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
         if getattr(self, "_ovtr_quant_deploy_mode", "none") == "int_msda":
+            if override_sampling_offsets is not None or return_sampling_offsets:
+                raise RuntimeError(
+                    "OV-DPTD sampling offset override/return is not supported with "
+                    "--quant_deploy int_msda."
+                )
             output = self._forward_int_msda(
                 query,
                 value,
@@ -458,9 +465,23 @@ class MultiScaleDeformableAttention(nn.Module):
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         value = value.view(bs, num_value, self.num_heads, -1)
-        sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+        expected_offsets_shape = (
+            bs,
+            num_query,
+            self.num_heads,
+            self.num_levels,
+            self.num_points,
+            2,
         )
+        if override_sampling_offsets is None:
+            sampling_offsets = self.sampling_offsets(query).view(*expected_offsets_shape)
+        else:
+            if tuple(override_sampling_offsets.shape) != expected_offsets_shape:
+                raise ValueError(
+                    "override_sampling_offsets must have shape "
+                    f"{expected_offsets_shape}, got {tuple(override_sampling_offsets.shape)}"
+                )
+            sampling_offsets = override_sampling_offsets.to(device=query.device, dtype=query.dtype)
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points
         )
@@ -526,6 +547,8 @@ class MultiScaleDeformableAttention(nn.Module):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
+        if return_sampling_offsets:
+            return output, sampling_offsets.detach()
         return output
 
 

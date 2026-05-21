@@ -62,6 +62,12 @@ class Transformer(nn.Module):
         attention_protection_topk=3,
         attention_protection_conf_thresh=0.25,
         computed_aux=None,
+        use_ov_dptd=False,
+        ov_dptd_use_historical_offsets=True,
+        ov_dptd_fusion="linear_sum",
+        ov_dptd_id_path_text="none",
+        ov_dptd_fuse_cti=False,
+        ov_dptd_store_debug=False,
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -131,6 +137,12 @@ class Transformer(nn.Module):
             attention_protection_conf_thresh=attention_protection_conf_thresh,
             computed_aux=computed_aux,
             use_transformer_ckpt=use_transformer_ckpt,
+            use_ov_dptd=use_ov_dptd,
+            ov_dptd_use_historical_offsets=ov_dptd_use_historical_offsets,
+            ov_dptd_fusion=ov_dptd_fusion,
+            ov_dptd_id_path_text=ov_dptd_id_path_text,
+            ov_dptd_fuse_cti=ov_dptd_fuse_cti,
+            ov_dptd_store_debug=ov_dptd_store_debug,
         )
 
         self.d_model = d_model
@@ -171,6 +183,8 @@ class Transformer(nn.Module):
         self.attention_protection = attention_protection
             
         self._reset_parameters()
+        if hasattr(self.decoder, "reset_ov_dptd_fusion_parameters"):
+            self.decoder.reset_ov_dptd_fusion_parameters()
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -271,6 +285,8 @@ class Transformer(nn.Module):
         query_tgt=None,
         ref_pts=None,
         text_dict=None,
+        dptd_sampling_offsets=None,
+        return_dptd_info=False,
     ):
         text_dict = self._ensure_encoded_text(text_dict)
         bs, _, _ = memory.shape
@@ -320,7 +336,7 @@ class Transformer(nn.Module):
             init_reference_out = reference_points
 
         isolation_mask = None
-        hs_cti, hs_ofa, inter_references, pre_outputs_classes, query_pos_track = self.decoder(
+        decoder_outputs = self.decoder(
             tgt.transpose(0, 1),
             reference_points.transpose(0, 1),
             memory.transpose(0, 1),
@@ -333,15 +349,41 @@ class Transformer(nn.Module):
             pos=lvl_pos_embed_flatten.transpose(0, 1),
             num=self.num_queries,
             enc_output_undetach=None,
+            dptd_sampling_offsets=dptd_sampling_offsets,
+            return_dptd_info=return_dptd_info,
         )
+
+        dptd_info = None
+        if return_dptd_info:
+            hs_cti, hs_ofa, inter_references, pre_outputs_classes, query_pos_track, dptd_info = decoder_outputs
+        else:
+            hs_cti, hs_ofa, inter_references, pre_outputs_classes, query_pos_track = decoder_outputs
 
         inter_references_out = inter_references
         if self.two_stage_type == "standard":
-            return (hs_cti, hs_ofa, init_reference_out, inter_references_out, pre_outputs_classes, query_pos_track)
+            ret = (hs_cti, hs_ofa, init_reference_out, inter_references_out, pre_outputs_classes, query_pos_track)
+            if return_dptd_info:
+                ret = ret + (dptd_info,)
+            return ret
 
-        return (hs_cti, hs_ofa, init_reference_out, pre_outputs_classes, query_pos_track)
+        ret = (hs_cti, hs_ofa, init_reference_out, pre_outputs_classes, query_pos_track)
+        if return_dptd_info:
+            ret = ret + (dptd_info,)
+        return ret
 
-    def forward(self, srcs, masks, pos_embeds, query_pos=None, query_tgt=None, ref_pts=None, text_dict=None, cache=None):
+    def forward(
+        self,
+        srcs,
+        masks,
+        pos_embeds,
+        query_pos=None,
+        query_tgt=None,
+        ref_pts=None,
+        text_dict=None,
+        cache=None,
+        dptd_sampling_offsets=None,
+        return_dptd_info=False,
+    ):
     
         """
         Input:
@@ -382,6 +424,8 @@ class Transformer(nn.Module):
             query_tgt=query_tgt,
             ref_pts=ref_pts,
             text_dict=text_dict,
+            dptd_sampling_offsets=dptd_sampling_offsets,
+            return_dptd_info=return_dptd_info,
         )
 
 
@@ -556,6 +600,12 @@ class TransformerDecoder(nn.Module):
         attention_protection_conf_thresh=0.25,
         computed_aux=None,
         use_transformer_ckpt=False,
+        use_ov_dptd=False,
+        ov_dptd_use_historical_offsets=True,
+        ov_dptd_fusion="linear_sum",
+        ov_dptd_id_path_text="none",
+        ov_dptd_fuse_cti=False,
+        ov_dptd_store_debug=False,
     ):
         super().__init__()
         if num_layers > 0:
@@ -601,6 +651,244 @@ class TransformerDecoder(nn.Module):
         self.bias0 = nn.Parameter(torch.full((self.num_logits_layer,), bias_value), requires_grad=True)
         self.eps: float = 1e-05
 
+        self.use_ov_dptd = use_ov_dptd
+        self.ov_dptd_use_historical_offsets = ov_dptd_use_historical_offsets
+        self.ov_dptd_fusion = ov_dptd_fusion
+        self.ov_dptd_id_path_text = ov_dptd_id_path_text
+        self.ov_dptd_fuse_cti = ov_dptd_fuse_cti
+        self.ov_dptd_store_debug = ov_dptd_store_debug
+        if self.use_ov_dptd:
+            if self.ov_dptd_fusion != "linear_sum":
+                raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_fusion='linear_sum'.")
+            if self.ov_dptd_id_path_text != "none":
+                raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+            self.ov_dptd_ofa_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            self.ov_dptd_ofa_id_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            self.ov_dptd_ofa_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            self.ov_dptd_cti_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            self.ov_dptd_cti_id_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            self.ov_dptd_cti_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+        else:
+            self.ov_dptd_ofa_ada_proj = nn.ModuleList()
+            self.ov_dptd_ofa_id_proj = nn.ModuleList()
+            self.ov_dptd_ofa_out_proj = nn.ModuleList()
+            self.ov_dptd_cti_ada_proj = nn.ModuleList()
+            self.ov_dptd_cti_id_proj = nn.ModuleList()
+            self.ov_dptd_cti_out_proj = nn.ModuleList()
+
+    @staticmethod
+    def _reset_linear_identity(linear):
+        nn.init.eye_(linear.weight)
+        nn.init.constant_(linear.bias, 0.0)
+
+    @staticmethod
+    def _reset_linear_zero(linear):
+        nn.init.constant_(linear.weight, 0.0)
+        nn.init.constant_(linear.bias, 0.0)
+
+    def reset_ov_dptd_fusion_parameters(self):
+        if not self.use_ov_dptd:
+            return
+        for layer_id in range(self.num_layers):
+            self._reset_linear_identity(self.ov_dptd_ofa_ada_proj[layer_id])
+            self._reset_linear_zero(self.ov_dptd_ofa_id_proj[layer_id])
+            self._reset_linear_identity(self.ov_dptd_ofa_out_proj[layer_id])
+            self._reset_linear_identity(self.ov_dptd_cti_ada_proj[layer_id])
+            self._reset_linear_zero(self.ov_dptd_cti_id_proj[layer_id])
+            self._reset_linear_identity(self.ov_dptd_cti_out_proj[layer_id])
+
+    def _fuse_ov_dptd_ofa(self, layer_id, ada_ofa, id_ofa):
+        return self.ov_dptd_ofa_out_proj[layer_id](
+            self.ov_dptd_ofa_ada_proj[layer_id](ada_ofa)
+            + self.ov_dptd_ofa_id_proj[layer_id](id_ofa)
+        )
+
+    def _fuse_ov_dptd_cti(self, layer_id, ada_cti, id_ofa):
+        return self.ov_dptd_cti_out_proj[layer_id](
+            self.ov_dptd_cti_ada_proj[layer_id](ada_cti)
+            + self.ov_dptd_cti_id_proj[layer_id](id_ofa)
+        )
+
+    @staticmethod
+    def _new_ov_dptd_debug(enabled):
+        if not enabled:
+            return None
+        return {
+            "ov_dptd_enabled": True,
+            "ov_dptd_num_track_queries": 0,
+            "ov_dptd_historical_offset_used_count": 0,
+            "ov_dptd_historical_offset_fallback_count": 0,
+        }
+
+    def _normalize_ov_dptd_offsets(self, offsets, tgt):
+        if offsets is None:
+            return None
+        bs = tgt.shape[1]
+        num_queries = tgt.shape[0]
+        if offsets.dim() == 5:
+            offsets = offsets.unsqueeze(0)
+        if offsets.dim() != 6:
+            return None
+        if offsets.shape[0] == 1 and bs != 1:
+            offsets = offsets.expand(bs, -1, -1, -1, -1, -1)
+        if offsets.shape[:2] != (bs, num_queries):
+            return None
+        return offsets.to(device=tgt.device, dtype=tgt.dtype)
+
+    def _forward_ov_dptd(
+        self,
+        tgt,
+        reference_points,
+        src,
+        src_spatial_shapes,
+        src_level_start_index,
+        src_valid_ratios,
+        src_padding_mask=None,
+        tgt_mask: Optional[Tensor] = None,
+        num=None,
+        pos: Optional[Tensor] = None,
+        text_dict=None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        enc_output_undetach=None,
+        dptd_sampling_offsets=None,
+        return_dptd_info=False,
+    ):
+        if self.use_transformer_ckpt:
+            raise RuntimeError("OV-DPTD v1 does not support use_transformer_ckpt=True.")
+
+        output = tgt
+        fixed_track_tgt = tgt.clone()
+        intermediate_cti = []
+        intermediate_ofa = []
+        ref_points = []
+        text_attention_mask = ~text_dict["text_token_mask"]
+        pre_outputs_classes = []
+        historical_offsets = self._normalize_ov_dptd_offsets(dptd_sampling_offsets, tgt)
+        dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
+        last_ad_sampling_offsets = None
+
+        self.num_queries_cur = tgt.shape[0]
+        self.select_text_num = text_dict["select_text_num"]
+        self.text_bias, self.log_scale_cls = self.get_logits_bias(text_dict["encoded_text"], self.num_queries_cur)
+
+        for layer_id, layer in enumerate(self.layers):
+            if reference_points.shape[-1] == 4:
+                reference_points_input = (
+                    reference_points[:, :, None]
+                    * torch.cat([src_valid_ratios, src_valid_ratios], -1)[None, :]
+                )
+            else:
+                assert reference_points.shape[-1] == 2
+                reference_points_input = reference_points[:, :, None] * src_valid_ratios[None, :]
+
+            query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :])
+            raw_query_pos = self.ref_point_head(query_sine_embed)
+            pos_scale = self.query_scale(output) if self.query_scale is not None else 1
+            query_pos = pos_scale * raw_query_pos
+
+            ada_cti, ada_ofa, ad_sampling_offsets = layer(
+                tgt=output,
+                tgt_query_pos=query_pos,
+                tgt_query_sine_embed=query_sine_embed,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                tgt_reference_points=reference_points_input,
+                memory_text=text_dict["encoded_text"],
+                text_attention_mask=text_attention_mask,
+                memory=src,
+                memory_key_padding_mask=src_padding_mask,
+                memory_level_start_index=src_level_start_index,
+                memory_spatial_shapes=src_spatial_shapes,
+                memory_pos=pos,
+                self_attn_mask=tgt_mask,
+                cross_attn_mask=memory_mask,
+                num=num,
+                return_sampling_offsets=True,
+            )
+            last_ad_sampling_offsets = ad_sampling_offsets
+
+            id_tgt = output
+            track_start = self.num_queries_cur if num is None else min(max(int(num), 0), self.num_queries_cur)
+            if track_start < self.num_queries_cur:
+                id_tgt = output.clone()
+                id_tgt[track_start:] = fixed_track_tgt[track_start:]
+
+            id_ofa, _, id_debug = layer.forward_identity_path(
+                tgt=id_tgt,
+                tgt_query_pos=query_pos,
+                tgt_query_sine_embed=query_sine_embed,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                tgt_reference_points=reference_points_input,
+                memory=src,
+                memory_key_padding_mask=src_padding_mask,
+                memory_level_start_index=src_level_start_index,
+                memory_spatial_shapes=src_spatial_shapes,
+                memory_pos=pos,
+                self_attn_mask=tgt_mask,
+                cross_attn_mask=memory_mask,
+                num=num,
+                historical_sampling_offsets=historical_offsets,
+                use_historical_offsets=self.ov_dptd_use_historical_offsets,
+                store_debug=self.ov_dptd_store_debug,
+            )
+            if dptd_debug is not None:
+                dptd_debug["ov_dptd_num_track_queries"] = max(
+                    dptd_debug["ov_dptd_num_track_queries"],
+                    id_debug.get("num_track_queries", 0),
+                )
+                dptd_debug["ov_dptd_historical_offset_used_count"] += id_debug.get("used_count", 0)
+                dptd_debug["ov_dptd_historical_offset_fallback_count"] += id_debug.get("fallback_count", 0)
+
+            output_ofa = self._fuse_ov_dptd_ofa(layer_id, ada_ofa, id_ofa)
+            output = self._fuse_ov_dptd_cti(layer_id, ada_cti, id_ofa) if self.ov_dptd_fuse_cti else ada_cti
+
+            if self.bbox_embed is not None:
+                reference_before_sigmoid = inverse_sigmoid(reference_points)
+                delta_unsig = self.bbox_embed[layer_id](output_ofa)
+                outputs_unsig = delta_unsig + reference_before_sigmoid
+                new_reference_points = outputs_unsig.sigmoid()
+
+                if layer_id in self.computed_aux:
+                    reference_points = new_reference_points.detach()
+                    ref_points.append(new_reference_points)
+                else:
+                    reference_points = new_reference_points
+
+            output_norm = self.norm(output)
+
+            pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
+            if self.attention_protection:
+                tgt_mask = attention_protection(
+                    pre_outputs_class,
+                    self.num_queries_det,
+                    layer_id,
+                    isol_ratio=self.isol_ratio,
+                    mode=self.attention_protection_mode,
+                    topk=self.attention_protection_topk,
+                    conf_thresh=self.attention_protection_conf_thresh,
+                )
+            else:
+                tgt_mask = None
+
+            if layer_id in self.computed_aux:
+                intermediate_cti.append(output_norm)
+                intermediate_ofa.append(output_ofa)
+                pre_outputs_classes.append(pre_outputs_class)
+
+        ret = [
+            torch.stack([itm_out_cti.transpose(0, 1) for itm_out_cti in intermediate_cti]),
+            torch.stack([itm_out_ofa.transpose(0, 1) for itm_out_ofa in intermediate_ofa]),
+            torch.stack([itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points]),
+            torch.stack(pre_outputs_classes),
+            query_pos,
+        ]
+        if return_dptd_info:
+            ret.append({
+                "sampling_offsets": last_ad_sampling_offsets,
+                "debug": dptd_debug,
+            })
+        return ret
+
     def get_logits_bias(self, embedding, num_real_queries):
         bs,cls_len,_ = embedding.shape
         dot_product_proj_tokens_bias = torch.matmul(embedding, self.bias_lang).repeat(self.num_logits_layer,1,1) + self.bias0.repeat(bs,cls_len,1).permute(2,0,1)
@@ -626,8 +914,28 @@ class TransformerDecoder(nn.Module):
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 src_padding_mask=None, tgt_mask: Optional[Tensor] = None, num=None, pos: Optional[Tensor] = None,
-                text_dict=None, memory_mask: Optional[Tensor] = None, tgt_key_padding_mask: Optional[Tensor] = None,  enc_output_undetach=None
+                text_dict=None, memory_mask: Optional[Tensor] = None, tgt_key_padding_mask: Optional[Tensor] = None,
+                enc_output_undetach=None, dptd_sampling_offsets=None, return_dptd_info=False
                 ):
+        if self.use_ov_dptd:
+            return self._forward_ov_dptd(
+                tgt,
+                reference_points,
+                src,
+                src_spatial_shapes,
+                src_level_start_index,
+                src_valid_ratios,
+                src_padding_mask=src_padding_mask,
+                tgt_mask=tgt_mask,
+                num=num,
+                pos=pos,
+                text_dict=text_dict,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                enc_output_undetach=enc_output_undetach,
+                dptd_sampling_offsets=dptd_sampling_offsets,
+                return_dptd_info=return_dptd_info,
+            )
     
         """
         Input:
@@ -956,7 +1264,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # sa
         self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
         cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
-        num=None
+        num=None,
+        return_sampling_offsets=False,
     ):
         """
         Input:
@@ -982,14 +1291,21 @@ class DeformableTransformerDecoderLayer(nn.Module):
             tgt = self.norm2(tgt)
 
         # image cross-attention
-        tgt2 = self.cross_attn(
+        cross_attn_out = self.cross_attn(
             query=self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
             reference_points=tgt_reference_points.transpose(0, 1).contiguous(),
             value=memory.transpose(0, 1),
             spatial_shapes=memory_spatial_shapes,
             level_start_index=memory_level_start_index,
             key_padding_mask=memory_key_padding_mask,
-        ).transpose(0, 1)
+            return_sampling_offsets=return_sampling_offsets,
+        )
+        sampling_offsets = None
+        if return_sampling_offsets:
+            tgt2, sampling_offsets = cross_attn_out
+        else:
+            tgt2 = cross_attn_out
+        tgt2 = tgt2.transpose(0, 1)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         tgt_aligned = tgt # aligned queries
@@ -1011,7 +1327,96 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # image ffn in the OFA branch
         tgt_aligned = self.forward_ffn_align(tgt_aligned)
 
+        if return_sampling_offsets:
+            return tgt_cti, tgt_aligned, sampling_offsets
         return tgt_cti, tgt_aligned
+
+    def forward_identity_path(
+        self,
+        # for tgt
+        tgt: Optional[Tensor],
+        tgt_query_pos: Optional[Tensor] = None,
+        tgt_query_sine_embed: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        tgt_reference_points: Optional[Tensor] = None,
+        # for memory
+        memory: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        memory_level_start_index: Optional[Tensor] = None,
+        memory_spatial_shapes: Optional[Tensor] = None,
+        memory_pos: Optional[Tensor] = None,
+        # sa
+        self_attn_mask: Optional[Tensor] = None,
+        cross_attn_mask: Optional[Tensor] = None,
+        num=None,
+        historical_sampling_offsets: Optional[Tensor] = None,
+        use_historical_offsets: bool = True,
+        store_debug: bool = False,
+    ):
+        assert cross_attn_mask is None
+
+        track_start = tgt.shape[0] if num is None else min(max(int(num), 0), tgt.shape[0])
+        debug = {
+            "num_track_queries": int(tgt.shape[0] - track_start),
+            "used_count": 0,
+            "fallback_count": 0,
+        }
+
+        if self.extra_track_attn:
+            tgt = self._forward_track_attn(
+                tgt.transpose(0, 1),
+                tgt_query_pos.transpose(0, 1),
+                attn_mask=None,
+                num=track_start,
+            ).transpose(0, 1)
+
+        if self_attn_mask is not None:
+            self_attn_mask = self_attn_mask.squeeze(dim=0)
+
+        if self.self_attn is not None:
+            q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            tgt = tgt + self.dropout2(tgt2)
+            tgt = self.norm2(tgt)
+
+        cross_query = self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1)
+        bs, num_query, _ = cross_query.shape
+        predicted_offsets = self.cross_attn.sampling_offsets(cross_query).view(
+            bs,
+            num_query,
+            self.cross_attn.num_heads,
+            self.cross_attn.num_levels,
+            self.cross_attn.num_points,
+            2,
+        )
+        override_offsets = predicted_offsets
+        if use_historical_offsets and debug["num_track_queries"] > 0:
+            if historical_sampling_offsets is not None and tuple(historical_sampling_offsets.shape) == tuple(predicted_offsets.shape):
+                override_offsets = predicted_offsets.clone()
+                override_offsets[:, track_start:] = historical_sampling_offsets[:, track_start:].to(
+                    device=predicted_offsets.device,
+                    dtype=predicted_offsets.dtype,
+                )
+                debug["used_count"] = int(bs * debug["num_track_queries"])
+            else:
+                debug["fallback_count"] = int(bs * debug["num_track_queries"])
+
+        tgt2, sampling_offsets = self.cross_attn(
+            query=cross_query,
+            reference_points=tgt_reference_points.transpose(0, 1).contiguous(),
+            value=memory.transpose(0, 1),
+            spatial_shapes=memory_spatial_shapes,
+            level_start_index=memory_level_start_index,
+            key_padding_mask=memory_key_padding_mask,
+            override_sampling_offsets=override_offsets,
+            return_sampling_offsets=True,
+        )
+        tgt2 = tgt2.transpose(0, 1)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        id_ofa = self.forward_ffn_align(tgt)
+        return id_ofa, sampling_offsets, debug
 
 
 def build_transformer(args):
@@ -1045,5 +1450,11 @@ def build_transformer(args):
         attention_protection_mode=getattr(args, "attention_protection_mode", "kl"),
         attention_protection_topk=getattr(args, "attention_protection_topk", 3),
         attention_protection_conf_thresh=getattr(args, "attention_protection_conf_thresh", 0.25),
-        computed_aux=args.computed_aux
+        computed_aux=args.computed_aux,
+        use_ov_dptd=getattr(args, "use_ov_dptd", False),
+        ov_dptd_use_historical_offsets=getattr(args, "ov_dptd_use_historical_offsets", True),
+        ov_dptd_fusion=getattr(args, "ov_dptd_fusion", "linear_sum"),
+        ov_dptd_id_path_text=getattr(args, "ov_dptd_id_path_text", "none"),
+        ov_dptd_fuse_cti=getattr(args, "ov_dptd_fuse_cti", False),
+        ov_dptd_store_debug=getattr(args, "ov_dptd_store_debug", False),
     )
