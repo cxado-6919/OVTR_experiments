@@ -1,6 +1,6 @@
-# OV-DPTD v1-v6 변경 사항
+# OV-DPTD v1-v7 변경 사항
 
-이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v6까지의 변경점을 정리합니다.
+이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v7까지의 변경점을 정리합니다.
 
 OV-DPTD는 기본 OVTR/QAT/int_msda/TensorRT 경로를 바꾸지 않는 opt-in 기능입니다. `use_ov_dptd=False`이면 기존 OVTR decoder, tracking update, config 기본 동작이 유지됩니다.
 
@@ -14,7 +14,7 @@ OV-DPTD는 기존 OVTR decoder를 appearance-adaptive path로 유지하고, trac
 - Track query identity: ID path의 track query는 decoder layer를 거치며 갱신된 query가 아니라 frame decode 진입 시점의 initial track query를 고정해서 사용합니다.
 - Classification/category isolation: 항상 AD CTI output 기준입니다.
 - Box/feature alignment/CIP 입력: DPTD가 켜진 경우 fused OFA output 기준입니다.
-- CTI fusion: v6까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
+- CTI fusion: v7까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
 
 ## v1: Dual-Path Temporal Decoder
 
@@ -326,6 +326,46 @@ Reliability는 detached semantic gate가 있으면 이를 우선 사용하고, �
 - `dptd_loss_no_positive_skip_count`
 - `dptd_loss_no_negative_skip_count`
 
+## v7: Semantic Historical Offset Residual
+
+v7은 ID path가 재사용하는 historical sampling offsets를 대체하지 않고, valid track query에만 작은 residual correction을 더하는 optional module입니다. 기본값은 `use_dptd_semantic_offset_residual=False`이며, off 상태에서는 v6 checkpoint compatibility와 trainable parameter count를 유지하기 위해 `ov_dptd_offset_*` parameter를 생성하지 않습니다.
+
+### 적용 위치
+
+- AD path는 기존처럼 current sampling offsets를 예측합니다.
+- ID path 호출 직전에만 `adjusted_historical_offsets = historical_offsets + residual`을 만듭니다.
+- detect query `[0:num_det]`, memory 없는 new track, memory invalid track은 residual이 0입니다.
+- `dptd_info["sampling_offsets"]`는 계속 final AD path sampling offsets입니다.
+- v6 `loss_tensors["historical_sampling_offsets"]`는 residual 적용 전 원본 historical offsets를 target으로 유지합니다.
+
+### Residual module
+
+`use_dptd_semantic_offset_residual=True`일 때만 per-layer module을 생성합니다. 모든 이름은 checkpoint expected-missing 분류를 위해 `ov_dptd_` prefix를 사용합니다.
+
+- `ov_dptd_offset_semantic_proj`: semantic proto projection
+- `ov_dptd_offset_visual_proj`: visual memory projection
+- `ov_dptd_offset_box_proj`: current reference와 previous box delta projection
+- `ov_dptd_offset_age_proj`: normalized memory age projection
+- `ov_dptd_offset_residual_out`: offset residual output
+
+semantic/visual/box/age projection은 Xavier init이고, residual output은 weight/bias zero-init입니다. 따라서 기능을 켠 직후 initial forward는 v6와 allclose여야 합니다.
+
+### Memory dim
+
+raw `load_embeddings(...)`의 text embedding은 보통 `[num_classes, clip_dim]`이므로 v7 memory dim은 `text_embeddings.shape[-1]`입니다. build 단계에서 기본값 `512`는 auto value로 보고 loaded embedding dim으로 정규화합니다. explicit non-default value가 loaded text/image embedding dim과 다르면 RuntimeError입니다.
+
+### Debug stat
+
+Residual debug key는 residual이 enabled이거나 `dptd_offset_residual_debug=True`일 때만 merge됩니다.
+
+- `dptd_offset_residual_applied_count`
+- `dptd_offset_residual_skipped_count`
+- `dptd_offset_residual_norm_mean`
+- `dptd_offset_residual_norm_max`
+- `dptd_offset_residual_scale`
+- `dptd_offset_residual_clamp`
+- `dptd_offset_residual_zero_init`
+
 ## 주요 Config 기본값
 
 | Config | 기본값 | 설명 |
@@ -382,6 +422,18 @@ Reliability는 detached semantic gate가 있으면 이를 우선 사용하고, �
 | `dptd_contrast_temperature` | `0.07` | contrast CE temperature |
 | `dptd_contrast_min_negatives` | `1` | contrast 최소 negative 수 |
 | `dptd_loss_store_debug` | `False` | v6 loss debug stat 저장 |
+| `use_dptd_semantic_offset_residual` | `False` | v7 historical offset residual 활성화 |
+| `dptd_offset_residual_scale` | `0.05` | residual tanh output scale |
+| `dptd_offset_residual_clamp` | `0.1` | residual absolute clamp |
+| `dptd_offset_residual_hidden_dim` | `256` | residual MLP hidden dim |
+| `dptd_offset_residual_memory_dim` | `512` | default auto memory dim; build에서 embedding dim으로 정규화 |
+| `dptd_offset_residual_use_semantic_proto` | `True` | semantic proto feature 사용 |
+| `dptd_offset_residual_use_visual_memory` | `True` | visual memory feature 사용 |
+| `dptd_offset_residual_use_box_delta` | `True` | reference/previous box delta feature 사용 |
+| `dptd_offset_residual_use_memory_age` | `True` | memory age feature 사용 |
+| `dptd_offset_residual_detach_memory` | `True` | memory input detach |
+| `dptd_offset_residual_zero_init` | `True` | residual output zero-init |
+| `dptd_offset_residual_debug` | `False` | residual debug stat 저장 |
 
 ## Guard 및 호환성
 
@@ -406,6 +458,9 @@ Reliability는 detached semantic gate가 있으면 이를 우선 사용하고, �
 - `dptd_loss_apply_aux=True`
 - `dptd_loss_query_scope`가 `"track_only"`가 아닌 경우
 - `dptd_loss_ofa_target`, `dptd_loss_memory_target`, `dptd_loss_offset_target`가 v6 지원값이 아닌 경우
+- `use_dptd_semantic_offset_residual=True` without `use_ov_dptd`, semantic memory, semantic gate, `semantic_gate` fusion, or historical offsets
+- `use_dptd_semantic_offset_residual=True` and `query_dim != 4`
+- invalid v7 residual scale/clamp/hidden dim/memory dim, or `dptd_offset_residual_zero_init=False`
 
 ## Debug/Training Log
 

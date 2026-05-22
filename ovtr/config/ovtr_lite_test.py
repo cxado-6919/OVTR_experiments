@@ -107,6 +107,18 @@ dptd_loss_offset_target = "historical_stopgrad"
 dptd_contrast_temperature = 0.07
 dptd_contrast_min_negatives = 1
 dptd_loss_store_debug = False
+use_dptd_semantic_offset_residual = False
+dptd_offset_residual_scale = 0.05
+dptd_offset_residual_clamp = 0.1
+dptd_offset_residual_hidden_dim = 256
+dptd_offset_residual_memory_dim = 512
+dptd_offset_residual_use_semantic_proto = True
+dptd_offset_residual_use_visual_memory = True
+dptd_offset_residual_use_box_delta = True
+dptd_offset_residual_use_memory_age = True
+dptd_offset_residual_detach_memory = True
+dptd_offset_residual_zero_init = True
+dptd_offset_residual_debug = False
 
 # scaling
 prior_prob = 0.005

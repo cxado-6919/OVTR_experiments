@@ -1,6 +1,6 @@
 # OV-DPTD 실행 가이드
 
-이 문서는 OV-DPTD v1-v6를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
+이 문서는 OV-DPTD v1-v7를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
 
 OV-DPTD 인자는 현재 config field로 관리됩니다. `tools/*.sh`의 `EXTRA_ARGS`는 기존 CLI 인자를 뒤에 붙이는 용도이며, DPTD field는 config 파일에 명시하는 방식을 권장합니다.
 
@@ -187,6 +187,44 @@ use_transformer_ckpt = False
 - semantic/visual/contrast memory loss weight를 0보다 크게 쓰려면 `use_dptd_semantic_memory=True`가 필요합니다.
 - `dptd_loss_apply_aux=True`는 v6에서 지원하지 않습니다. final decoder layer loss만 계산합니다.
 - `dptd_loss_query_scope="track_only"`, target mode는 `ada_stopgrad`/`previous_stopgrad`/`historical_stopgrad`만 지원합니다.
+
+### v7 semantic offset residual config
+
+v7 residual은 semantic gate 기반 ID path에서만 사용합니다. LocA를 흔들 수 있으므로 scale/clamp를 작게 시작하고, zero-init을 유지합니다.
+
+```python
+use_ov_dptd = True
+ov_dptd_fusion = "semantic_gate"
+ov_dptd_fuse_cti = False
+use_dptd_semantic_memory = True
+use_dptd_semantic_gate = True
+ov_dptd_use_historical_offsets = True
+
+use_dptd_semantic_offset_residual = True
+dptd_offset_residual_scale = 0.05
+dptd_offset_residual_clamp = 0.1
+dptd_offset_residual_hidden_dim = 256
+dptd_offset_residual_memory_dim = 512  # build에서 loaded embedding dim으로 auto 정규화
+dptd_offset_residual_use_semantic_proto = True
+dptd_offset_residual_use_visual_memory = True
+dptd_offset_residual_use_box_delta = True
+dptd_offset_residual_use_memory_age = True
+dptd_offset_residual_detach_memory = True
+dptd_offset_residual_zero_init = True
+dptd_offset_residual_debug = True
+
+use_checkpoint_track = False
+use_transformer_ckpt = False
+```
+
+`use_dptd_semantic_offset_residual=False`이면 `ov_dptd_offset_*` parameter가 생성되지 않습니다. 기존 v6 checkpoint를 residual-off config로 로드할 때 missing key나 trainable parameter count가 늘지 않는 것이 의도입니다.
+
+주의할 점:
+
+- v7은 `query_dim=4`만 지원합니다.
+- `dptd_info["sampling_offsets"]`는 AD path final offsets이고, residual-applied ID offsets가 아닙니다.
+- v6 offset consistency target은 residual 적용 전 original historical offsets입니다.
+- raw embedding dim은 `text_embeddings.shape[-1]` 기준입니다. class count인 `shape[0]`를 memory dim으로 쓰면 안 됩니다.
 
 ### v4 eval config with suppression
 
@@ -442,6 +480,21 @@ use_dptd_semantic_gate = True
 `dptd_topk_text_embeddings.shape[-1]`은 decoder CTI가 쓰는 text feature dim과 같아야 합니다. 이 dim이 다르면 adapter k/v projection input dim과 맞지 않아 RuntimeError가 납니다.
 
 모든 top-k text score가 `dptd_id_text_score_eps` 이하인 query는 attention을 실행하지 않고 residual 0으로 skip됩니다.
+
+### v7 residual parameter가 보이지 않는 경우
+
+정상입니다. `use_dptd_semantic_offset_residual=False`이면 `ov_dptd_offset_*` module은 빈 `ModuleList`라 parameter가 없습니다. residual을 학습하려면 다음 조합이 모두 필요합니다.
+
+```python
+use_ov_dptd = True
+use_dptd_semantic_memory = True
+use_dptd_semantic_gate = True
+ov_dptd_fusion = "semantic_gate"
+ov_dptd_use_historical_offsets = True
+use_dptd_semantic_offset_residual = True
+```
+
+gradient smoke에서는 `ov_dptd_gate_alpha`가 0이면 fused output loss에서 residual branch gradient가 0일 수 있습니다. alpha를 nonzero로 두거나 ID-path loss를 사용해 확인하세요.
 
 ### DPTD loss가 RuntimeError를 내는 경우
 

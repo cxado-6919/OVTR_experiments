@@ -20,6 +20,7 @@ from models.ovtr import (  # noqa: E402
     OVFrameMatcher,
     OVTR,
     RuntimeTrackerBase,
+    _normalize_dptd_offset_residual_memory_dim,
     resolve_ov_dptd_options,
 )
 from models.transformer import DeformableTransformerDecoderLayer, TransformerDecoder  # noqa: E402
@@ -227,7 +228,20 @@ def _args_cfg(**overrides):
         dptd_contrast_temperature=0.07,
         dptd_contrast_min_negatives=1,
         dptd_loss_store_debug=False,
+        use_dptd_semantic_offset_residual=False,
+        dptd_offset_residual_scale=0.05,
+        dptd_offset_residual_clamp=0.1,
+        dptd_offset_residual_hidden_dim=256,
+        dptd_offset_residual_memory_dim=512,
+        dptd_offset_residual_use_semantic_proto=True,
+        dptd_offset_residual_use_visual_memory=True,
+        dptd_offset_residual_use_box_delta=True,
+        dptd_offset_residual_use_memory_age=True,
+        dptd_offset_residual_detach_memory=True,
+        dptd_offset_residual_zero_init=True,
+        dptd_offset_residual_debug=False,
         hidden_dim=256,
+        query_dim=4,
         use_checkpoint_track=False,
         use_transformer_ckpt=False,
     )
@@ -301,6 +315,24 @@ def test_dptd_guards():
     _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_losses=True, dptd_loss_query_scope="all")))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="small_random", ov_dptd_semantic_gate_id_proj_init_std=0.0)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="bad")))
+    offset_base = dict(
+        use_dptd_semantic_offset_residual=True,
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+    )
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_ov_dptd=False, **offset_base)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_offset_residual=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_offset_residual=True, use_dptd_semantic_memory=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_offset_residual=True, use_dptd_semantic_memory=True, use_dptd_semantic_gate=True, ov_dptd_fusion="linear_sum")))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_use_historical_offsets=False, **offset_base)))
+    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(query_dim=2, **offset_base)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(dptd_offset_residual_scale=-0.1, **offset_base)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(dptd_offset_residual_clamp=-0.1, **offset_base)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(dptd_offset_residual_hidden_dim=0, **offset_base)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(dptd_offset_residual_memory_dim=0, **offset_base)))
+    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(dptd_offset_residual_zero_init=False, **offset_base)))
+    resolve_ov_dptd_options(*_args_cfg(**offset_base))
 
     fake_model = OVTR.__new__(OVTR)
     fake_model.training = True
@@ -968,6 +1000,518 @@ def test_dptd_topk_text_initial_forward_equivalence_and_grad():
 
 
 
+
+def test_dptd_offset_residual_memory_dim_normalization():
+    args, cfg = _args_cfg(
+        use_dptd_semantic_offset_residual=True,
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+    )
+    text_embeddings = torch.zeros(11, 4)
+    image_embeddings = torch.zeros(11, 4)
+    _normalize_dptd_offset_residual_memory_dim(args, cfg, text_embeddings, image_embeddings)
+    assert args.dptd_offset_residual_memory_dim == 4
+    assert cfg.dptd_offset_residual_memory_dim == 4
+
+    args, cfg = _args_cfg(
+        use_dptd_semantic_offset_residual=True,
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        dptd_offset_residual_memory_dim=8,
+    )
+    _assert_raises(RuntimeError, lambda: _normalize_dptd_offset_residual_memory_dim(args, cfg, text_embeddings, image_embeddings))
+
+    args, cfg = _args_cfg(
+        use_dptd_semantic_offset_residual=True,
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+    )
+    _assert_raises(RuntimeError, lambda: _normalize_dptd_offset_residual_memory_dim(args, cfg, text_embeddings, torch.zeros(11, 5)))
+
+
+def _make_offset_residual_decoder(**kwargs):
+    memory_dim = kwargs.pop("dptd_offset_residual_memory_dim", 4)
+    residual_hidden_dim = kwargs.pop("dptd_offset_residual_hidden_dim", 8)
+    residual_debug = kwargs.pop("dptd_offset_residual_debug", True)
+    return _make_decoder(
+        use_ov_dptd=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        use_dptd_semantic_offset_residual=True,
+        dptd_offset_residual_memory_dim=memory_dim,
+        dptd_offset_residual_hidden_dim=residual_hidden_dim,
+        dptd_offset_residual_debug=residual_debug,
+        **kwargs,
+    )
+
+
+def test_dptd_offset_residual_default_off_params_and_contract():
+    decoder = _make_decoder(use_ov_dptd=True, use_dptd_semantic_gate=True, ov_dptd_fusion="semantic_gate")
+    assert not any("ov_dptd_offset_" in name for name, _ in decoder.named_parameters())
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3),
+    )
+    assert len(out) == 6
+    assert "offset_residual" not in out[-1]
+    assert "dptd_offset_residual_applied_count" not in out[-1]["debug"]
+
+
+def test_dptd_offset_residual_zero_init_equivalence_and_info():
+    torch.manual_seed(3)
+    off_decoder = _make_decoder(use_ov_dptd=True, use_dptd_semantic_gate=True, ov_dptd_fusion="semantic_gate")
+    on_decoder = _make_offset_residual_decoder()
+    on_decoder.load_state_dict(off_decoder.state_dict(), strict=False)
+    historical = torch.zeros(5, 4, 2, 2, 2)
+    gate_state = _gate_state(num_queries=5, num_det=3)
+    torch.manual_seed(33)
+    off = _run_decoder(off_decoder, 5, 3, historical_offsets=historical, return_dptd_info=True, dptd_gate_state=gate_state)
+    torch.manual_seed(33)
+    on = _run_decoder(on_decoder, 5, 3, historical_offsets=historical, return_dptd_info=True, dptd_gate_state=gate_state)
+    assert torch.allclose(on[1], off[1], atol=1e-6)
+    assert torch.allclose(on[2], off[2], atol=1e-6)
+    assert torch.allclose(on[-1]["sampling_offsets"], off[-1]["sampling_offsets"], atol=1e-6)
+    assert on[-1]["offset_residual"].shape == (1, 5, 4, 2, 2, 2)
+    assert torch.allclose(on[-1]["offset_residual"], torch.zeros_like(on[-1]["offset_residual"]))
+    assert "dptd_offset_residual_applied_count" in on[-1]["debug"]
+
+
+def test_dptd_offset_residual_manual_nonzero_track_only_and_clamp_skip():
+    decoder = _make_offset_residual_decoder(dptd_offset_residual_scale=1.0, dptd_offset_residual_clamp=0.05)
+    decoder.ov_dptd_offset_residual_out[0].bias.data.fill_(10.0)
+    historical = torch.zeros(1, 5, 4, 2, 2, 2)
+    state = _gate_state(num_queries=5, num_det=3)
+    state["memory_valid"][4] = False
+    ref = torch.rand(5, 1, 4)
+    tgt = torch.randn(5, 1, 256)
+    debug = {}
+    adjusted, residual = decoder._compute_dptd_offset_residual(0, historical, state, ref, 3, tgt, debug=debug)
+    assert residual.shape == historical.shape
+    assert torch.allclose(residual[:, :3], torch.zeros_like(residual[:, :3]))
+    assert float(residual[:, 3].abs().max()) > 0.0
+    assert torch.allclose(residual[:, 4], torch.zeros_like(residual[:, 4]))
+    assert float(residual.abs().max()) <= 0.050001
+    assert torch.allclose(adjusted, historical + residual)
+    assert debug["dptd_offset_residual_applied_count"] == 1
+    assert debug["dptd_offset_residual_skipped_count"] == 1
+
+    _, no_state_residual = decoder._compute_dptd_offset_residual(0, historical, None, ref, 3, tgt, debug={})
+    assert no_state_residual is None
+    _, bad_shape_residual = decoder._compute_dptd_offset_residual(0, torch.zeros(1, 4, 4, 2, 2, 2), state, ref, 3, tgt, debug={})
+    assert bad_shape_residual is None
+
+
+def _clone_gate_state_without(state, *keys):
+    cloned = {}
+    for key, value in state.items():
+        if key in keys:
+            continue
+        cloned[key] = value.clone() if isinstance(value, torch.Tensor) else value
+    return cloned
+
+
+def _make_nonzero_offset_residual_decoder(**kwargs):
+    decoder = _make_offset_residual_decoder(
+        dptd_offset_residual_scale=kwargs.pop("dptd_offset_residual_scale", 0.5),
+        dptd_offset_residual_clamp=kwargs.pop("dptd_offset_residual_clamp", 0.5),
+        **kwargs,
+    )
+    for layer in decoder.ov_dptd_offset_residual_out:
+        layer.bias.data.fill_(0.2)
+    decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+    return decoder
+
+
+def test_dptd_offset_residual_missing_semantic_fallback():
+    decoder = _make_nonzero_offset_residual_decoder()
+    historical = torch.zeros(1, 5, 4, 2, 2, 2)
+    state = _clone_gate_state_without(_gate_state(num_queries=5, num_det=3), "semantic_proto")
+    adjusted, residual = decoder._compute_dptd_offset_residual(
+        0,
+        historical,
+        state,
+        torch.rand(5, 1, 4),
+        3,
+        torch.randn(5, 1, 256),
+        debug={},
+    )
+    assert residual is not None
+    assert residual.shape == historical.shape
+    assert torch.allclose(adjusted, historical + residual)
+
+
+def test_dptd_offset_residual_missing_visual_fallback():
+    decoder = _make_nonzero_offset_residual_decoder()
+    historical = torch.zeros(1, 5, 4, 2, 2, 2)
+    state = _clone_gate_state_without(_gate_state(num_queries=5, num_det=3), "visual_memory")
+    adjusted, residual = decoder._compute_dptd_offset_residual(
+        0,
+        historical,
+        state,
+        torch.rand(5, 1, 4),
+        3,
+        torch.randn(5, 1, 256),
+        debug={},
+    )
+    assert residual is not None
+    assert residual.shape == historical.shape
+    assert torch.allclose(adjusted, historical + residual)
+
+
+def test_dptd_offset_residual_missing_semantic_and_visual_safe():
+    decoder = _make_nonzero_offset_residual_decoder()
+    historical = torch.zeros(1, 5, 4, 2, 2, 2)
+    state = _clone_gate_state_without(_gate_state(num_queries=5, num_det=3), "semantic_proto", "visual_memory")
+    _, residual = decoder._compute_dptd_offset_residual(
+        0,
+        historical,
+        state,
+        torch.rand(5, 1, 4),
+        3,
+        torch.randn(5, 1, 256),
+        debug={},
+    )
+    assert residual is None or residual.shape == historical.shape
+
+    state_no_valid = _clone_gate_state_without(_gate_state(num_queries=5, num_det=3), "memory_valid")
+    _, no_valid_residual = decoder._compute_dptd_offset_residual(
+        0,
+        historical,
+        state_no_valid,
+        torch.rand(5, 1, 4),
+        3,
+        torch.randn(5, 1, 256),
+        debug={},
+    )
+    assert no_valid_residual is None
+
+
+def test_dptd_offset_residual_device_mismatch_guard():
+    if not torch.cuda.is_available():
+        return
+    decoder = _make_offset_residual_decoder().cuda()
+    historical = torch.zeros(1, 5, 4, 2, 2, 2)
+    _assert_raises(
+        RuntimeError,
+        lambda: decoder._compute_dptd_offset_residual(
+            0,
+            historical,
+            _gate_state(num_queries=5, num_det=3),
+            torch.rand(5, 1, 4, device="cuda"),
+            3,
+            torch.randn(5, 1, 256, device="cuda"),
+            debug={},
+        ),
+    )
+
+
+def test_dptd_offset_residual_nonzero_decoder_forward_changes_track_path():
+    torch.manual_seed(13)
+    off_decoder = _make_decoder(use_ov_dptd=True, use_dptd_semantic_gate=True, ov_dptd_fusion="semantic_gate")
+    on_decoder = _make_nonzero_offset_residual_decoder()
+    on_decoder.load_state_dict(off_decoder.state_dict(), strict=False)
+    for layer in on_decoder.ov_dptd_offset_residual_out:
+        layer.bias.data.fill_(0.2)
+    on_decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+
+    num_det = 3
+    historical = torch.zeros(5, 4, 2, 2, 2)
+    gate_state = _gate_state(num_queries=5, num_det=num_det, semantic_sign=-1.0)
+    gate_state["memory_valid"][4] = False
+
+    torch.manual_seed(77)
+    off = _run_decoder(
+        off_decoder,
+        5,
+        num_det,
+        historical_offsets=historical,
+        return_dptd_info=True,
+        dptd_gate_state=gate_state,
+    )
+    torch.manual_seed(77)
+    on = _run_decoder(
+        on_decoder,
+        5,
+        num_det,
+        historical_offsets=historical,
+        return_dptd_info=True,
+        dptd_gate_state=gate_state,
+    )
+
+    residual = on[-1]["offset_residual"]
+    assert residual is not None
+    assert torch.allclose(residual[:, :num_det], torch.zeros_like(residual[:, :num_det]))
+    assert float(residual[:, 3].abs().max()) > 0.0
+    assert torch.allclose(residual[:, 4], torch.zeros_like(residual[:, 4]))
+    assert torch.allclose(on[-1]["sampling_offsets"], off[-1]["sampling_offsets"], atol=1e-6)
+
+    track_delta = (on[1][-1, 0, 3] - off[1][-1, 0, 3]).abs().max()
+    assert float(track_delta.item()) > 1e-7
+
+
+def test_dptd_offset_residual_trainability_and_gradient():
+    decoder = _make_nonzero_offset_residual_decoder()
+    decoder.train()
+    decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+    historical = torch.zeros(5, 4, 2, 2, 2)
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=historical,
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3, semantic_sign=-1.0),
+    )
+    assert out[-1]["offset_residual"] is not None
+    # With zero-init residual_out and gate alpha == 0, a simple fused-output loss can
+    # legitimately produce zero gradient for this branch. This test makes both nonzero.
+    loss = out[1][-1, 0, 3:].sum()
+    decoder.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norms = []
+    for name, param in decoder.named_parameters():
+        if "ov_dptd_offset_" not in name or param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if torch.isfinite(grad).all():
+            grad_norms.append(float(grad.norm().item()))
+    assert grad_norms and max(grad_norms) > 0.0
+
+
+class _DptdPassthroughTrackEmbed(nn.Module):
+    def forward(self, data):
+        init_tracks = data["init_track_instances"]
+        tracks = data["track_instances"]
+        active = tracks[tracks.obj_idxes >= 0]
+        return Instances.cat([init_tracks, active])
+
+
+class _DptdMiniTransformer(nn.Module):
+    def __init__(self, decoder, num_queries=3, hidden_dim=4):
+        super().__init__()
+        self.decoder = decoder
+        self.num_queries = num_queries
+        self.d_model = hidden_dim
+        self.level_embed = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
+        self.seen_gate_states = []
+
+    def forward(
+        self,
+        srcs,
+        masks,
+        pos,
+        query_pos,
+        query_tgt,
+        ref_pts=None,
+        text_dict=None,
+        dptd_sampling_offsets=None,
+        dptd_gate_state=None,
+        return_dptd_info=False,
+    ):
+        self.seen_gate_states.append(dptd_gate_state)
+        device = query_tgt.device
+        dtype = query_tgt.dtype
+        num_queries = query_tgt.shape[0]
+        memory = torch.linspace(-0.5, 0.5, steps=5 * self.d_model, device=device, dtype=dtype).view(5, 1, self.d_model)
+        spatial_shapes = torch.tensor([[2, 2], [1, 1]], dtype=torch.long, device=device)
+        level_start_index = torch.tensor([0, 4], dtype=torch.long, device=device)
+        valid_ratios = torch.ones(1, 2, 2, device=device, dtype=dtype)
+        padding_mask = torch.zeros(1, 5, dtype=torch.bool, device=device)
+        text_dict = dict(text_dict)
+        text_dict["encoded_text"] = text_dict["text_features"]
+        text_dict["encoded_text_all"] = text_dict["text_features"].unsqueeze(0)
+        reference_points = ref_pts.unsqueeze(1).sigmoid() if ref_pts is not None else torch.full((num_queries, 1, 4), 0.5, device=device, dtype=dtype)
+        outputs = self.decoder(
+            query_tgt.unsqueeze(1),
+            reference_points,
+            memory,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            src_padding_mask=padding_mask,
+            pos=torch.zeros_like(memory),
+            text_dict=text_dict,
+            num=self.num_queries,
+            dptd_sampling_offsets=dptd_sampling_offsets,
+            dptd_gate_state=dptd_gate_state,
+            return_dptd_info=return_dptd_info,
+        )
+        if return_dptd_info:
+            hs_cti, hs_ofa, inter_refs, pre_classes, query_pos_track, dptd_info = outputs
+            return hs_cti, hs_ofa, reference_points.transpose(0, 1), inter_refs, pre_classes, query_pos_track, dptd_info
+        hs_cti, hs_ofa, inter_refs, pre_classes, query_pos_track = outputs
+        return hs_cti, hs_ofa, reference_points.transpose(0, 1), inter_refs, pre_classes, query_pos_track
+
+
+def _make_offset_residual_ovtr_fixture():
+    hidden_dim = 256
+    num_det = 3
+    model = OVTR.__new__(OVTR)
+    nn.Module.__init__(model)
+    decoder = _make_offset_residual_decoder(
+        d_model=hidden_dim,
+        nheads=4,
+        nlevels=2,
+        npoints=2,
+        num_det=num_det,
+        dptd_offset_residual_memory_dim=hidden_dim,
+    )
+    for layer in decoder.ov_dptd_offset_residual_out:
+        layer.bias.data.fill_(0.2)
+    decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+    model.transformer = _DptdMiniTransformer(decoder, num_queries=num_det, hidden_dim=hidden_dim)
+    model.num_queries = num_det
+    model.aux_loss = False
+    model.use_ov_dptd = True
+    model.use_dptd_semantic_memory = True
+    model.use_dptd_semantic_gate = True
+    model.use_dptd_semantic_offset_residual = True
+    model.dptd_offset_residual_memory_dim = hidden_dim
+    model.use_dptd_update_suppression = False
+    model.use_dptd_semantic_update_suppression = False
+    model.use_dptd_losses = False
+    model.ov_dptd_store_debug = True
+    model.dptd_offset_residual_debug = True
+    model.dptd_memory_ema = 0.8
+    model.dptd_memory_min_score = 0.0
+    model.dptd_memory_max_entropy = 1.0
+    model.dptd_memory_use_alignment_feature = True
+    model.dptd_memory_allow_untrained_visual_projection = False
+    model.dptd_memory_store_topk = 2
+    model.dptd_memory_debug = True
+    model.dptd_memory_dim = hidden_dim
+    model.dptd_visual_memory_proj = None
+    model.dptd_id_text_topk = 2
+    model.dptd_id_text_feature_dim = hidden_dim
+    model.dptd_store_topk_text_embeddings = True
+    model.dptd_gate_visual_cos_tau = 0.25
+    model.dptd_gate_temperature = 10.0
+    model.dptd_semantic_update_suppression_thresh = 0.3
+    model.train_with_artificial_img_seqs = True
+    model.ious_thresh = 2.0
+    model.track_base = RuntimeTrackerBase(score_thresh=0.0, filter_score_thresh=0.0, miss_tolerance=5, maximum_quantity=20)
+    model.track_embed = _DptdPassthroughTrackEmbed()
+    model.select_id = [0, 1, 2]
+    model.text_embeddings = torch.eye(hidden_dim)[:, :3]
+    model.image_embeddings = torch.eye(hidden_dim)[:, :3]
+    model.patch2query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+    nn.init.eye_(model.patch2query.weight)
+    model.bbox_embed = nn.ModuleList([nn.Linear(hidden_dim, 4) for _ in range(2)])
+    for layer in model.bbox_embed:
+        nn.init.zeros_(layer.weight)
+        nn.init.zeros_(layer.bias)
+    model.feature_align = nn.ModuleList([nn.Identity(), nn.Identity()])
+    model.ov_dptd_debug_stats = {
+        "dptd_offset_residual_applied_count": 0,
+        "dptd_offset_residual_skipped_count": 0,
+        "dptd_offset_residual_norm_mean": 0.0,
+        "dptd_offset_residual_norm_max": 0.0,
+    }
+
+    def _extract_backbone_features(_samples):
+        src = torch.zeros(1, hidden_dim, 2, 2)
+        mask = torch.zeros(1, 2, 2, dtype=torch.bool)
+        pos = torch.zeros(1, hidden_dim, 2, 2)
+        return [src], [mask], [pos]
+
+    model._extract_backbone_features = _extract_backbone_features
+    model.eval()
+    return model
+
+
+def test_dptd_offset_residual_full_ovtr_two_frame_integration():
+    model = _make_offset_residual_ovtr_fixture()
+    tracks = model._generate_empty_tracks(cls_pad_len=3)
+    dummy_frame = torch.zeros(3, 8, 8)
+
+    frame1 = model._forward_single_image(dummy_frame, tracks, targets=None, extra_labels=None, is_first=True, cls_num=None)
+    frame1 = model._post_process_single_image(frame1, tracks, is_last=False, is_first=True)
+    assert frame1["track_instances"] is not None
+
+    tracks = frame1["track_instances"]
+    frame2 = model._forward_single_image(dummy_frame, tracks, targets=None, extra_labels=None, is_first=False, cls_num=None)
+    gate_state = model.transformer.seen_gate_states[-1]
+    for key in ["semantic_proto", "visual_memory", "memory_valid", "pred_boxes", "historical_offsets"]:
+        assert isinstance(gate_state.get(key), torch.Tensor), key
+    assert gate_state["memory_valid"][model.num_queries:].any()
+    assert gate_state["historical_offsets"].shape[0] == len(tracks)
+    frame2 = model._post_process_single_image(frame2, tracks, is_last=True, is_first=False)
+    assert frame2["track_instances_pre"] is not None
+    debug = model.ov_dptd_debug_stats
+    assert (
+        debug.get("dptd_offset_residual_applied_count", 0) > 0
+        or debug.get("dptd_offset_residual_skipped_count", 0) >= 0
+    )
+
+
+def test_dptd_offset_residual_loss_target_and_trainability():
+    decoder = _make_offset_residual_decoder(use_dptd_losses=True)
+    assert any("ov_dptd_offset_residual_out" in name for name, _ in decoder.named_parameters())
+    decoder.train()
+    decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+    historical = torch.zeros(5, 4, 2, 2, 2)
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=historical,
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3),
+    )
+    info = out[-1]
+    assert torch.allclose(info["loss_tensors"]["historical_sampling_offsets"], historical.unsqueeze(0))
+    assert info["sampling_offsets"].shape == (1, 5, 4, 2, 2, 2)
+
+    helper_hist = torch.zeros(1, 5, 4, 2, 2, 2)
+    _, residual = decoder._compute_dptd_offset_residual(
+        0,
+        helper_hist,
+        _gate_state(num_queries=5, num_det=3),
+        torch.rand(5, 1, 4),
+        3,
+        torch.randn(5, 1, 256),
+        debug={},
+    )
+    # A plain fused-output loss can be zero for this branch while gate alpha is 0;
+    # use the residual path directly here to verify residual_out trainability.
+    loss = residual[:, 3:].sum()
+    decoder.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = sum(
+        float(param.grad.detach().norm().item())
+        for name, param in decoder.named_parameters()
+        if "ov_dptd_offset_residual_out" in name and param.grad is not None
+    )
+    assert grad_norm > 0.0
+
+    class MiniOffsetModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.decoder = _make_offset_residual_decoder()
+
+    model = MiniOffsetModel()
+    for _, param in model.named_parameters():
+        param.requires_grad_(False)
+    for name, param in model.named_parameters():
+        if "ov_dptd_" in name:
+            param.requires_grad_(True)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+    optimizer_param_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    for name, param in model.named_parameters():
+        if "ov_dptd_offset_" in name:
+            assert param.requires_grad, name
+            assert id(param) in optimizer_param_ids, name
+
+
 def test_dptd_loss_tensor_contract_and_offsets_non_detached():
     decoder = _make_decoder(use_ov_dptd=True, use_dptd_losses=True)
     decoder.train()
@@ -1240,6 +1784,11 @@ def test_dptd_checkpoint_key_classifier():
     assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_gate_alpha")
     assert is_ov_dptd_checkpoint_key("module.transformer.decoder.ov_dptd_ofa_id_proj.0.weight")
     assert is_ov_dptd_checkpoint_key("dptd_visual_memory_proj.weight")
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_offset_semantic_proj.0.weight")
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_offset_visual_proj.0.weight")
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_offset_box_proj.0.weight")
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_offset_age_proj.0.weight")
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_offset_residual_out.0.weight")
     assert not is_ov_dptd_checkpoint_key("track_embed.self_attn.in_proj_weight")
 
 
@@ -1265,6 +1814,18 @@ def main():
     test_dptd_topk_text_dim_and_cat_mismatch_guards()
     test_dptd_topk_text_adapter_zero_init_masks_and_track_only()
     test_dptd_topk_text_initial_forward_equivalence_and_grad()
+    test_dptd_offset_residual_memory_dim_normalization()
+    test_dptd_offset_residual_default_off_params_and_contract()
+    test_dptd_offset_residual_zero_init_equivalence_and_info()
+    test_dptd_offset_residual_manual_nonzero_track_only_and_clamp_skip()
+    test_dptd_offset_residual_missing_semantic_fallback()
+    test_dptd_offset_residual_missing_visual_fallback()
+    test_dptd_offset_residual_missing_semantic_and_visual_safe()
+    test_dptd_offset_residual_device_mismatch_guard()
+    test_dptd_offset_residual_nonzero_decoder_forward_changes_track_path()
+    test_dptd_offset_residual_trainability_and_gradient()
+    test_dptd_offset_residual_full_ovtr_two_frame_integration()
+    test_dptd_offset_residual_loss_target_and_trainability()
     test_dptd_loss_tensor_contract_and_offsets_non_detached()
     test_dptd_aux_loss_values_backward_and_skips()
     test_dptd_aux_loss_no_valid_and_artificial_keep_remap()

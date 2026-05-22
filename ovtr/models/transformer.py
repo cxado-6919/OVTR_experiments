@@ -92,6 +92,18 @@ class Transformer(nn.Module):
         dptd_semantic_update_suppression_thresh=0.3,
         ov_dptd_semantic_gate_id_proj_init="small_random",
         ov_dptd_semantic_gate_id_proj_init_std=1e-3,
+        use_dptd_semantic_offset_residual=False,
+        dptd_offset_residual_scale=0.05,
+        dptd_offset_residual_clamp=0.1,
+        dptd_offset_residual_hidden_dim=256,
+        dptd_offset_residual_memory_dim=512,
+        dptd_offset_residual_use_semantic_proto=True,
+        dptd_offset_residual_use_visual_memory=True,
+        dptd_offset_residual_use_box_delta=True,
+        dptd_offset_residual_use_memory_age=True,
+        dptd_offset_residual_detach_memory=True,
+        dptd_offset_residual_zero_init=True,
+        dptd_offset_residual_debug=False,
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -190,6 +202,18 @@ class Transformer(nn.Module):
             dptd_semantic_update_suppression_thresh=dptd_semantic_update_suppression_thresh,
             ov_dptd_semantic_gate_id_proj_init=ov_dptd_semantic_gate_id_proj_init,
             ov_dptd_semantic_gate_id_proj_init_std=ov_dptd_semantic_gate_id_proj_init_std,
+            use_dptd_semantic_offset_residual=use_dptd_semantic_offset_residual,
+            dptd_offset_residual_scale=dptd_offset_residual_scale,
+            dptd_offset_residual_clamp=dptd_offset_residual_clamp,
+            dptd_offset_residual_hidden_dim=dptd_offset_residual_hidden_dim,
+            dptd_offset_residual_memory_dim=dptd_offset_residual_memory_dim,
+            dptd_offset_residual_use_semantic_proto=dptd_offset_residual_use_semantic_proto,
+            dptd_offset_residual_use_visual_memory=dptd_offset_residual_use_visual_memory,
+            dptd_offset_residual_use_box_delta=dptd_offset_residual_use_box_delta,
+            dptd_offset_residual_use_memory_age=dptd_offset_residual_use_memory_age,
+            dptd_offset_residual_detach_memory=dptd_offset_residual_detach_memory,
+            dptd_offset_residual_zero_init=dptd_offset_residual_zero_init,
+            dptd_offset_residual_debug=dptd_offset_residual_debug,
         )
 
         self.d_model = d_model
@@ -680,6 +704,18 @@ class TransformerDecoder(nn.Module):
         dptd_semantic_update_suppression_thresh=0.3,
         ov_dptd_semantic_gate_id_proj_init="small_random",
         ov_dptd_semantic_gate_id_proj_init_std=1e-3,
+        use_dptd_semantic_offset_residual=False,
+        dptd_offset_residual_scale=0.05,
+        dptd_offset_residual_clamp=0.1,
+        dptd_offset_residual_hidden_dim=256,
+        dptd_offset_residual_memory_dim=512,
+        dptd_offset_residual_use_semantic_proto=True,
+        dptd_offset_residual_use_visual_memory=True,
+        dptd_offset_residual_use_box_delta=True,
+        dptd_offset_residual_use_memory_age=True,
+        dptd_offset_residual_detach_memory=True,
+        dptd_offset_residual_zero_init=True,
+        dptd_offset_residual_debug=False,
     ):
         super().__init__()
         if num_layers > 0:
@@ -754,6 +790,18 @@ class TransformerDecoder(nn.Module):
         self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
         self.ov_dptd_semantic_gate_id_proj_init = ov_dptd_semantic_gate_id_proj_init
         self.ov_dptd_semantic_gate_id_proj_init_std = float(ov_dptd_semantic_gate_id_proj_init_std)
+        self.use_dptd_semantic_offset_residual = bool(use_dptd_semantic_offset_residual)
+        self.dptd_offset_residual_scale = float(dptd_offset_residual_scale)
+        self.dptd_offset_residual_clamp = float(dptd_offset_residual_clamp)
+        self.dptd_offset_residual_hidden_dim = int(dptd_offset_residual_hidden_dim)
+        self.dptd_offset_residual_memory_dim = int(dptd_offset_residual_memory_dim)
+        self.dptd_offset_residual_use_semantic_proto = bool(dptd_offset_residual_use_semantic_proto)
+        self.dptd_offset_residual_use_visual_memory = bool(dptd_offset_residual_use_visual_memory)
+        self.dptd_offset_residual_use_box_delta = bool(dptd_offset_residual_use_box_delta)
+        self.dptd_offset_residual_use_memory_age = bool(dptd_offset_residual_use_memory_age)
+        self.dptd_offset_residual_detach_memory = bool(dptd_offset_residual_detach_memory)
+        self.dptd_offset_residual_zero_init = bool(dptd_offset_residual_zero_init)
+        self.dptd_offset_residual_debug = bool(dptd_offset_residual_debug)
         self.ov_dptd_gate_alpha = nn.Parameter(torch.tensor(0.0)) if self.use_ov_dptd else None
         if self.use_ov_dptd:
             if self.ov_dptd_fusion not in ("linear_sum", "semantic_gate"):
@@ -787,6 +835,25 @@ class TransformerDecoder(nn.Module):
                 raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
             if self.ov_dptd_fusion == "semantic_gate" and self.ov_dptd_semantic_gate_id_proj_init == "small_random" and self.ov_dptd_semantic_gate_id_proj_init_std <= 0.0:
                 raise RuntimeError("ov_dptd_semantic_gate_id_proj_init_std must be > 0 for small_random init.")
+            if self.use_dptd_semantic_offset_residual:
+                if self.ov_dptd_fusion != "semantic_gate":
+                    raise RuntimeError("DPTD semantic offset residual requires ov_dptd_fusion='semantic_gate'.")
+                if not self.use_dptd_semantic_gate:
+                    raise RuntimeError("DPTD semantic offset residual requires use_dptd_semantic_gate=True.")
+                if not self.ov_dptd_use_historical_offsets:
+                    raise RuntimeError("DPTD semantic offset residual requires ov_dptd_use_historical_offsets=True.")
+                if self.query_dim != 4:
+                    raise NotImplementedError("OV-DPTD v7 semantic offset residual supports query_dim=4 only.")
+                if self.dptd_offset_residual_scale < 0.0:
+                    raise RuntimeError("dptd_offset_residual_scale must be >= 0.")
+                if self.dptd_offset_residual_clamp < 0.0:
+                    raise RuntimeError("dptd_offset_residual_clamp must be >= 0.")
+                if self.dptd_offset_residual_hidden_dim <= 0:
+                    raise RuntimeError("dptd_offset_residual_hidden_dim must be > 0.")
+                if self.dptd_offset_residual_memory_dim <= 0:
+                    raise RuntimeError("dptd_offset_residual_memory_dim must be > 0.")
+                if not self.dptd_offset_residual_zero_init:
+                    raise NotImplementedError("OV-DPTD v7 requires dptd_offset_residual_zero_init=True.")
             self.ov_dptd_ofa_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_ofa_id_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_ofa_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
@@ -803,6 +870,36 @@ class TransformerDecoder(nn.Module):
                 self.ov_dptd_id_text_k_proj = nn.ModuleList()
                 self.ov_dptd_id_text_v_proj = nn.ModuleList()
                 self.ov_dptd_id_text_out_proj = nn.ModuleList()
+            if self.use_dptd_semantic_offset_residual:
+                offset_dim = (
+                    decoder_layer.cross_attn.num_heads
+                    * decoder_layer.cross_attn.num_levels
+                    * decoder_layer.cross_attn.num_points
+                    * 2
+                )
+                self.ov_dptd_offset_semantic_proj = nn.ModuleList([
+                    nn.Linear(self.dptd_offset_residual_memory_dim, self.dptd_offset_residual_hidden_dim)
+                    for _ in range(num_layers)
+                ])
+                self.ov_dptd_offset_visual_proj = nn.ModuleList([
+                    nn.Linear(self.dptd_offset_residual_memory_dim, self.dptd_offset_residual_hidden_dim)
+                    for _ in range(num_layers)
+                ])
+                self.ov_dptd_offset_box_proj = nn.ModuleList([
+                    nn.Linear(4, self.dptd_offset_residual_hidden_dim) for _ in range(num_layers)
+                ])
+                self.ov_dptd_offset_age_proj = nn.ModuleList([
+                    nn.Linear(1, self.dptd_offset_residual_hidden_dim) for _ in range(num_layers)
+                ])
+                self.ov_dptd_offset_residual_out = nn.ModuleList([
+                    nn.Linear(self.dptd_offset_residual_hidden_dim, offset_dim) for _ in range(num_layers)
+                ])
+            else:
+                self.ov_dptd_offset_semantic_proj = nn.ModuleList()
+                self.ov_dptd_offset_visual_proj = nn.ModuleList()
+                self.ov_dptd_offset_box_proj = nn.ModuleList()
+                self.ov_dptd_offset_age_proj = nn.ModuleList()
+                self.ov_dptd_offset_residual_out = nn.ModuleList()
         else:
             self.ov_dptd_ofa_ada_proj = nn.ModuleList()
             self.ov_dptd_ofa_id_proj = nn.ModuleList()
@@ -814,6 +911,11 @@ class TransformerDecoder(nn.Module):
             self.ov_dptd_id_text_k_proj = nn.ModuleList()
             self.ov_dptd_id_text_v_proj = nn.ModuleList()
             self.ov_dptd_id_text_out_proj = nn.ModuleList()
+            self.ov_dptd_offset_semantic_proj = nn.ModuleList()
+            self.ov_dptd_offset_visual_proj = nn.ModuleList()
+            self.ov_dptd_offset_box_proj = nn.ModuleList()
+            self.ov_dptd_offset_age_proj = nn.ModuleList()
+            self.ov_dptd_offset_residual_out = nn.ModuleList()
 
     @staticmethod
     def _reset_linear_identity(linear):
@@ -828,6 +930,11 @@ class TransformerDecoder(nn.Module):
     @staticmethod
     def _reset_linear_small_random(linear, std):
         nn.init.normal_(linear.weight, mean=0.0, std=float(std))
+        nn.init.constant_(linear.bias, 0.0)
+
+    @staticmethod
+    def _reset_linear_xavier(linear):
+        nn.init.xavier_uniform_(linear.weight)
         nn.init.constant_(linear.bias, 0.0)
 
     def reset_ov_dptd_fusion_parameters(self):
@@ -851,6 +958,12 @@ class TransformerDecoder(nn.Module):
             self._reset_linear_identity(self.ov_dptd_cti_out_proj[layer_id])
             if self.ov_dptd_id_path_text == "topk_memory" and self.dptd_id_text_out_zero_init:
                 self._reset_linear_zero(self.ov_dptd_id_text_out_proj[layer_id])
+            if self.use_dptd_semantic_offset_residual:
+                self._reset_linear_xavier(self.ov_dptd_offset_semantic_proj[layer_id])
+                self._reset_linear_xavier(self.ov_dptd_offset_visual_proj[layer_id])
+                self._reset_linear_xavier(self.ov_dptd_offset_box_proj[layer_id])
+                self._reset_linear_xavier(self.ov_dptd_offset_age_proj[layer_id])
+                self._reset_linear_zero(self.ov_dptd_offset_residual_out[layer_id])
 
     def ov_dptd_id_proj_weight_norm(self):
         if not self.use_ov_dptd or len(self.ov_dptd_ofa_id_proj) == 0:
@@ -936,6 +1049,158 @@ class TransformerDecoder(nn.Module):
         if expected_dim is not None and value.dim() == expected_dim - 1:
             value = value.unsqueeze(0)
         return value
+
+
+    @staticmethod
+    def _expand_dptd_state_first_dim(value, bs):
+        if value is not None and value.shape[0] == 1 and bs != 1:
+            value = value.expand(bs, *value.shape[1:])
+        return value
+
+    def _set_dptd_offset_residual_debug(self, debug, stats):
+        if debug is None or not (self.use_dptd_semantic_offset_residual or self.dptd_offset_residual_debug):
+            return
+        debug['dptd_offset_residual_applied_count'] = int(stats.get('applied_count', 0))
+        debug['dptd_offset_residual_skipped_count'] = int(stats.get('skipped_count', 0))
+        debug['dptd_offset_residual_norm_mean'] = float(stats.get('norm_mean', 0.0))
+        debug['dptd_offset_residual_norm_max'] = float(stats.get('norm_max', 0.0))
+        debug['dptd_offset_residual_scale'] = float(self.dptd_offset_residual_scale)
+        debug['dptd_offset_residual_clamp'] = float(self.dptd_offset_residual_clamp)
+        debug['dptd_offset_residual_zero_init'] = bool(self.dptd_offset_residual_zero_init)
+
+    def _compute_dptd_offset_residual(
+        self,
+        layer_id,
+        historical_offsets,
+        dptd_gate_state,
+        reference_points,
+        track_start,
+        tgt,
+        debug=None,
+    ):
+        if not self.use_dptd_semantic_offset_residual:
+            return historical_offsets, None
+
+        stats = {'applied_count': 0, 'skipped_count': 0, 'norm_mean': 0.0, 'norm_max': 0.0}
+        bs = tgt.shape[1]
+        num_queries = tgt.shape[0]
+        if historical_offsets is None or historical_offsets.dim() != 6 or historical_offsets.shape[:2] != (bs, num_queries):
+            stats['skipped_count'] = 1
+            self._set_dptd_offset_residual_debug(debug, stats)
+            return historical_offsets, None
+
+        expected_tail = (
+            self.layers[layer_id].cross_attn.num_heads,
+            self.layers[layer_id].cross_attn.num_levels,
+            self.layers[layer_id].cross_attn.num_points,
+            2,
+        )
+        if tuple(historical_offsets.shape[2:]) != expected_tail:
+            stats['skipped_count'] = 1
+            self._set_dptd_offset_residual_debug(debug, stats)
+            return historical_offsets, None
+        if not isinstance(dptd_gate_state, dict) or track_start >= num_queries:
+            stats['skipped_count'] = max((num_queries - track_start) * bs, 0)
+            self._set_dptd_offset_residual_debug(debug, stats)
+            return historical_offsets, None
+
+        memory_valid = self._gate_state_tensor(dptd_gate_state, 'memory_valid', historical_offsets, expected_dim=2, dtype=torch.bool)
+        if memory_valid is None:
+            stats['skipped_count'] = max((num_queries - track_start) * bs, 0)
+            self._set_dptd_offset_residual_debug(debug, stats)
+            return historical_offsets, None
+        memory_valid = self._expand_dptd_state_first_dim(memory_valid, bs)
+        if memory_valid.shape[:2] != (bs, num_queries):
+            stats['skipped_count'] = max((num_queries - track_start) * bs, 0)
+            self._set_dptd_offset_residual_debug(debug, stats)
+            return historical_offsets, None
+
+        module_weight = self.ov_dptd_offset_residual_out[layer_id].weight
+        module_dtype = module_weight.dtype
+        module_device = module_weight.device
+        if historical_offsets.device != module_device:
+            raise RuntimeError(
+                "DPTD offset residual device mismatch: "
+                f"historical_offsets={historical_offsets.device}, module={module_device}."
+            )
+        hidden = torch.zeros(
+            bs,
+            num_queries,
+            self.dptd_offset_residual_hidden_dim,
+            device=module_device,
+            dtype=module_dtype,
+        )
+
+        def _memory_feature(name, expected_dim=3):
+            value = self._gate_state_tensor(dptd_gate_state, name, historical_offsets, expected_dim=expected_dim, dtype=module_dtype)
+            value = self._expand_dptd_state_first_dim(value, bs) if value is not None else None
+            if value is None or value.shape[:2] != (bs, num_queries) or value.shape[-1] != self.dptd_offset_residual_memory_dim:
+                return None
+            if self.dptd_offset_residual_detach_memory:
+                value = value.detach()
+            return value
+
+        if self.dptd_offset_residual_use_semantic_proto:
+            semantic = _memory_feature('semantic_proto')
+            if semantic is not None:
+                hidden = hidden + self.ov_dptd_offset_semantic_proj[layer_id](semantic)
+
+        if self.dptd_offset_residual_use_visual_memory:
+            visual = _memory_feature('visual_memory')
+            if visual is not None:
+                hidden = hidden + self.ov_dptd_offset_visual_proj[layer_id](visual)
+
+        if self.dptd_offset_residual_use_box_delta:
+            current_ref = None
+            if isinstance(reference_points, torch.Tensor) and reference_points.dim() == 3 and reference_points.shape[-1] == 4:
+                if reference_points.shape[1] == bs:
+                    current_ref = reference_points.transpose(0, 1).to(device=module_device, dtype=module_dtype)
+                elif reference_points.shape[0] == bs:
+                    current_ref = reference_points.to(device=module_device, dtype=module_dtype)
+            pred_boxes = self._gate_state_tensor(dptd_gate_state, 'pred_boxes', historical_offsets, expected_dim=3, dtype=module_dtype)
+            pred_boxes = self._expand_dptd_state_first_dim(pred_boxes, bs) if pred_boxes is not None else None
+            if pred_boxes is not None and pred_boxes.dim() == 2 and pred_boxes.shape == (num_queries, 4):
+                pred_boxes = pred_boxes.unsqueeze(0).expand(bs, -1, -1)
+            if current_ref is not None and pred_boxes is not None and pred_boxes.shape[:2] == (bs, num_queries) and pred_boxes.shape[-1] == 4:
+                if self.dptd_offset_residual_detach_memory:
+                    pred_boxes = pred_boxes.detach()
+                box_delta = current_ref - pred_boxes
+            else:
+                box_delta = torch.zeros(bs, num_queries, 4, device=module_device, dtype=module_dtype)
+            hidden = hidden + self.ov_dptd_offset_box_proj[layer_id](box_delta)
+
+        if self.dptd_offset_residual_use_memory_age:
+            age = self._gate_state_tensor(dptd_gate_state, 'memory_age', historical_offsets, expected_dim=2, dtype=module_dtype)
+            age = self._expand_dptd_state_first_dim(age, bs) if age is not None else None
+            if age is None or age.shape[:2] != (bs, num_queries):
+                age_feature = torch.zeros(bs, num_queries, 1, device=module_device, dtype=module_dtype)
+            else:
+                if self.dptd_offset_residual_detach_memory:
+                    age = age.detach()
+                age_feature = (torch.log1p(age.float()).to(dtype=module_dtype) / 10.0).clamp(0.0, 1.0).unsqueeze(-1)
+            hidden = hidden + self.ov_dptd_offset_age_proj[layer_id](age_feature)
+
+        hidden = F.relu(hidden)
+        raw = self.ov_dptd_offset_residual_out[layer_id](hidden)
+        residual = raw.view_as(historical_offsets).tanh() * float(self.dptd_offset_residual_scale)
+        clamp_value = float(self.dptd_offset_residual_clamp)
+        if clamp_value >= 0.0:
+            residual = residual.clamp(min=-clamp_value, max=clamp_value)
+        track_mask = torch.zeros(bs, num_queries, device=module_device, dtype=torch.bool)
+        track_mask[:, track_start:] = True
+        valid = memory_valid.bool() & track_mask
+        residual = residual.to(dtype=historical_offsets.dtype) * valid[:, :, None, None, None, None].to(dtype=historical_offsets.dtype)
+        adjusted = historical_offsets + residual
+
+        stats['applied_count'] = int(valid.detach().sum().item())
+        stats['skipped_count'] = int((track_mask & ~valid).detach().sum().item())
+        if valid.any():
+            norms = residual[valid].detach().float().flatten(1).norm(dim=-1)
+            if norms.numel() > 0:
+                stats['norm_mean'] = float(norms.mean().item())
+                stats['norm_max'] = float(norms.max().item())
+        self._set_dptd_offset_residual_debug(debug, stats)
+        return adjusted, residual
 
     def _semantic_gate_ones(self, tgt):
         return torch.ones(tgt.shape[1], tgt.shape[0], device=tgt.device, dtype=tgt.dtype)
@@ -1182,8 +1447,9 @@ class TransformerDecoder(nn.Module):
         text_attention_mask = ~text_dict["text_token_mask"]
         pre_outputs_classes = []
         historical_offsets = self._normalize_ov_dptd_offsets(dptd_sampling_offsets, tgt)
+        original_historical_offsets = historical_offsets
         collect_loss_tensors = bool(self.training and self.use_dptd_losses)
-        dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
+        dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug or self.dptd_offset_residual_debug)
         if dptd_debug is not None:
             dptd_debug["ov_dptd_gate_alpha"] = float(self.ov_dptd_gate_alpha.detach().item()) if self.ov_dptd_gate_alpha is not None else 0.0
             dptd_debug["ov_dptd_id_proj_weight_norm"] = self.ov_dptd_id_proj_weight_norm()
@@ -1196,6 +1462,7 @@ class TransformerDecoder(nn.Module):
         last_id_ofa = None
         last_fused_ofa = None
         last_ad_sampling_offsets_loss = None
+        last_offset_residual = None
 
         self.num_queries_cur = tgt.shape[0]
         self.select_text_num = text_dict["select_text_num"]
@@ -1244,6 +1511,17 @@ class TransformerDecoder(nn.Module):
                 id_tgt = output.clone()
                 id_tgt[track_start:] = fixed_track_tgt[track_start:]
 
+            adjusted_historical_offsets, offset_residual = self._compute_dptd_offset_residual(
+                layer_id,
+                historical_offsets,
+                dptd_gate_state,
+                reference_points,
+                track_start,
+                tgt,
+                debug=dptd_debug,
+            )
+            last_offset_residual = offset_residual
+
             id_ofa, _, id_debug = layer.forward_identity_path(
                 tgt=id_tgt,
                 tgt_query_pos=query_pos,
@@ -1258,7 +1536,7 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask,
                 num=num,
-                historical_sampling_offsets=historical_offsets,
+                historical_sampling_offsets=adjusted_historical_offsets,
                 use_historical_offsets=self.ov_dptd_use_historical_offsets,
                 store_debug=self.ov_dptd_store_debug,
             )
@@ -1341,13 +1619,15 @@ class TransformerDecoder(nn.Module):
                 "semantic_gate_memory_valid": last_gate_memory_valid.detach() if last_gate_memory_valid is not None else None,
                 "debug": dptd_debug,
             }
+            if self.use_dptd_semantic_offset_residual:
+                dptd_info["offset_residual"] = last_offset_residual.detach() if last_offset_residual is not None else None
             if collect_loss_tensors:
                 dptd_info["loss_tensors"] = {
                     "ada_ofa_final": last_ada_ofa.transpose(0, 1),
                     "id_ofa_final": last_id_ofa.transpose(0, 1),
                     "fused_ofa_final": last_fused_ofa.transpose(0, 1),
                     "ad_sampling_offsets_final": last_ad_sampling_offsets_loss,
-                    "historical_sampling_offsets": historical_offsets.detach() if historical_offsets is not None else None,
+                    "historical_sampling_offsets": original_historical_offsets.detach() if original_historical_offsets is not None else None,
                     "semantic_gate": last_gate_values.detach() if last_gate_values is not None else None,
                     "semantic_gate_memory_valid": last_gate_memory_valid.detach() if last_gate_memory_valid is not None else None,
                     "num_det": track_start,
@@ -1949,4 +2229,16 @@ def build_transformer(args):
         dptd_semantic_update_suppression_thresh=getattr(args, "dptd_semantic_update_suppression_thresh", 0.3),
         ov_dptd_semantic_gate_id_proj_init=getattr(args, "ov_dptd_semantic_gate_id_proj_init", "small_random"),
         ov_dptd_semantic_gate_id_proj_init_std=getattr(args, "ov_dptd_semantic_gate_id_proj_init_std", 1e-3),
+        use_dptd_semantic_offset_residual=getattr(args, "use_dptd_semantic_offset_residual", False),
+        dptd_offset_residual_scale=getattr(args, "dptd_offset_residual_scale", 0.05),
+        dptd_offset_residual_clamp=getattr(args, "dptd_offset_residual_clamp", 0.1),
+        dptd_offset_residual_hidden_dim=getattr(args, "dptd_offset_residual_hidden_dim", 256),
+        dptd_offset_residual_memory_dim=getattr(args, "dptd_offset_residual_memory_dim", 512),
+        dptd_offset_residual_use_semantic_proto=getattr(args, "dptd_offset_residual_use_semantic_proto", True),
+        dptd_offset_residual_use_visual_memory=getattr(args, "dptd_offset_residual_use_visual_memory", True),
+        dptd_offset_residual_use_box_delta=getattr(args, "dptd_offset_residual_use_box_delta", True),
+        dptd_offset_residual_use_memory_age=getattr(args, "dptd_offset_residual_use_memory_age", True),
+        dptd_offset_residual_detach_memory=getattr(args, "dptd_offset_residual_detach_memory", True),
+        dptd_offset_residual_zero_init=getattr(args, "dptd_offset_residual_zero_init", True),
+        dptd_offset_residual_debug=getattr(args, "dptd_offset_residual_debug", False),
     )

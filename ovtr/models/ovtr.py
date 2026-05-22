@@ -103,6 +103,18 @@ OV_DPTD_OPTION_DEFAULTS = {
     'dptd_contrast_temperature': 0.07,
     'dptd_contrast_min_negatives': 1,
     'dptd_loss_store_debug': False,
+    'use_dptd_semantic_offset_residual': False,
+    'dptd_offset_residual_scale': 0.05,
+    'dptd_offset_residual_clamp': 0.1,
+    'dptd_offset_residual_hidden_dim': 256,
+    'dptd_offset_residual_memory_dim': 512,
+    'dptd_offset_residual_use_semantic_proto': True,
+    'dptd_offset_residual_use_visual_memory': True,
+    'dptd_offset_residual_use_box_delta': True,
+    'dptd_offset_residual_use_memory_age': True,
+    'dptd_offset_residual_detach_memory': True,
+    'dptd_offset_residual_zero_init': True,
+    'dptd_offset_residual_debug': False,
 }
 
 DPTD_LOSS_NAMES = (
@@ -258,6 +270,33 @@ def _validate_dptd_gate_options(container):
 
 
 
+def _validate_dptd_offset_residual_options(container):
+    if not getattr(container, 'use_dptd_semantic_offset_residual', False):
+        return
+    if not getattr(container, 'use_ov_dptd', False):
+        raise RuntimeError('DPTD semantic offset residual requires use_ov_dptd=True.')
+    if not getattr(container, 'use_dptd_semantic_memory', False):
+        raise RuntimeError('DPTD semantic offset residual requires use_dptd_semantic_memory=True.')
+    if not getattr(container, 'use_dptd_semantic_gate', False):
+        raise RuntimeError('DPTD semantic offset residual requires use_dptd_semantic_gate=True.')
+    if getattr(container, 'ov_dptd_fusion', 'linear_sum') != 'semantic_gate':
+        raise RuntimeError("DPTD semantic offset residual requires ov_dptd_fusion='semantic_gate'.")
+    if not getattr(container, 'ov_dptd_use_historical_offsets', True):
+        raise RuntimeError('DPTD semantic offset residual requires ov_dptd_use_historical_offsets=True.')
+    if int(getattr(container, 'query_dim', 4)) != 4:
+        raise NotImplementedError('OV-DPTD v7 semantic offset residual supports query_dim=4 only.')
+    if float(getattr(container, 'dptd_offset_residual_scale', 0.05)) < 0.0:
+        raise RuntimeError('dptd_offset_residual_scale must be >= 0.')
+    if float(getattr(container, 'dptd_offset_residual_clamp', 0.1)) < 0.0:
+        raise RuntimeError('dptd_offset_residual_clamp must be >= 0.')
+    if int(getattr(container, 'dptd_offset_residual_hidden_dim', 256)) <= 0:
+        raise RuntimeError('dptd_offset_residual_hidden_dim must be > 0.')
+    if int(getattr(container, 'dptd_offset_residual_memory_dim', 512)) <= 0:
+        raise RuntimeError('dptd_offset_residual_memory_dim must be > 0.')
+    if not getattr(container, 'dptd_offset_residual_zero_init', True):
+        raise NotImplementedError('OV-DPTD v7 requires dptd_offset_residual_zero_init=True.')
+
+
 def _validate_dptd_loss_options(container):
     if not getattr(container, 'use_dptd_losses', False):
         return
@@ -318,6 +357,8 @@ def resolve_ov_dptd_options(args, cfg):
         setattr(cfg, name, value)
     if not hasattr(args, 'hidden_dim') and hasattr(cfg, 'hidden_dim'):
         setattr(args, 'hidden_dim', getattr(cfg, 'hidden_dim'))
+    if not hasattr(args, 'query_dim') and hasattr(cfg, 'query_dim'):
+        setattr(args, 'query_dim', getattr(cfg, 'query_dim'))
 
     if getattr(args, 'use_dptd_update_suppression', False) and not getattr(args, 'use_ov_dptd', False):
         raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
@@ -329,6 +370,7 @@ def resolve_ov_dptd_options(args, cfg):
     _validate_dptd_memory_options(args)
     _validate_dptd_gate_options(args)
     _validate_dptd_id_text_options(args)
+    _validate_dptd_offset_residual_options(args)
     _validate_dptd_loss_options(args)
 
     if not getattr(args, 'use_ov_dptd', False):
@@ -1163,6 +1205,18 @@ class OVTR(nn.Module):
                     dptd_semantic_update_suppression_thresh=0.3,
                     use_dptd_losses=False,
                     dptd_loss_store_debug=False,
+                    use_dptd_semantic_offset_residual=False,
+                    dptd_offset_residual_scale=0.05,
+                    dptd_offset_residual_clamp=0.1,
+                    dptd_offset_residual_hidden_dim=256,
+                    dptd_offset_residual_memory_dim=512,
+                    dptd_offset_residual_use_semantic_proto=True,
+                    dptd_offset_residual_use_visual_memory=True,
+                    dptd_offset_residual_use_box_delta=True,
+                    dptd_offset_residual_use_memory_age=True,
+                    dptd_offset_residual_detach_memory=True,
+                    dptd_offset_residual_zero_init=True,
+                    dptd_offset_residual_debug=False,
                  ):
         """ Initializes the model.
         Parameters:
@@ -1312,7 +1366,24 @@ class OVTR(nn.Module):
         self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
         self.use_dptd_losses = bool(use_dptd_losses)
         self.dptd_loss_store_debug = bool(dptd_loss_store_debug)
+        self.use_dptd_semantic_offset_residual = bool(use_dptd_semantic_offset_residual)
+        self.dptd_offset_residual_scale = float(dptd_offset_residual_scale)
+        self.dptd_offset_residual_clamp = float(dptd_offset_residual_clamp)
+        self.dptd_offset_residual_hidden_dim = int(dptd_offset_residual_hidden_dim)
+        self.dptd_offset_residual_memory_dim = int(dptd_offset_residual_memory_dim)
+        self.dptd_offset_residual_use_semantic_proto = bool(dptd_offset_residual_use_semantic_proto)
+        self.dptd_offset_residual_use_visual_memory = bool(dptd_offset_residual_use_visual_memory)
+        self.dptd_offset_residual_use_box_delta = bool(dptd_offset_residual_use_box_delta)
+        self.dptd_offset_residual_use_memory_age = bool(dptd_offset_residual_use_memory_age)
+        self.dptd_offset_residual_detach_memory = bool(dptd_offset_residual_detach_memory)
+        self.dptd_offset_residual_zero_init = bool(dptd_offset_residual_zero_init)
+        self.dptd_offset_residual_debug = bool(dptd_offset_residual_debug)
         self.dptd_memory_dim = int(self.text_embeddings.shape[0])
+        if self.use_dptd_semantic_offset_residual and self.dptd_memory_dim != self.dptd_offset_residual_memory_dim:
+            raise RuntimeError(
+                'DPTD offset residual memory dim mismatch: '
+                f'text memory dim {self.dptd_memory_dim} != {self.dptd_offset_residual_memory_dim}'
+            )
         self.dptd_id_text_feature_dim = int(getattr(self.transformer.decoder, 'dptd_id_text_feature_dim', hidden_dim))
         self.dptd_visual_memory_proj = None
         if self.use_dptd_semantic_memory and self.dptd_memory_allow_untrained_visual_projection:
@@ -1328,6 +1399,7 @@ class OVTR(nn.Module):
         _validate_dptd_memory_options(self)
         _validate_dptd_gate_options(self)
         _validate_dptd_id_text_options(self)
+        _validate_dptd_offset_residual_options(self)
         _validate_dptd_loss_options(self)
         self.supports_mot_batch = (
             (not use_checkpoint)
@@ -1396,7 +1468,18 @@ class OVTR(nn.Module):
             or self.dptd_gate_debug
             or self.dptd_id_text_debug
             or self.dptd_loss_store_debug
+            or self.dptd_offset_residual_debug
         ) else {}
+        if self.ov_dptd_debug_stats and (self.use_dptd_semantic_offset_residual or self.dptd_offset_residual_debug):
+            self.ov_dptd_debug_stats.update({
+                'dptd_offset_residual_applied_count': 0,
+                'dptd_offset_residual_skipped_count': 0,
+                'dptd_offset_residual_norm_mean': 0.0,
+                'dptd_offset_residual_norm_max': 0.0,
+                'dptd_offset_residual_scale': self.dptd_offset_residual_scale,
+                'dptd_offset_residual_clamp': self.dptd_offset_residual_clamp,
+                'dptd_offset_residual_zero_init': self.dptd_offset_residual_zero_init,
+            })
 
     def _dptd_offset_shape(self, num_queries):
         decoder_layers = getattr(self.transformer.decoder, 'layers', [])
@@ -1434,7 +1517,11 @@ class OVTR(nn.Module):
         )
 
     def _update_ov_dptd_debug_stats(self, dptd_info):
-        if not (self.use_ov_dptd and self.ov_dptd_store_debug and dptd_info is not None):
+        if not (
+            self.use_ov_dptd
+            and (self.ov_dptd_store_debug or getattr(self, 'dptd_offset_residual_debug', False))
+            and dptd_info is not None
+        ):
             return
         debug = dptd_info.get('debug') if isinstance(dptd_info, dict) else None
         if not debug:
@@ -1466,6 +1553,13 @@ class OVTR(nn.Module):
             'ov_dptd_gate_alpha',
             'ov_dptd_id_proj_weight_norm',
             'ov_dptd_id_proj_init_mode',
+            'dptd_offset_residual_applied_count',
+            'dptd_offset_residual_skipped_count',
+            'dptd_offset_residual_norm_mean',
+            'dptd_offset_residual_norm_max',
+            'dptd_offset_residual_scale',
+            'dptd_offset_residual_clamp',
+            'dptd_offset_residual_zero_init',
         ]:
             if key in debug:
                 self.ov_dptd_debug_stats[key] = debug[key]
@@ -1873,6 +1967,16 @@ class OVTR(nn.Module):
         score = logits.sigmoid()
         prob = score / score.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         text_embeddings = text_embeddings.to(device=prob.device, dtype=prob.dtype)
+        if int(text_embeddings.shape[-1]) != int(self.dptd_memory_dim):
+            raise RuntimeError(
+                'DPTD semantic memory dim mismatch: '
+                f'{text_embeddings.shape[-1]} != {self.dptd_memory_dim}'
+            )
+        if getattr(self, 'use_dptd_semantic_offset_residual', False) and int(text_embeddings.shape[-1]) != int(self.dptd_offset_residual_memory_dim):
+            raise RuntimeError(
+                'DPTD offset residual semantic dim mismatch: '
+                f'{text_embeddings.shape[-1]} != {self.dptd_offset_residual_memory_dim}'
+            )
         semantic_proto = F.normalize(prob @ text_embeddings, dim=-1, eps=1e-6)
         semantic_conf = score.max(dim=-1).values
         entropy_den = math.log(num_cls) if num_cls > 1 else 1.0
@@ -1966,6 +2070,11 @@ class OVTR(nn.Module):
             raise RuntimeError(
                 'DPTD visual memory dim mismatch: '
                 f'{visual_memory.shape[-1]} != {memory_dim}'
+            )
+        if getattr(self, 'use_dptd_semantic_offset_residual', False) and int(visual_memory.shape[-1]) != int(self.dptd_offset_residual_memory_dim):
+            raise RuntimeError(
+                'DPTD offset residual visual dim mismatch: '
+                f'{visual_memory.shape[-1]} != {self.dptd_offset_residual_memory_dim}'
             )
         visual_memory = F.normalize(visual_memory.float(), dim=-1, eps=1e-6)
         target_dtype = track_instances.query_tgt.dtype if track_instances.has('query_tgt') else visual_memory.dtype
@@ -2911,12 +3020,34 @@ class OVTR(nn.Module):
         return outputs
 
 
+def _normalize_dptd_offset_residual_memory_dim(args, cfg, text_embeddings, image_embeddings):
+    if not getattr(args, 'use_dptd_semantic_offset_residual', getattr(cfg, 'use_dptd_semantic_offset_residual', False)):
+        return
+    expected_memory_dim = int(text_embeddings.shape[-1])
+    if hasattr(image_embeddings, 'shape') and len(image_embeddings.shape) > 0 and int(image_embeddings.shape[-1]) != expected_memory_dim:
+        raise RuntimeError(
+            'DPTD offset residual embedding dim mismatch: '
+            f'text={expected_memory_dim}, image={int(image_embeddings.shape[-1])}'
+        )
+    default_memory_dim = int(OV_DPTD_OPTION_DEFAULTS['dptd_offset_residual_memory_dim'])
+    configured_memory_dim = int(getattr(cfg, 'dptd_offset_residual_memory_dim', default_memory_dim))
+    if configured_memory_dim == default_memory_dim:
+        setattr(args, 'dptd_offset_residual_memory_dim', expected_memory_dim)
+        setattr(cfg, 'dptd_offset_residual_memory_dim', expected_memory_dim)
+    elif configured_memory_dim != expected_memory_dim:
+        raise RuntimeError(
+            'DPTD offset residual memory dim mismatch: '
+            f'configured={configured_memory_dim}, embedding={expected_memory_dim}'
+        )
+
+
 def build(args, cfg):
     resolve_attention_protection_options(args, cfg)
     resolve_ov_dptd_options(args, cfg)
     
     assert cfg.Clip_text_embeddings and cfg.Clip_image_embeddings, "Clip_text_embeddings or Clip_image_embeddings should not be None"
     text_embeddings, image_embeddings = load_embeddings(cfg.Clip_text_embeddings, cfg.Clip_image_embeddings)  
+    _normalize_dptd_offset_residual_memory_dim(args, cfg, text_embeddings, image_embeddings)
 
     device = torch.device(args.device)
     backbone = build_backbone(cfg)
@@ -3034,5 +3165,17 @@ def build(args, cfg):
         dptd_semantic_update_suppression_thresh=args.dptd_semantic_update_suppression_thresh,
         use_dptd_losses=args.use_dptd_losses,
         dptd_loss_store_debug=args.dptd_loss_store_debug,
+        use_dptd_semantic_offset_residual=args.use_dptd_semantic_offset_residual,
+        dptd_offset_residual_scale=args.dptd_offset_residual_scale,
+        dptd_offset_residual_clamp=args.dptd_offset_residual_clamp,
+        dptd_offset_residual_hidden_dim=args.dptd_offset_residual_hidden_dim,
+        dptd_offset_residual_memory_dim=args.dptd_offset_residual_memory_dim,
+        dptd_offset_residual_use_semantic_proto=args.dptd_offset_residual_use_semantic_proto,
+        dptd_offset_residual_use_visual_memory=args.dptd_offset_residual_use_visual_memory,
+        dptd_offset_residual_use_box_delta=args.dptd_offset_residual_use_box_delta,
+        dptd_offset_residual_use_memory_age=args.dptd_offset_residual_use_memory_age,
+        dptd_offset_residual_detach_memory=args.dptd_offset_residual_detach_memory,
+        dptd_offset_residual_zero_init=args.dptd_offset_residual_zero_init,
+        dptd_offset_residual_debug=args.dptd_offset_residual_debug,
     )
     return model, criterion
