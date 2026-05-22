@@ -1,6 +1,6 @@
 # OV-DPTD 실행 가이드
 
-이 문서는 OV-DPTD v1-v4를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
+이 문서는 OV-DPTD v1-v5를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
 
 OV-DPTD 인자는 현재 config field로 관리됩니다. `tools/*.sh`의 `EXTRA_ARGS`는 기존 CLI 인자를 뒤에 붙이는 용도이며, DPTD field는 config 파일에 명시하는 방식을 권장합니다.
 
@@ -93,6 +93,40 @@ use_transformer_ckpt = False
 ```
 
 `semantic_gate`에서는 `ov_dptd_gate_alpha`가 0으로 시작하고 ID projection은 small-random으로 시작합니다. 초기 forward는 baseline과 같지만 첫 backward에서 alpha gradient가 흐르도록 하기 위한 설정입니다.
+
+### v5 topk_memory training config
+
+v5 top-k text memory interaction은 semantic gate 전용입니다. training config 예시는 다음과 같습니다.
+
+```python
+use_ov_dptd = True
+ov_dptd_fusion = "semantic_gate"
+ov_dptd_id_path_text = "topk_memory"
+ov_dptd_fuse_cti = False
+ov_dptd_store_debug = True
+
+use_dptd_semantic_memory = True
+dptd_store_topk_text_embeddings = True
+dptd_id_text_topk = 5
+dptd_id_text_num_heads = 4
+dptd_id_text_dropout = 0.0
+dptd_id_text_out_zero_init = True
+dptd_id_text_score_eps = 1e-8
+dptd_id_text_debug = True
+
+use_dptd_semantic_gate = True
+dptd_gate_mode = "heuristic"
+dptd_gate_debug = True
+
+# inference-only 기능이므로 training에서는 끕니다.
+use_dptd_update_suppression = False
+use_dptd_semantic_update_suppression = False
+
+use_checkpoint_track = False
+use_transformer_ckpt = False
+```
+
+`ov_dptd_fusion="linear_sum"`과 `ov_dptd_id_path_text="topk_memory"` 조합은 v5에서 RuntimeError입니다. semantic_gate의 small-random ID projection과 nonzero alpha gradient 흐름을 전제로 adapter gradient를 확인하기 때문입니다.
 
 ### v4 eval config with suppression
 
@@ -332,6 +366,22 @@ dptd_memory_allow_untrained_visual_projection = True
 ```
 
 기본 실험에서는 fallback을 켜지 않는 것을 권장합니다.
+
+### `topk_memory`가 RuntimeError를 내는 경우
+
+`topk_memory`는 semantic gate 전용입니다. 다음 네 가지가 모두 필요합니다.
+
+```python
+use_ov_dptd = True
+ov_dptd_fusion = "semantic_gate"
+ov_dptd_id_path_text = "topk_memory"
+use_dptd_semantic_memory = True
+use_dptd_semantic_gate = True
+```
+
+`dptd_topk_text_embeddings.shape[-1]`은 decoder CTI가 쓰는 text feature dim과 같아야 합니다. 이 dim이 다르면 adapter k/v projection input dim과 맞지 않아 RuntimeError가 납니다.
+
+모든 top-k text score가 `dptd_id_text_score_eps` 이하인 query는 attention을 실행하지 않고 residual 0으로 skip됩니다.
 
 ### Alpha가 계속 0인 경우
 

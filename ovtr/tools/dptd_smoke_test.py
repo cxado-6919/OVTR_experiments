@@ -42,6 +42,7 @@ def _make_decoder(use_ov_dptd=False, num_layers=2, d_model=256, nheads=4, nlevel
         computed_aux=list(range(num_layers)),
         use_ov_dptd=use_ov_dptd,
         ov_dptd_store_debug=True,
+        dptd_id_text_feature_dim=decoder_kwargs.pop("dptd_id_text_feature_dim", d_model),
         **decoder_kwargs,
     )
     decoder.bbox_embed = nn.ModuleList([nn.Linear(d_model, 4) for _ in range(num_layers)])
@@ -193,6 +194,14 @@ def _args_cfg(**overrides):
         ov_dptd_semantic_gate_id_proj_init="small_random",
         ov_dptd_semantic_gate_id_proj_init_std=1e-3,
         ov_dptd_reinit_dead_semantic_gate_id_proj=False,
+        dptd_id_text_topk=5,
+        dptd_id_text_num_heads=4,
+        dptd_id_text_dropout=0.0,
+        dptd_id_text_out_zero_init=True,
+        dptd_id_text_score_eps=1e-8,
+        dptd_id_text_debug=False,
+        dptd_store_topk_text_embeddings=True,
+        hidden_dim=256,
         use_checkpoint_track=False,
         use_transformer_ckpt=False,
     )
@@ -224,6 +233,42 @@ def test_dptd_guards():
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_fusion="semantic_gate")))
     _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, dptd_gate_mode="mlp")))
     _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_fuse_cti=True)))
+    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_id_path_text="bad")))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_ov_dptd=False, ov_dptd_id_path_text="topk_memory")))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_id_path_text="topk_memory")))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(
+        ov_dptd_id_path_text="topk_memory",
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="linear_sum",
+    )))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(
+        ov_dptd_id_path_text="topk_memory",
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        dptd_id_text_topk=0,
+    )))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(
+        ov_dptd_id_path_text="topk_memory",
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        dptd_id_text_num_heads=3,
+    )))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(
+        ov_dptd_id_path_text="topk_memory",
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        dptd_id_text_score_eps=-1e-8,
+    )))
+    resolve_ov_dptd_options(*_args_cfg(
+        ov_dptd_id_path_text="topk_memory",
+        use_dptd_semantic_memory=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+    ))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="small_random", ov_dptd_semantic_gate_id_proj_init_std=0.0)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="bad")))
 
@@ -341,7 +386,7 @@ def test_dptd_update_suppression_after_track_base_update():
 
 
 
-def _make_memory_model(topk=2, allow_projection=False):
+def _make_memory_model(topk=2, allow_projection=False, id_text_topk=None, text_dim=4):
     fake_model = OVTR.__new__(OVTR)
     fake_model.training = False
     fake_model.use_ov_dptd = True
@@ -353,6 +398,14 @@ def _make_memory_model(topk=2, allow_projection=False):
     fake_model.dptd_memory_allow_untrained_visual_projection = allow_projection
     fake_model.dptd_memory_store_topk = topk
     fake_model.dptd_memory_debug = True
+    fake_model.dptd_id_text_topk = int(id_text_topk if id_text_topk is not None else topk)
+    fake_model.dptd_id_text_num_heads = 2
+    fake_model.dptd_id_text_dropout = 0.0
+    fake_model.dptd_id_text_out_zero_init = True
+    fake_model.dptd_id_text_score_eps = 1e-8
+    fake_model.dptd_id_text_debug = True
+    fake_model.dptd_store_topk_text_embeddings = True
+    fake_model.dptd_id_text_feature_dim = int(text_dim)
     fake_model.use_dptd_semantic_gate = True
     fake_model.dptd_gate_visual_cos_tau = 0.25
     fake_model.dptd_gate_temperature = 10.0
@@ -398,16 +451,25 @@ def _text_memory(num_cls):
     return torch.cat([base, extra], dim=0)
 
 
-def _attach_memory_candidates(model, tracks, logits, select_id, pred_embed=None):
+def _id_text_memory(num_cls, text_dim=4):
+    values = torch.arange(num_cls * text_dim, dtype=torch.float32).view(num_cls, text_dim)
+    return values / max(float(text_dim), 1.0)
+
+
+def _attach_memory_candidates(model, tracks, logits, select_id, pred_embed=None, id_text_embeddings=None):
     tracks.pred_logits = logits.clone()
+    if id_text_embeddings is None:
+        id_text_embeddings = _id_text_memory(len(select_id), getattr(model, "dptd_id_text_feature_dim", 4))
     frame_res = {
         "select_id": torch.tensor(select_id, dtype=torch.long),
         "dptd_text_memory_embeddings": _text_memory(len(select_id)),
+        "dptd_id_text_memory_embeddings": id_text_embeddings,
     }
     if pred_embed is not None:
         frame_res["pred_embed"] = pred_embed.unsqueeze(0)
     OVTR._attach_dptd_memory_candidates(model, frame_res, tracks)
     assert "dptd_text_memory_embeddings" not in frame_res
+    assert "dptd_id_text_memory_embeddings" not in frame_res
     return frame_res
 
 
@@ -431,9 +493,20 @@ def test_dptd_memory_init_topk_detach_and_entropy_single_class():
     assert updated.dptd_memory_age.tolist() == [0]
     assert updated.dptd_topk_class_indices.tolist() == [[42, -1]]
     assert torch.allclose(updated.dptd_topk_class_scores[0, 0], torch.tensor(1.0))
+    assert updated.dptd_topk_text_embeddings.shape == (1, 2, 4)
+    assert updated.dptd_topk_text_scores.shape == (1, 2)
+    assert torch.allclose(updated.dptd_topk_text_scores[0], torch.tensor([1.0, 0.0]))
     for field_name in DPTD_CURRENT_MEMORY_FIELDS:
         assert not updated.has(field_name), field_name
-    for field_name in ["dptd_semantic_proto", "dptd_visual_memory", "dptd_semantic_conf", "dptd_semantic_entropy", "dptd_topk_class_scores"]:
+    for field_name in [
+        "dptd_semantic_proto",
+        "dptd_visual_memory",
+        "dptd_semantic_conf",
+        "dptd_semantic_entropy",
+        "dptd_topk_class_scores",
+        "dptd_topk_text_embeddings",
+        "dptd_topk_text_scores",
+    ]:
         assert updated.get(field_name).grad_fn is None, field_name
 
 
@@ -509,6 +582,8 @@ def test_dptd_memory_missing_pred_embed_and_selected_class_changes():
     prob = score / score.sum(dim=-1, keepdim=True).clamp_min(1e-6)
     assert tracks._dptd_current_topk_class_indices.tolist() == [[30, 10]]
     assert torch.allclose(tracks._dptd_current_topk_class_scores, prob[:, [0, 1]])
+    assert tracks._dptd_current_topk_text_embeddings.shape == (1, 2, 4)
+    assert torch.allclose(tracks._dptd_current_topk_text_scores, prob[:, [0, 1]])
     tracks = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
     assert tracks.dptd_semantic_proto.shape == (1, 4)
 
@@ -552,15 +627,29 @@ def test_dptd_memory_track_base_new_row_and_instances_cat():
     assert merged.dptd_semantic_proto.shape == (4, 4)
     assert merged.dptd_visual_memory.shape == (4, 4)
     assert merged.dptd_topk_class_indices.shape == (4, 2)
+    assert merged.dptd_topk_text_embeddings.shape == (4, 2, 4)
+    assert merged.dptd_topk_text_scores.shape == (4, 2)
 
 
-def _gate_state(num_queries=5, num_det=3, memory_valid=True, semantic_sign=1.0):
+def _gate_state(
+    num_queries=5,
+    num_det=3,
+    memory_valid=True,
+    semantic_sign=1.0,
+    id_text_topk=5,
+    id_text_dim=256,
+    topk_score=0.9,
+):
     semantic = torch.zeros(num_queries, 4)
     semantic[num_det:] = semantic_sign * torch.tensor([1.0, 0.0, 0.0, 0.0])
     visual = torch.ones(num_queries, 4)
     valid = torch.zeros(num_queries, dtype=torch.bool)
     if memory_valid:
         valid[num_det:] = True
+    topk_text = torch.randn(num_queries, id_text_topk, id_text_dim)
+    topk_scores = torch.zeros(num_queries, id_text_topk)
+    if memory_valid:
+        topk_scores[num_det:] = float(topk_score)
     return {
         "semantic_proto": semantic,
         "visual_memory": visual,
@@ -570,6 +659,8 @@ def _gate_state(num_queries=5, num_det=3, memory_valid=True, semantic_sign=1.0):
         "obj_idxes": torch.tensor([-1, -1, -1, 10, 11], dtype=torch.long)[:num_queries],
         "memory_valid": valid,
         "text_memory_embeddings": torch.eye(4)[:1],
+        "topk_text_embeddings": topk_text,
+        "topk_text_scores": topk_scores,
     }
 
 
@@ -704,6 +795,146 @@ def test_dptd_duplicate_obj_idx_guard():
     tracks = _make_suppression_tracks()
     tracks.obj_idxes = torch.tensor([10, 10, -1], dtype=torch.long)
     _assert_raises(RuntimeError, lambda: OVTR._snapshot_dptd_update_suppression_state(model, tracks))
+
+
+
+def test_dptd_topk_text_memory_fields_and_padding():
+    model = _make_memory_model(topk=1, id_text_topk=3, text_dim=4)
+    tracks = _make_memory_tracks(num_tracks=1, obj_idxes=[10])
+    OVTR._ensure_dptd_memory_fields(model, tracks)
+    assert tracks.dptd_topk_class_indices.shape == (1, 1)
+    assert tracks.dptd_topk_text_embeddings.shape == (1, 3, 4)
+    snapshot = OVTR._snapshot_dptd_memory_state(model, tracks)
+    logits = torch.tensor([[3.0, 1.0]])
+    frame_res = _attach_memory_candidates(
+        model,
+        tracks,
+        logits,
+        [30, 10],
+        pred_embed=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        id_text_embeddings=torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
+    )
+    assert "dptd_id_text_memory_embeddings" not in frame_res
+    assert tracks._dptd_current_topk_class_indices.shape == (1, 1)
+    assert tracks._dptd_current_topk_text_embeddings.shape == (1, 3, 4)
+    assert torch.allclose(tracks._dptd_current_topk_text_embeddings[0, 2], torch.zeros(4))
+    assert torch.allclose(tracks._dptd_current_topk_text_scores[0, 2], torch.tensor(0.0))
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    assert updated.dptd_topk_class_indices.shape == (1, 1)
+    assert updated.dptd_topk_text_embeddings.shape == (1, 3, 4)
+    assert updated.dptd_topk_text_scores.shape == (1, 3)
+
+
+def test_dptd_topk_text_dim_and_cat_mismatch_guards():
+    model = _make_memory_model(topk=2, id_text_topk=2, text_dim=4)
+    tracks = _make_memory_tracks(num_tracks=1, obj_idxes=[10])
+    OVTR._ensure_dptd_memory_fields(model, tracks)
+    _assert_raises(
+        RuntimeError,
+        lambda: _attach_memory_candidates(
+            model,
+            tracks,
+            torch.tensor([[1.0, 2.0]]),
+            [1, 2],
+            pred_embed=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            id_text_embeddings=torch.randn(2, 5),
+        ),
+    )
+
+    init_tracks = _make_memory_tracks(num_tracks=1, obj_idxes=[-1])
+    active_tracks = _make_memory_tracks(num_tracks=1, obj_idxes=[10])
+    OVTR._ensure_dptd_memory_fields(model, init_tracks)
+    OVTR._ensure_dptd_memory_fields(model, active_tracks)
+    init_tracks.dptd_topk_text_embeddings = torch.zeros(1, 3, 4)
+    _assert_raises(RuntimeError, lambda: OVTR._validate_dptd_topk_text_cat_shapes(model, init_tracks, active_tracks))
+
+
+def test_dptd_topk_text_adapter_zero_init_masks_and_track_only():
+    decoder = _make_decoder(
+        use_ov_dptd=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        ov_dptd_id_path_text="topk_memory",
+        dptd_id_text_topk=2,
+        dptd_id_text_num_heads=4,
+        dptd_id_text_feature_dim=256,
+    )
+    id_ofa = torch.randn(5, 1, 256)
+    state = _gate_state(num_queries=5, num_det=3, id_text_topk=2, id_text_dim=256)
+    debug = {}
+    enhanced = decoder._apply_dptd_id_text_memory(0, id_ofa, state, 3, debug=debug)
+    assert torch.allclose(enhanced, id_ofa, atol=1e-6)
+    assert debug["dptd_id_text_applied_count"] == 2
+
+    decoder._reset_linear_identity(decoder.ov_dptd_id_text_out_proj[0])
+    debug = {}
+    enhanced = decoder._apply_dptd_id_text_memory(0, id_ofa, state, 3, debug=debug)
+    assert torch.allclose(enhanced[:3], id_ofa[:3], atol=1e-6)
+    assert not torch.allclose(enhanced[3:], id_ofa[3:])
+
+    no_memory_debug = {}
+    no_memory = decoder._apply_dptd_id_text_memory(
+        0,
+        id_ofa,
+        _gate_state(num_queries=5, num_det=3, memory_valid=False, id_text_topk=2, id_text_dim=256),
+        3,
+        debug=no_memory_debug,
+    )
+    assert torch.allclose(no_memory, id_ofa, atol=1e-6)
+    assert no_memory_debug["dptd_id_text_skipped_no_memory_count"] == 2
+
+    no_topk_debug = {}
+    no_topk = decoder._apply_dptd_id_text_memory(
+        0,
+        id_ofa,
+        _gate_state(num_queries=5, num_det=3, id_text_topk=2, id_text_dim=256, topk_score=0.0),
+        3,
+        debug=no_topk_debug,
+    )
+    assert torch.allclose(no_topk, id_ofa, atol=1e-6)
+    assert no_topk_debug["dptd_id_text_skipped_no_topk_count"] == 2
+
+    bad_state = _gate_state(num_queries=5, num_det=3, id_text_topk=2, id_text_dim=128)
+    _assert_raises(RuntimeError, lambda: decoder._apply_dptd_id_text_memory(0, id_ofa, bad_state, 3, debug={}))
+
+
+def test_dptd_topk_text_initial_forward_equivalence_and_grad():
+    torch.manual_seed(2)
+    decoder = _make_decoder(
+        use_ov_dptd=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        ov_dptd_id_path_text="topk_memory",
+        dptd_id_text_topk=2,
+        dptd_id_text_num_heads=4,
+        dptd_id_text_feature_dim=256,
+    )
+    assert float(decoder.ov_dptd_gate_alpha.detach()) == 0.0
+    assert float(decoder.ov_dptd_ofa_id_proj[0].weight.detach().norm()) > 0.0
+    for proj in decoder.ov_dptd_id_text_out_proj:
+        assert float(proj.weight.detach().norm()) == 0.0
+        assert float(proj.bias.detach().norm()) == 0.0
+
+    decoder.train()
+    decoder.ov_dptd_gate_alpha.data.fill_(1.0)
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3, semantic_sign=-1.0, id_text_topk=2, id_text_dim=256),
+    )
+    loss = out[1][..., 3:, :].pow(2).mean()
+    decoder.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = sum(
+        float(proj.weight.grad.detach().norm().item())
+        for proj in decoder.ov_dptd_id_text_out_proj
+        if proj.weight.grad is not None
+    )
+    assert grad_norm > 0.0
+    assert out[-1]["debug"]["dptd_id_text_applied_count"] > 0
 
 
 def test_dptd_trainability_and_optimizer_membership():
@@ -873,6 +1104,10 @@ def main():
     test_dptd_semantic_update_suppression_and_visual_consistency_order()
     test_dptd_gate_attach_detaches_frame_state()
     test_dptd_duplicate_obj_idx_guard()
+    test_dptd_topk_text_memory_fields_and_padding()
+    test_dptd_topk_text_dim_and_cat_mismatch_guards()
+    test_dptd_topk_text_adapter_zero_init_masks_and_track_only()
+    test_dptd_topk_text_initial_forward_equivalence_and_grad()
     test_dptd_trainability_and_optimizer_membership()
     test_dptd_semantic_gate_init_not_dead_and_second_step_grad()
     test_dptd_semantic_gate_initial_forward_equivalence()

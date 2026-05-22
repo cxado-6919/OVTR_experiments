@@ -63,6 +63,13 @@ OV_DPTD_OPTION_DEFAULTS = {
     'dptd_memory_allow_untrained_visual_projection': False,
     'dptd_memory_store_topk': 5,
     'dptd_memory_debug': False,
+    'dptd_id_text_topk': 5,
+    'dptd_id_text_num_heads': 4,
+    'dptd_id_text_dropout': 0.0,
+    'dptd_id_text_out_zero_init': True,
+    'dptd_id_text_score_eps': 1e-8,
+    'dptd_id_text_debug': False,
+    'dptd_store_topk_text_embeddings': True,
     'use_dptd_semantic_gate': False,
     'dptd_gate_mode': 'heuristic',
     'dptd_gate_min_score': 0.3,
@@ -89,6 +96,8 @@ DPTD_MEMORY_FIELDS = (
     'dptd_memory_age',
     'dptd_topk_class_indices',
     'dptd_topk_class_scores',
+    'dptd_topk_text_embeddings',
+    'dptd_topk_text_scores',
 )
 
 DPTD_CURRENT_MEMORY_FIELDS = (
@@ -98,6 +107,8 @@ DPTD_CURRENT_MEMORY_FIELDS = (
     '_dptd_current_semantic_entropy',
     '_dptd_current_topk_class_indices',
     '_dptd_current_topk_class_scores',
+    '_dptd_current_topk_text_embeddings',
+    '_dptd_current_topk_text_scores',
 )
 
 DPTD_TEMP_FIELDS = DPTD_CURRENT_MEMORY_FIELDS + (
@@ -132,6 +143,40 @@ def _validate_dptd_memory_options(container):
         raise RuntimeError('dptd_memory_max_entropy must be in [0, 1].')
     if int(getattr(container, 'dptd_memory_store_topk', 5)) < 1:
         raise RuntimeError('dptd_memory_store_topk must be >= 1.')
+
+
+
+def _validate_dptd_id_text_options(container):
+    mode = getattr(container, 'ov_dptd_id_path_text', 'none')
+    if mode not in ('none', 'topk_memory'):
+        raise NotImplementedError("OV-DPTD v5 supports ov_dptd_id_path_text in {'none', 'topk_memory'}.")
+    topk = int(getattr(container, 'dptd_id_text_topk', 5))
+    if topk < 1:
+        raise RuntimeError('dptd_id_text_topk must be >= 1.')
+    num_heads = int(getattr(container, 'dptd_id_text_num_heads', 4))
+    if num_heads < 1:
+        raise RuntimeError('dptd_id_text_num_heads must be >= 1.')
+    hidden_dim = getattr(container, 'hidden_dim', None)
+    if hidden_dim is not None and int(hidden_dim) % num_heads != 0:
+        raise RuntimeError('hidden_dim must be divisible by dptd_id_text_num_heads.')
+    dropout = float(getattr(container, 'dptd_id_text_dropout', 0.0))
+    if dropout < 0.0 or dropout >= 1.0:
+        raise RuntimeError('dptd_id_text_dropout must satisfy 0 <= dropout < 1.')
+    score_eps = float(getattr(container, 'dptd_id_text_score_eps', 1e-8))
+    if score_eps < 0.0:
+        raise RuntimeError('dptd_id_text_score_eps must be >= 0.')
+    if mode == 'none':
+        return
+    if not getattr(container, 'use_ov_dptd', False):
+        raise RuntimeError("ov_dptd_id_path_text='topk_memory' requires use_ov_dptd=True.")
+    if not getattr(container, 'use_dptd_semantic_memory', False):
+        raise RuntimeError("ov_dptd_id_path_text='topk_memory' requires use_dptd_semantic_memory=True.")
+    if not getattr(container, 'use_dptd_semantic_gate', False):
+        raise RuntimeError("ov_dptd_id_path_text='topk_memory' requires use_dptd_semantic_gate=True.")
+    if getattr(container, 'ov_dptd_fusion', 'linear_sum') != 'semantic_gate':
+        raise RuntimeError("OV-DPTD v5 topk_memory requires ov_dptd_fusion='semantic_gate'.")
+    if not getattr(container, 'dptd_store_topk_text_embeddings', True):
+        raise RuntimeError("ov_dptd_id_path_text='topk_memory' requires dptd_store_topk_text_embeddings=True.")
 
 
 def _validate_dptd_gate_options(container):
@@ -196,6 +241,8 @@ def resolve_ov_dptd_options(args, cfg):
             value = getattr(cfg, name, default)
         setattr(args, name, value)
         setattr(cfg, name, value)
+    if not hasattr(args, 'hidden_dim') and hasattr(cfg, 'hidden_dim'):
+        setattr(args, 'hidden_dim', getattr(cfg, 'hidden_dim'))
 
     if getattr(args, 'use_dptd_update_suppression', False) and not getattr(args, 'use_ov_dptd', False):
         raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
@@ -206,6 +253,7 @@ def resolve_ov_dptd_options(args, cfg):
         raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
     _validate_dptd_memory_options(args)
     _validate_dptd_gate_options(args)
+    _validate_dptd_id_text_options(args)
 
     if not getattr(args, 'use_ov_dptd', False):
         return
@@ -218,8 +266,8 @@ def resolve_ov_dptd_options(args, cfg):
         raise RuntimeError('OV-DPTD v1 does not support --quant_deploy int_msda.')
     if getattr(args, 'ov_dptd_fusion', 'linear_sum') not in ('linear_sum', 'semantic_gate'):
         raise NotImplementedError("OV-DPTD supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
-    if getattr(args, 'ov_dptd_id_path_text', 'none') != 'none':
-        raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+    if getattr(args, 'ov_dptd_id_path_text', 'none') not in ('none', 'topk_memory'):
+        raise NotImplementedError("OV-DPTD v5 supports ov_dptd_id_path_text in {'none', 'topk_memory'}.")
     init_mode = getattr(args, 'ov_dptd_semantic_gate_id_proj_init', 'small_random')
     if init_mode not in ('small_random', 'zero'):
         raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
@@ -761,6 +809,13 @@ class OVTR(nn.Module):
                     dptd_memory_allow_untrained_visual_projection=False,
                     dptd_memory_store_topk=5,
                     dptd_memory_debug=False,
+                    dptd_id_text_topk=5,
+                    dptd_id_text_num_heads=4,
+                    dptd_id_text_dropout=0.0,
+                    dptd_id_text_out_zero_init=True,
+                    dptd_id_text_score_eps=1e-8,
+                    dptd_id_text_debug=False,
+                    dptd_store_topk_text_embeddings=True,
                     use_dptd_semantic_gate=False,
                     dptd_gate_mode='heuristic',
                     dptd_gate_min_score=0.3,
@@ -901,6 +956,13 @@ class OVTR(nn.Module):
         self.dptd_memory_allow_untrained_visual_projection = dptd_memory_allow_untrained_visual_projection
         self.dptd_memory_store_topk = int(dptd_memory_store_topk)
         self.dptd_memory_debug = dptd_memory_debug
+        self.dptd_id_text_topk = int(dptd_id_text_topk)
+        self.dptd_id_text_num_heads = int(dptd_id_text_num_heads)
+        self.dptd_id_text_dropout = float(dptd_id_text_dropout)
+        self.dptd_id_text_out_zero_init = bool(dptd_id_text_out_zero_init)
+        self.dptd_id_text_score_eps = float(dptd_id_text_score_eps)
+        self.dptd_id_text_debug = dptd_id_text_debug
+        self.dptd_store_topk_text_embeddings = bool(dptd_store_topk_text_embeddings)
         self.use_dptd_semantic_gate = use_dptd_semantic_gate
         self.dptd_gate_mode = dptd_gate_mode
         self.dptd_gate_min_score = dptd_gate_min_score
@@ -915,6 +977,7 @@ class OVTR(nn.Module):
         self.use_dptd_semantic_update_suppression = use_dptd_semantic_update_suppression
         self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
         self.dptd_memory_dim = int(self.text_embeddings.shape[0])
+        self.dptd_id_text_feature_dim = int(getattr(self.transformer.decoder, 'dptd_id_text_feature_dim', hidden_dim))
         self.dptd_visual_memory_proj = None
         if self.use_dptd_semantic_memory and self.dptd_memory_allow_untrained_visual_projection:
             self.dptd_visual_memory_proj = nn.Linear(hidden_dim, self.dptd_memory_dim)
@@ -928,6 +991,7 @@ class OVTR(nn.Module):
             raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
         _validate_dptd_memory_options(self)
         _validate_dptd_gate_options(self)
+        _validate_dptd_id_text_options(self)
         self.supports_mot_batch = (
             (not use_checkpoint)
             and (len(self.transformer.encoder.fusion_layers) == 0)
@@ -973,11 +1037,17 @@ class OVTR(nn.Module):
             'ov_dptd_id_proj_weight_norm': 0.0,
             'ov_dptd_id_proj_grad_norm': 0.0,
             'ov_dptd_id_proj_init_mode': 'none',
+            'dptd_id_text_applied_count': 0,
+            'dptd_id_text_skipped_no_memory_count': 0,
+            'dptd_id_text_skipped_no_topk_count': 0,
+            'dptd_id_text_residual_norm_mean': 0.0,
+            'dptd_id_text_residual_norm_max': 0.0,
         } if self.use_ov_dptd and (
             self.ov_dptd_store_debug
             or self.use_dptd_update_suppression
             or self.dptd_memory_debug
             or self.dptd_gate_debug
+            or self.dptd_id_text_debug
         ) else {}
 
     def _dptd_offset_shape(self, num_queries):
@@ -1230,6 +1300,12 @@ class OVTR(nn.Module):
         _needs_tensor('dptd_memory_age', (num_tracks,), torch.long)
         _needs_tensor('dptd_topk_class_indices', (num_tracks, topk), torch.long)
         _needs_tensor('dptd_topk_class_scores', (num_tracks, topk), torch.float32)
+        if getattr(self, 'dptd_store_topk_text_embeddings', True):
+            text_dim = getattr(self, 'dptd_id_text_feature_dim', None)
+            if text_dim is not None:
+                text_topk = int(getattr(self, 'dptd_id_text_topk', topk))
+                _needs_tensor('dptd_topk_text_embeddings', (num_tracks, text_topk, int(text_dim)), dtype)
+                _needs_tensor('dptd_topk_text_scores', (num_tracks, text_topk), torch.float32)
         return track_instances
 
     def _snapshot_dptd_memory_state(self, track_instances):
@@ -1250,6 +1326,31 @@ class OVTR(nn.Module):
                 snapshot['fields'][field_name] = value[valid_mask].detach().clone()
         return snapshot
 
+    def _dptd_required_current_memory_fields(self):
+        fields = list(DPTD_CURRENT_MEMORY_FIELDS)
+        if not getattr(self, 'dptd_store_topk_text_embeddings', True):
+            fields = [
+                name for name in fields
+                if name not in ('_dptd_current_topk_text_embeddings', '_dptd_current_topk_text_scores')
+            ]
+        return fields
+
+    def _validate_dptd_topk_text_cat_shapes(self, init_track_instances, track_instances):
+        if not (self.use_dptd_semantic_memory and getattr(self, 'dptd_store_topk_text_embeddings', True)):
+            return
+        for field_name in ('dptd_topk_text_embeddings', 'dptd_topk_text_scores'):
+            if not init_track_instances.has(field_name) or not track_instances.has(field_name):
+                raise RuntimeError(f'DPTD top-k text field missing before Instances.cat: {field_name}.')
+            init_value = init_track_instances.get(field_name)
+            active_value = track_instances.get(field_name)
+            if not isinstance(init_value, torch.Tensor) or not isinstance(active_value, torch.Tensor):
+                raise RuntimeError(f'DPTD top-k text field must be tensor before Instances.cat: {field_name}.')
+            if tuple(init_value.shape[1:]) != tuple(active_value.shape[1:]):
+                raise RuntimeError(
+                    f'DPTD top-k text field shape mismatch before Instances.cat for {field_name}: '
+                    f'{tuple(init_value.shape)} vs {tuple(active_value.shape)}'
+                )
+
     def _make_dptd_gate_state(self, track_instances, text_memory_embeddings):
         if not self.use_dptd_semantic_gate:
             return None
@@ -1261,7 +1362,7 @@ class OVTR(nn.Module):
             & (semantic.float().norm(dim=-1) > 1e-6)
             & (visual.float().norm(dim=-1) > 1e-6)
         )
-        return {
+        state = {
             'semantic_proto': semantic,
             'visual_memory': visual,
             'memory_age': track_instances.dptd_memory_age.detach(),
@@ -1271,6 +1372,12 @@ class OVTR(nn.Module):
             'memory_valid': memory_valid.detach(),
             'text_memory_embeddings': text_memory_embeddings.detach() if text_memory_embeddings is not None else None,
         }
+        if getattr(self, 'ov_dptd_id_path_text', 'none') == 'topk_memory':
+            if not track_instances.has('dptd_topk_text_embeddings') or not track_instances.has('dptd_topk_text_scores'):
+                raise RuntimeError('DPTD top-k text memory requires dptd_topk_text_embeddings and dptd_topk_text_scores.')
+            state['topk_text_embeddings'] = track_instances.dptd_topk_text_embeddings.detach()
+            state['topk_text_scores'] = track_instances.dptd_topk_text_scores.detach()
+        return state
 
     def _normalize_dptd_gate_vector(self, value, field_name, track_instances, dtype=None, default=None):
         if value is None:
@@ -1399,6 +1506,7 @@ class OVTR(nn.Module):
         text_embeddings = frame_res.pop('dptd_text_memory_embeddings', None)
         if text_embeddings is None:
             raise RuntimeError('DPTD semantic memory requires frame_res["dptd_text_memory_embeddings"].')
+        id_text_embeddings = frame_res.pop('dptd_id_text_memory_embeddings', None)
         select_id = frame_res['select_id']
         if not isinstance(select_id, torch.Tensor):
             select_id = torch.as_tensor(select_id, device=track_instances.pred_logits.device, dtype=torch.long)
@@ -1440,13 +1548,52 @@ class OVTR(nn.Module):
             ], dim=-1)
 
         target_dtype = track_instances.query_tgt.dtype if track_instances.has('query_tgt') else semantic_proto.dtype
-        return {
+        result = {
             '_dptd_current_semantic_proto': semantic_proto.to(dtype=target_dtype).detach(),
             '_dptd_current_semantic_conf': semantic_conf.to(dtype=torch.float32).detach(),
             '_dptd_current_semantic_entropy': entropy.to(dtype=torch.float32).detach(),
             '_dptd_current_topk_class_indices': topk_indices.to(dtype=torch.long).detach(),
             '_dptd_current_topk_class_scores': topk_scores.to(dtype=torch.float32).detach(),
         }
+        if getattr(self, 'dptd_store_topk_text_embeddings', True):
+            if id_text_embeddings is None:
+                raise RuntimeError('DPTD top-k text memory requires frame_res["dptd_id_text_memory_embeddings"].')
+            if id_text_embeddings.dim() != 2:
+                raise RuntimeError('DPTD top-k text embeddings must have shape [num_selected_classes, text_dim].')
+            if id_text_embeddings.shape[0] < num_cls:
+                raise RuntimeError(
+                    'DPTD top-k text embeddings shorter than selected classes: '
+                    f'{id_text_embeddings.shape[0]} < {num_cls}'
+                )
+            expected_text_dim = int(getattr(self, 'dptd_id_text_feature_dim', id_text_embeddings.shape[-1]))
+            if int(id_text_embeddings.shape[-1]) != expected_text_dim:
+                raise RuntimeError(
+                    'DPTD top-k text embedding dim mismatch: '
+                    f'{id_text_embeddings.shape[-1]} != {expected_text_dim}'
+                )
+            id_text_embeddings = id_text_embeddings.to(device=prob.device, dtype=prob.dtype)
+            text_topk = int(getattr(self, 'dptd_id_text_topk', self.dptd_memory_store_topk))
+            actual_text_topk = min(text_topk, num_cls)
+            _, text_topk_local = torch.topk(prob, k=actual_text_topk, dim=-1)
+            topk_text_embeddings = id_text_embeddings[text_topk_local]
+            topk_text_scores = torch.gather(prob, dim=-1, index=text_topk_local)
+            if actual_text_topk < text_topk:
+                pad_shape = (len(track_instances), text_topk - actual_text_topk)
+                topk_text_embeddings = torch.cat([
+                    topk_text_embeddings,
+                    torch.zeros(
+                        pad_shape + (expected_text_dim,),
+                        device=topk_text_embeddings.device,
+                        dtype=topk_text_embeddings.dtype,
+                    ),
+                ], dim=1)
+                topk_text_scores = torch.cat([
+                    topk_text_scores,
+                    torch.zeros(pad_shape, device=topk_text_scores.device, dtype=topk_text_scores.dtype),
+                ], dim=-1)
+            result['_dptd_current_topk_text_embeddings'] = topk_text_embeddings.to(dtype=target_dtype).detach()
+            result['_dptd_current_topk_text_scores'] = topk_text_scores.to(dtype=torch.float32).detach()
+        return result
 
     def _compute_dptd_visual_memory_candidates(self, frame_res, track_instances):
         visual_source = 'alignment_feature'
@@ -1524,7 +1671,7 @@ class OVTR(nn.Module):
             self._validate_dptd_track_instance_unique_ids(track_instances, 'memory update')
             if memory_snapshot is not None:
                 self._validate_dptd_unique_obj_ids(memory_snapshot.get('ids'), 'memory update snapshot ids')
-            missing = [name for name in DPTD_CURRENT_MEMORY_FIELDS if not track_instances.has(name)]
+            missing = [name for name in self._dptd_required_current_memory_fields() if not track_instances.has(name)]
             if missing:
                 raise RuntimeError(f'DPTD memory candidate fields missing: {missing}')
 
@@ -1555,6 +1702,13 @@ class OVTR(nn.Module):
             current_entropy = track_instances.get('_dptd_current_semantic_entropy')
             current_topk_indices = track_instances.get('_dptd_current_topk_class_indices')
             current_topk_scores = track_instances.get('_dptd_current_topk_class_scores')
+            store_text_topk = bool(getattr(self, 'dptd_store_topk_text_embeddings', True))
+            current_topk_text_embeddings = (
+                track_instances.get('_dptd_current_topk_text_embeddings') if store_text_topk else None
+            )
+            current_topk_text_scores = (
+                track_instances.get('_dptd_current_topk_text_scores') if store_text_topk else None
+            )
 
             for row_idx in range(len(track_instances)):
                 if not track_instances.has('obj_idxes'):
@@ -1597,6 +1751,22 @@ class OVTR(nn.Module):
                     if has_old and 'dptd_topk_class_indices' in snapshot_fields
                     else track_instances.dptd_topk_class_indices[row_idx]
                 )
+                old_topk_text_embeddings = (
+                    snapshot_fields['dptd_topk_text_embeddings'][old_idx].to(
+                        device=track_instances.dptd_topk_text_embeddings.device,
+                        dtype=track_instances.dptd_topk_text_embeddings.dtype,
+                    )
+                    if store_text_topk and has_old and 'dptd_topk_text_embeddings' in snapshot_fields
+                    else (track_instances.dptd_topk_text_embeddings[row_idx] if store_text_topk else None)
+                )
+                old_topk_text_scores = (
+                    snapshot_fields['dptd_topk_text_scores'][old_idx].to(
+                        device=track_instances.dptd_topk_text_scores.device,
+                        dtype=track_instances.dptd_topk_text_scores.dtype,
+                    )
+                    if store_text_topk and has_old and 'dptd_topk_text_scores' in snapshot_fields
+                    else (track_instances.dptd_topk_text_scores[row_idx] if store_text_topk else None)
+                )
 
                 is_new = (
                     not has_old
@@ -1629,6 +1799,9 @@ class OVTR(nn.Module):
                             device=track_instances.dptd_topk_class_scores.device,
                             dtype=track_instances.dptd_topk_class_scores.dtype,
                         )
+                    if store_text_topk:
+                        track_instances.dptd_topk_text_embeddings[row_idx] = old_topk_text_embeddings
+                        track_instances.dptd_topk_text_scores[row_idx] = old_topk_text_scores
                     track_instances.dptd_memory_age[row_idx] = old_age + 1
                     keep_count += 1
                     continue
@@ -1640,6 +1813,9 @@ class OVTR(nn.Module):
                     track_instances.dptd_semantic_entropy[row_idx] = current_entropy[row_idx]
                     track_instances.dptd_topk_class_indices[row_idx] = current_topk_indices[row_idx]
                     track_instances.dptd_topk_class_scores[row_idx] = current_topk_scores[row_idx]
+                    if store_text_topk:
+                        track_instances.dptd_topk_text_embeddings[row_idx] = current_topk_text_embeddings[row_idx]
+                        track_instances.dptd_topk_text_scores[row_idx] = current_topk_text_scores[row_idx]
                     track_instances.dptd_memory_age[row_idx] = 0
                     init_count += 1
                     continue
@@ -1661,6 +1837,9 @@ class OVTR(nn.Module):
                     track_instances.dptd_semantic_entropy[row_idx] = current_entropy[row_idx]
                     track_instances.dptd_topk_class_indices[row_idx] = current_topk_indices[row_idx]
                     track_instances.dptd_topk_class_scores[row_idx] = current_topk_scores[row_idx]
+                    if store_text_topk:
+                        track_instances.dptd_topk_text_embeddings[row_idx] = current_topk_text_embeddings[row_idx]
+                        track_instances.dptd_topk_text_scores[row_idx] = current_topk_text_scores[row_idx]
                     track_instances.dptd_memory_age[row_idx] = 0
                     cosine_delta = 1.0 - F.cosine_similarity(
                         old_semantic.float().unsqueeze(0),
@@ -1692,6 +1871,9 @@ class OVTR(nn.Module):
                             device=track_instances.dptd_topk_class_scores.device,
                             dtype=track_instances.dptd_topk_class_scores.dtype,
                         )
+                    if store_text_topk:
+                        track_instances.dptd_topk_text_embeddings[row_idx] = old_topk_text_embeddings
+                        track_instances.dptd_topk_text_scores[row_idx] = old_topk_text_scores
                     track_instances.dptd_memory_age[row_idx] = old_age + 1
                     keep_count += 1
 
@@ -1994,14 +2176,19 @@ class OVTR(nn.Module):
             select_id, extra_labels = self.select_id, None
 
         # Prepare queries and embeddings for alignment
-        text_query = self.text_embeddings[:, select_id].to(masks[0].device).t()
-        dptd_text_memory_embeddings = text_query.detach() if self.use_dptd_semantic_memory else None
+        raw_text_query = self.text_embeddings[:, select_id].to(masks[0].device).t()
+        dptd_text_memory_embeddings = raw_text_query.detach() if self.use_dptd_semantic_memory else None
         image_align = self.image_embeddings[:, select_id].to(masks[0].device).t()
         
         image_feat_ori = (image_align.float()).detach()
 
         dtype = self.patch2query.weight.dtype
-        text_query = self.patch2query(text_query.type(dtype))
+        text_query = self.patch2query(raw_text_query.type(dtype))
+        dptd_id_text_memory_embeddings = (
+            text_query.detach()
+            if self.use_dptd_semantic_memory and getattr(self, 'dptd_store_topk_text_embeddings', True)
+            else None
+        )
         select_id = torch.tensor(select_id).to(text_query.device)
         text_dict = preprocess_for_masks(srcs[0].shape[0], select_id, text_query)
 
@@ -2066,6 +2253,8 @@ class OVTR(nn.Module):
             }
         if self.use_dptd_semantic_memory:
             out['dptd_text_memory_embeddings'] = dptd_text_memory_embeddings
+            if getattr(self, 'dptd_store_topk_text_embeddings', True):
+                out['dptd_id_text_memory_embeddings'] = dptd_id_text_memory_embeddings
         if self.use_ov_dptd:
             if dptd_info is None or dptd_info.get('sampling_offsets') is None:
                 raise RuntimeError('OV-DPTD decoder did not return final sampling offsets.')
@@ -2136,6 +2325,7 @@ class OVTR(nn.Module):
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks(cls_pad_len=track_instances.pred_logits.shape[1])
         tmp['track_instances'] = track_instances
+        self._validate_dptd_topk_text_cat_shapes(tmp['init_track_instances'], track_instances)
 
         if not is_last:
             out_track_instances = self.track_embed(tmp)
@@ -2372,6 +2562,13 @@ def build(args, cfg):
         dptd_memory_allow_untrained_visual_projection=args.dptd_memory_allow_untrained_visual_projection,
         dptd_memory_store_topk=args.dptd_memory_store_topk,
         dptd_memory_debug=args.dptd_memory_debug,
+        dptd_id_text_topk=args.dptd_id_text_topk,
+        dptd_id_text_num_heads=args.dptd_id_text_num_heads,
+        dptd_id_text_dropout=args.dptd_id_text_dropout,
+        dptd_id_text_out_zero_init=args.dptd_id_text_out_zero_init,
+        dptd_id_text_score_eps=args.dptd_id_text_score_eps,
+        dptd_id_text_debug=args.dptd_id_text_debug,
+        dptd_store_topk_text_embeddings=args.dptd_store_topk_text_embeddings,
         use_dptd_semantic_gate=args.use_dptd_semantic_gate,
         dptd_gate_mode=args.dptd_gate_mode,
         dptd_gate_min_score=args.dptd_gate_min_score,

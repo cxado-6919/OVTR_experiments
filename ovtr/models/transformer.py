@@ -69,6 +69,14 @@ class Transformer(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        dptd_id_text_topk=5,
+        dptd_id_text_num_heads=4,
+        dptd_id_text_dropout=0.0,
+        dptd_id_text_out_zero_init=True,
+        dptd_id_text_score_eps=1e-8,
+        dptd_id_text_debug=False,
+        dptd_store_topk_text_embeddings=True,
+        dptd_id_text_feature_dim=None,
         use_dptd_semantic_gate=False,
         dptd_gate_mode="heuristic",
         dptd_gate_min_score=0.3,
@@ -158,6 +166,14 @@ class Transformer(nn.Module):
             ov_dptd_id_path_text=ov_dptd_id_path_text,
             ov_dptd_fuse_cti=ov_dptd_fuse_cti,
             ov_dptd_store_debug=ov_dptd_store_debug,
+            dptd_id_text_topk=dptd_id_text_topk,
+            dptd_id_text_num_heads=dptd_id_text_num_heads,
+            dptd_id_text_dropout=dptd_id_text_dropout,
+            dptd_id_text_out_zero_init=dptd_id_text_out_zero_init,
+            dptd_id_text_score_eps=dptd_id_text_score_eps,
+            dptd_id_text_debug=dptd_id_text_debug,
+            dptd_store_topk_text_embeddings=dptd_store_topk_text_embeddings,
+            dptd_id_text_feature_dim=text_dim if dptd_id_text_feature_dim is None else dptd_id_text_feature_dim,
             use_dptd_semantic_gate=use_dptd_semantic_gate,
             dptd_gate_mode=dptd_gate_mode,
             dptd_gate_min_score=dptd_gate_min_score,
@@ -639,6 +655,14 @@ class TransformerDecoder(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        dptd_id_text_topk=5,
+        dptd_id_text_num_heads=4,
+        dptd_id_text_dropout=0.0,
+        dptd_id_text_out_zero_init=True,
+        dptd_id_text_score_eps=1e-8,
+        dptd_id_text_debug=False,
+        dptd_store_topk_text_embeddings=True,
+        dptd_id_text_feature_dim=None,
         use_dptd_semantic_gate=False,
         dptd_gate_mode="heuristic",
         dptd_gate_min_score=0.3,
@@ -704,6 +728,14 @@ class TransformerDecoder(nn.Module):
         self.ov_dptd_id_path_text = ov_dptd_id_path_text
         self.ov_dptd_fuse_cti = ov_dptd_fuse_cti
         self.ov_dptd_store_debug = ov_dptd_store_debug
+        self.dptd_id_text_topk = int(dptd_id_text_topk)
+        self.dptd_id_text_num_heads = int(dptd_id_text_num_heads)
+        self.dptd_id_text_dropout = float(dptd_id_text_dropout)
+        self.dptd_id_text_out_zero_init = bool(dptd_id_text_out_zero_init)
+        self.dptd_id_text_score_eps = float(dptd_id_text_score_eps)
+        self.dptd_id_text_debug = dptd_id_text_debug
+        self.dptd_store_topk_text_embeddings = bool(dptd_store_topk_text_embeddings)
+        self.dptd_id_text_feature_dim = int(text_dim if dptd_id_text_feature_dim is None else dptd_id_text_feature_dim)
         self.use_dptd_semantic_gate = use_dptd_semantic_gate
         self.dptd_gate_mode = dptd_gate_mode
         self.dptd_gate_min_score = dptd_gate_min_score
@@ -728,8 +760,25 @@ class TransformerDecoder(nn.Module):
                 raise NotImplementedError("OV-DPTD v4 keeps CTI fusion disabled; ov_dptd_fuse_cti=True is unsupported.")
             if self.use_dptd_semantic_gate and self.dptd_gate_mode != "heuristic":
                 raise NotImplementedError("OV-DPTD v4 only supports dptd_gate_mode='heuristic'.")
-            if self.ov_dptd_id_path_text != "none":
-                raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+            if self.ov_dptd_id_path_text not in ("none", "topk_memory"):
+                raise NotImplementedError("OV-DPTD v5 supports ov_dptd_id_path_text in {'none', 'topk_memory'}.")
+            if self.ov_dptd_id_path_text == "topk_memory":
+                if self.ov_dptd_fusion != "semantic_gate":
+                    raise RuntimeError("OV-DPTD v5 topk_memory requires ov_dptd_fusion='semantic_gate'.")
+                if not self.use_dptd_semantic_gate:
+                    raise RuntimeError("OV-DPTD v5 topk_memory requires use_dptd_semantic_gate=True.")
+                if not self.dptd_store_topk_text_embeddings:
+                    raise RuntimeError("OV-DPTD v5 topk_memory requires dptd_store_topk_text_embeddings=True.")
+            if self.dptd_id_text_topk < 1:
+                raise RuntimeError("dptd_id_text_topk must be >= 1.")
+            if self.dptd_id_text_num_heads < 1:
+                raise RuntimeError("dptd_id_text_num_heads must be >= 1.")
+            if d_model % self.dptd_id_text_num_heads != 0:
+                raise RuntimeError("d_model must be divisible by dptd_id_text_num_heads.")
+            if self.dptd_id_text_dropout < 0.0 or self.dptd_id_text_dropout >= 1.0:
+                raise RuntimeError("dptd_id_text_dropout must satisfy 0 <= dropout < 1.")
+            if self.dptd_id_text_score_eps < 0.0:
+                raise RuntimeError("dptd_id_text_score_eps must be >= 0.")
             if self.ov_dptd_semantic_gate_id_proj_init not in ("small_random", "zero"):
                 raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
             if self.ov_dptd_fusion == "semantic_gate" and self.ov_dptd_semantic_gate_id_proj_init == "small_random" and self.ov_dptd_semantic_gate_id_proj_init_std <= 0.0:
@@ -740,6 +789,16 @@ class TransformerDecoder(nn.Module):
             self.ov_dptd_cti_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_cti_id_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_cti_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            if self.ov_dptd_id_path_text == "topk_memory":
+                self.ov_dptd_id_text_q_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+                self.ov_dptd_id_text_k_proj = nn.ModuleList([nn.Linear(self.dptd_id_text_feature_dim, d_model) for _ in range(num_layers)])
+                self.ov_dptd_id_text_v_proj = nn.ModuleList([nn.Linear(self.dptd_id_text_feature_dim, d_model) for _ in range(num_layers)])
+                self.ov_dptd_id_text_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
+            else:
+                self.ov_dptd_id_text_q_proj = nn.ModuleList()
+                self.ov_dptd_id_text_k_proj = nn.ModuleList()
+                self.ov_dptd_id_text_v_proj = nn.ModuleList()
+                self.ov_dptd_id_text_out_proj = nn.ModuleList()
         else:
             self.ov_dptd_ofa_ada_proj = nn.ModuleList()
             self.ov_dptd_ofa_id_proj = nn.ModuleList()
@@ -747,6 +806,10 @@ class TransformerDecoder(nn.Module):
             self.ov_dptd_cti_ada_proj = nn.ModuleList()
             self.ov_dptd_cti_id_proj = nn.ModuleList()
             self.ov_dptd_cti_out_proj = nn.ModuleList()
+            self.ov_dptd_id_text_q_proj = nn.ModuleList()
+            self.ov_dptd_id_text_k_proj = nn.ModuleList()
+            self.ov_dptd_id_text_v_proj = nn.ModuleList()
+            self.ov_dptd_id_text_out_proj = nn.ModuleList()
 
     @staticmethod
     def _reset_linear_identity(linear):
@@ -782,6 +845,8 @@ class TransformerDecoder(nn.Module):
             self._reset_linear_identity(self.ov_dptd_cti_ada_proj[layer_id])
             self._reset_linear_zero(self.ov_dptd_cti_id_proj[layer_id])
             self._reset_linear_identity(self.ov_dptd_cti_out_proj[layer_id])
+            if self.ov_dptd_id_path_text == "topk_memory" and self.dptd_id_text_out_zero_init:
+                self._reset_linear_zero(self.ov_dptd_id_text_out_proj[layer_id])
 
     def ov_dptd_id_proj_weight_norm(self):
         if not self.use_ov_dptd or len(self.ov_dptd_ofa_id_proj) == 0:
@@ -834,6 +899,11 @@ class TransformerDecoder(nn.Module):
             "ov_dptd_gate_alpha": 0.0,
             "ov_dptd_id_proj_weight_norm": 0.0,
             "ov_dptd_id_proj_init_mode": "none",
+            "dptd_id_text_applied_count": 0,
+            "dptd_id_text_skipped_no_memory_count": 0,
+            "dptd_id_text_skipped_no_topk_count": 0,
+            "dptd_id_text_residual_norm_mean": 0.0,
+            "dptd_id_text_residual_norm_max": 0.0,
         }
 
 
@@ -979,6 +1049,98 @@ class TransformerDecoder(nn.Module):
         return self._semantic_gate_result(tgt, fusion_gate, raw_gate, valid)
 
 
+    def _apply_dptd_id_text_memory(self, layer_id, id_ofa, gate_state, track_start, debug=None):
+        if self.ov_dptd_id_path_text != "topk_memory":
+            return id_ofa
+        if not isinstance(gate_state, dict):
+            if debug is not None:
+                debug["dptd_id_text_skipped_no_memory_count"] = int(debug.get("dptd_id_text_skipped_no_memory_count", 0)) + int(max(id_ofa.shape[0] - track_start, 0) * id_ofa.shape[1])
+            return id_ofa
+
+        bs = id_ofa.shape[1]
+        num_queries = id_ofa.shape[0]
+        topk_text = self._gate_state_tensor(gate_state, 'topk_text_embeddings', id_ofa, expected_dim=4, dtype=id_ofa.dtype)
+        topk_scores = self._gate_state_tensor(gate_state, 'topk_text_scores', id_ofa, expected_dim=3, dtype=id_ofa.dtype)
+        memory_valid = self._gate_state_tensor(gate_state, 'memory_valid', id_ofa, expected_dim=2, dtype=torch.bool)
+        if topk_text is None or topk_scores is None or memory_valid is None:
+            if debug is not None:
+                debug["dptd_id_text_skipped_no_memory_count"] = int(debug.get("dptd_id_text_skipped_no_memory_count", 0)) + int(max(num_queries - track_start, 0) * bs)
+            return id_ofa
+        if topk_text.shape[0] == 1 and bs != 1:
+            topk_text = topk_text.expand(bs, -1, -1, -1)
+        if topk_scores.shape[0] == 1 and bs != 1:
+            topk_scores = topk_scores.expand(bs, -1, -1)
+        if memory_valid.shape[0] == 1 and bs != 1:
+            memory_valid = memory_valid.expand(bs, -1)
+        if topk_text.dim() != 4 or topk_text.shape[:2] != (bs, num_queries):
+            raise RuntimeError(
+                'DPTD top-k text embeddings row mismatch: '
+                f'{tuple(topk_text.shape)} vs expected ({bs}, {num_queries}, topk, text_dim).'
+            )
+        if topk_scores.dim() != 3 or topk_scores.shape[:2] != (bs, num_queries):
+            raise RuntimeError(
+                'DPTD top-k text scores row mismatch: '
+                f'{tuple(topk_scores.shape)} vs expected ({bs}, {num_queries}, topk).'
+            )
+        if memory_valid.shape[:2] != (bs, num_queries):
+            raise RuntimeError('DPTD top-k text memory_valid row mismatch.')
+        if int(topk_text.shape[2]) != int(self.dptd_id_text_topk) or int(topk_scores.shape[2]) != int(self.dptd_id_text_topk):
+            raise RuntimeError(
+                'DPTD top-k text topk mismatch: '
+                f'embeddings={topk_text.shape[2]}, scores={topk_scores.shape[2]}, expected={self.dptd_id_text_topk}.'
+            )
+        if int(topk_text.shape[-1]) != int(self.dptd_id_text_feature_dim):
+            raise RuntimeError(
+                'DPTD top-k text embedding dim mismatch: '
+                f'{topk_text.shape[-1]} != {self.dptd_id_text_feature_dim}'
+            )
+
+        track_mask = torch.zeros(bs, num_queries, device=id_ofa.device, dtype=torch.bool)
+        track_mask[:, track_start:] = True
+        memory_valid = memory_valid.bool() & track_mask
+        token_valid = topk_scores.float() > float(self.dptd_id_text_score_eps)
+        has_topk = token_valid.any(dim=-1)
+        apply_mask = memory_valid & has_topk
+
+        if debug is not None:
+            debug["dptd_id_text_skipped_no_memory_count"] = int(debug.get("dptd_id_text_skipped_no_memory_count", 0)) + int((track_mask & ~memory_valid).detach().sum().item())
+            debug["dptd_id_text_skipped_no_topk_count"] = int(debug.get("dptd_id_text_skipped_no_topk_count", 0)) + int((memory_valid & ~has_topk).detach().sum().item())
+            debug["dptd_id_text_applied_count"] = int(debug.get("dptd_id_text_applied_count", 0)) + int(apply_mask.detach().sum().item())
+        if not apply_mask.any():
+            return id_ofa
+
+        hidden = id_ofa.shape[-1]
+        num_heads = int(self.dptd_id_text_num_heads)
+        head_dim = hidden // num_heads
+        flat_mask = apply_mask.reshape(-1)
+        token_invalid = (~token_valid).reshape(bs * num_queries, self.dptd_id_text_topk)[flat_mask]
+        id_ofa_bq = id_ofa.transpose(0, 1).contiguous()
+        q = self.ov_dptd_id_text_q_proj[layer_id](id_ofa_bq).reshape(bs * num_queries, hidden)[flat_mask]
+        kv_source = topk_text.reshape(bs * num_queries, self.dptd_id_text_topk, self.dptd_id_text_feature_dim)[flat_mask]
+        k = self.ov_dptd_id_text_k_proj[layer_id](kv_source)
+        v = self.ov_dptd_id_text_v_proj[layer_id](kv_source)
+
+        q = q.view(-1, 1, num_heads, head_dim).transpose(1, 2)
+        k = k.view(-1, self.dptd_id_text_topk, num_heads, head_dim).transpose(1, 2)
+        v = v.view(-1, self.dptd_id_text_topk, num_heads, head_dim).transpose(1, 2)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+        attn_logits = attn_logits.masked_fill(token_invalid[:, None, None, :], torch.finfo(attn_logits.dtype).min)
+        attn = torch.softmax(attn_logits.float(), dim=-1).to(dtype=q.dtype)
+        if self.dptd_id_text_dropout > 0.0:
+            attn = F.dropout(attn, p=self.dptd_id_text_dropout, training=self.training)
+        context = torch.matmul(attn, v).transpose(1, 2).reshape(-1, hidden)
+        selected_residual = self.ov_dptd_id_text_out_proj[layer_id](context)
+        residual = torch.zeros(bs * num_queries, hidden, device=id_ofa.device, dtype=id_ofa.dtype)
+        residual[flat_mask] = selected_residual.to(dtype=id_ofa.dtype)
+        residual = residual.view(bs, num_queries, hidden).transpose(0, 1).contiguous()
+        if debug is not None:
+            norms = selected_residual.detach().float().norm(dim=-1)
+            if norms.numel() > 0:
+                debug["dptd_id_text_residual_norm_mean"] = float(norms.mean().item())
+                debug["dptd_id_text_residual_norm_max"] = float(norms.max().item())
+        return id_ofa + residual
+
+
     def _fuse_ov_dptd_ofa_semantic_gate(self, layer_id, ada_ofa, id_ofa, gate):
         id_delta = self.ov_dptd_ofa_id_proj[layer_id](id_ofa)
         correction = (1.0 - gate.transpose(0, 1).unsqueeze(-1).to(dtype=ada_ofa.dtype)) * id_delta
@@ -1113,6 +1275,7 @@ class TransformerDecoder(nn.Module):
             last_gate_values = gate_values
             last_gate_raw_values = gate_info["semantic_gate_raw"]
             last_gate_memory_valid = gate_info["semantic_gate_memory_valid"]
+            id_ofa = self._apply_dptd_id_text_memory(layer_id, id_ofa, dptd_gate_state, track_start, debug=dptd_debug)
             if self.ov_dptd_fusion == "semantic_gate":
                 output_ofa = self._fuse_ov_dptd_ofa_semantic_gate(layer_id, ada_ofa, id_ofa, gate_values)
             else:
@@ -1734,6 +1897,14 @@ def build_transformer(args):
         ov_dptd_id_path_text=getattr(args, "ov_dptd_id_path_text", "none"),
         ov_dptd_fuse_cti=getattr(args, "ov_dptd_fuse_cti", False),
         ov_dptd_store_debug=getattr(args, "ov_dptd_store_debug", False),
+        dptd_id_text_topk=getattr(args, "dptd_id_text_topk", 5),
+        dptd_id_text_num_heads=getattr(args, "dptd_id_text_num_heads", 4),
+        dptd_id_text_dropout=getattr(args, "dptd_id_text_dropout", 0.0),
+        dptd_id_text_out_zero_init=getattr(args, "dptd_id_text_out_zero_init", True),
+        dptd_id_text_score_eps=getattr(args, "dptd_id_text_score_eps", 1e-8),
+        dptd_id_text_debug=getattr(args, "dptd_id_text_debug", False),
+        dptd_store_topk_text_embeddings=getattr(args, "dptd_store_topk_text_embeddings", True),
+        dptd_id_text_feature_dim=getattr(args, "dptd_id_text_feature_dim", getattr(args, "text_dim", 256)),
         use_dptd_semantic_gate=getattr(args, "use_dptd_semantic_gate", False),
         dptd_gate_mode=getattr(args, "dptd_gate_mode", "heuristic"),
         dptd_gate_min_score=getattr(args, "dptd_gate_min_score", 0.3),

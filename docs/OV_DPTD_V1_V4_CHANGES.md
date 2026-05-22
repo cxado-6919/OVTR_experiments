@@ -1,6 +1,6 @@
-# OV-DPTD v1-v4 변경 사항
+# OV-DPTD v1-v5 변경 사항
 
-이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v4까지의 변경점을 정리합니다.
+이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v5까지의 변경점을 정리합니다.
 
 OV-DPTD는 기본 OVTR/QAT/int_msda/TensorRT 경로를 바꾸지 않는 opt-in 기능입니다. `use_ov_dptd=False`이면 기존 OVTR decoder, tracking update, config 기본 동작이 유지됩니다.
 
@@ -14,7 +14,7 @@ OV-DPTD는 기존 OVTR decoder를 appearance-adaptive path로 유지하고, trac
 - Track query identity: ID path의 track query는 decoder layer를 거치며 갱신된 query가 아니라 frame decode 진입 시점의 initial track query를 고정해서 사용합니다.
 - Classification/category isolation: 항상 AD CTI output 기준입니다.
 - Box/feature alignment/CIP 입력: DPTD가 켜진 경우 fused OFA output 기준입니다.
-- CTI fusion: v4까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
+- CTI fusion: v5까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
 
 ## v1: Dual-Path Temporal Decoder
 
@@ -191,6 +191,66 @@ alpha가 0이므로 initial forward는 baseline과 동일하게 시작하지만,
 
 기존 dead v4 checkpoint는 load 직후 감지합니다. 기본은 warning만 출력하고 checkpoint 값을 보존합니다. `ov_dptd_reinit_dead_semantic_gate_id_proj=True`일 때만 dead ID projection을 small-random으로 재초기화합니다.
 
+## v5: Top-k Text Memory Interaction
+
+v5는 identity-preserving path에 track별 top-k text memory interaction을 추가했습니다. 이 기능은 ID path 보조용이며 AD CTI/classification path를 직접 바꾸지 않습니다.
+
+### 사용 조건
+
+`ov_dptd_id_path_text="topk_memory"`는 v5에서 다음 조합에서만 허용됩니다.
+
+- `use_ov_dptd=True`
+- `use_dptd_semantic_memory=True`
+- `use_dptd_semantic_gate=True`
+- `ov_dptd_fusion="semantic_gate"`
+
+`linear_sum + topk_memory`는 RuntimeError로 막습니다. `linear_sum`에서는 ID projection이 zero-init이므로 text adapter gradient가 dead branch가 될 수 있기 때문입니다.
+
+### 새 long-term field
+
+기존 class top-k field와 별도로 adapter용 text top-k field를 저장합니다.
+
+| Field | Shape | 설명 |
+| --- | --- | --- |
+| `dptd_topk_text_embeddings` | `[num_tracks, dptd_id_text_topk, text_feature_dim]` | decoder CTI가 사용하는 selected text feature 기준 top-k embedding |
+| `dptd_topk_text_scores` | `[num_tracks, dptd_id_text_topk]` | normalized probability `p` 기준 top-k score |
+
+`dptd_memory_store_topk`는 기존 `dptd_topk_class_indices/scores` 전용입니다. v5 text adapter field shape는 `dptd_id_text_topk`만 따르므로 두 값이 달라도 shape mismatch가 나지 않아야 합니다.
+
+Text feature dim은 TransformerDecoder 생성 시점에 `dptd_id_text_feature_dim`으로 고정됩니다. runtime `dptd_topk_text_embeddings.shape[-1]`이 adapter k/v projection input dim과 다르면 RuntimeError를 냅니다. LazyLinear는 사용하지 않습니다.
+
+### Adapter attention
+
+ID text adapter는 각 query가 자기 top-k text token만 attend합니다. selected class 전체 attention이나 query 간 attention은 없습니다.
+
+```python
+q:   [bs * nq, 1, hidden]
+k/v: [bs * nq, topk, hidden]
+key_padding_mask = dptd_topk_text_scores <= dptd_id_text_score_eps
+```
+
+모든 top-k token이 invalid인 query는 MultiheadAttention 계산에 넣지 않고 residual 0으로 skip합니다. detect query, no-memory/new track, `memory_valid=False` track에도 residual을 적용하지 않습니다.
+
+Residual은 ID OFA에만 더합니다.
+
+```python
+id_ofa_enhanced = id_ofa + id_text_residual
+```
+
+이후 기존 semantic gate OFA fusion이 `id_ofa_enhanced`를 사용합니다. CTI output, classification logits, category isolation에는 text residual을 직접 섞지 않습니다.
+
+### 초기화와 compatibility
+
+q/k/v projection은 일반 Linear 초기화이고, `dptd_id_text_out_zero_init=True`에서는 out projection을 zero-init합니다. 따라서 `topk_memory`를 켜도 initial forward는 v4 semantic_gate와 allclose여야 합니다.
+
+Debug stat:
+
+- `dptd_id_text_applied_count`
+- `dptd_id_text_skipped_no_memory_count`
+- `dptd_id_text_skipped_no_topk_count`
+- `dptd_id_text_residual_norm_mean`
+- `dptd_id_text_residual_norm_max`
+
 ## 주요 Config 기본값
 
 | Config | 기본값 | 설명 |
@@ -198,7 +258,7 @@ alpha가 0이므로 initial forward는 baseline과 동일하게 시작하지만,
 | `use_ov_dptd` | `False` | OV-DPTD 전체 활성화 |
 | `ov_dptd_use_historical_offsets` | `True` | track query에 historical sampling offset 사용 |
 | `ov_dptd_fusion` | `"linear_sum"` | `"linear_sum"` 또는 `"semantic_gate"` |
-| `ov_dptd_id_path_text` | `"none"` | v1-v4에서는 ID path text attention 미지원 |
+| `ov_dptd_id_path_text` | `"none"` | `"none"` 또는 v5 `"topk_memory"` |
 | `ov_dptd_fuse_cti` | `False` | v4까지 CTI fusion 금지 |
 | `ov_dptd_store_debug` | `False` | DPTD debug stat 저장 |
 | `use_dptd_update_suppression` | `False` | v2 confidence suppression |
@@ -210,6 +270,13 @@ alpha가 0이므로 initial forward는 baseline과 동일하게 시작하지만,
 | `dptd_memory_use_alignment_feature` | `True` | visual memory에 `pred_embed` 사용 |
 | `dptd_memory_allow_untrained_visual_projection` | `False` | fallback projection 허용 |
 | `dptd_memory_store_topk` | `5` | 저장할 top-k class 수 |
+| `dptd_id_text_topk` | `5` | v5 text adapter용 top-k text token 수 |
+| `dptd_id_text_num_heads` | `4` | v5 text adapter head 수 |
+| `dptd_id_text_dropout` | `0.0` | v5 text adapter attention dropout |
+| `dptd_id_text_out_zero_init` | `True` | initial forward v4 호환을 위한 out projection zero-init |
+| `dptd_id_text_score_eps` | `1e-8` | top-k text token validity mask threshold |
+| `dptd_id_text_debug` | `False` | v5 text adapter debug stat 저장 |
+| `dptd_store_topk_text_embeddings` | `True` | v5 long-term top-k text field 저장 |
 | `use_dptd_semantic_gate` | `False` | v4 heuristic semantic gate |
 | `dptd_gate_mode` | `"heuristic"` | v4는 heuristic만 지원 |
 | `dptd_gate_min_score` | `0.3` | score confidence lower bound |
@@ -226,14 +293,16 @@ alpha가 0이므로 initial forward는 baseline과 동일하게 시작하지만,
 
 ## Guard 및 호환성
 
-다음 조합은 v4 범위에서 명확히 막습니다.
+다음 조합은 v5 범위에서 명확히 막습니다.
 
 - `use_ov_dptd=True` and `use_checkpoint_track=True`
 - `use_ov_dptd=True` and `use_transformer_ckpt=True`
 - `use_ov_dptd=True` and training `batch_size > 1`
 - `use_ov_dptd=True` and `quant_deploy="int_msda"`
 - `ov_dptd_fuse_cti=True`
-- `ov_dptd_id_path_text!="none"`
+- `ov_dptd_id_path_text`가 `"none"` 또는 `"topk_memory"`가 아닌 경우
+- `ov_dptd_id_path_text="topk_memory"` and `ov_dptd_fusion!="semantic_gate"`
+- `ov_dptd_id_path_text="topk_memory"` and `use_dptd_semantic_memory=False`
 - `use_dptd_update_suppression=True` and `use_ov_dptd=False`
 - training mode and `use_dptd_update_suppression=True`
 - `use_dptd_semantic_memory=True` and `use_ov_dptd=False`
