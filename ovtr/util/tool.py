@@ -4,23 +4,10 @@ from .utils import clean_state_dict
 from models.quant_utils import apply_ovtr_quant_state_dict, materialize_checkpoint_bias_parameters
 
 
-MCIP_CHECKPOINT_KEY_MARKERS = (
-    "track_embed.gate_mlp.",
-    "track_embed.memory_img_proj.",
-    "track_embed.memory_sem_proj.",
-    "track_embed.motion_scale",
-)
-
 OV_DPTD_CHECKPOINT_KEY_MARKERS = (
     "ov_dptd_",
     "dptd_visual_memory_proj.",
 )
-
-
-def is_mcip_checkpoint_key(name):
-    if name.startswith("module."):
-        name = name[7:]
-    return any(marker in name for marker in MCIP_CHECKPOINT_KEY_MARKERS)
 
 
 def is_ov_dptd_checkpoint_key(name):
@@ -66,7 +53,7 @@ def maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(
                 )
     return dead_layers
 
-def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, allow_mcip_missing=False, ov_dptd_reinit_dead_semantic_gate_id_proj=False, ov_dptd_semantic_gate_id_proj_init_std=1e-3):
+def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, ov_dptd_reinit_dead_semantic_gate_id_proj=False, ov_dptd_semantic_gate_id_proj_init_std=1e-3):
     start_epoch = 0
     checkpoint = torch.load(
         model_path,
@@ -93,7 +80,6 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
         else:
             if "_group_a_" not in k:
                 print('Drop parameter {}.'.format(k))
-    allowed_mcip_missing = []
     allowed_ov_dptd_missing = []
     for k in model_state_dict:
         if not (k in state_dict):
@@ -103,16 +89,12 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                 # avoids feeding empty default observer buffers back through
                 # torch.load_state_dict().
                 continue
-            if allow_mcip_missing and is_mcip_checkpoint_key(k):
-                allowed_mcip_missing.append(k)
-            elif is_ov_dptd_checkpoint_key(k):
+            if is_ov_dptd_checkpoint_key(k):
                 allowed_ov_dptd_missing.append(k)
             else:
                 print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
-    if allowed_mcip_missing:
-        print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
     if allowed_ov_dptd_missing:
         print('Allowed missing OV-DPTD Keys: {}'.format(allowed_ov_dptd_missing))
     maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(

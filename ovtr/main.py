@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
-from util.tool import is_mcip_checkpoint_key, is_ov_dptd_checkpoint_key, load_model, maybe_warn_or_reinit_dead_ov_dptd_semantic_gate
+from util.tool import is_ov_dptd_checkpoint_key, load_model, maybe_warn_or_reinit_dead_ov_dptd_semantic_gate
 from util.quantization import (
     add_quant_args,
     build_quant_manifest,
@@ -148,21 +148,6 @@ def get_args_parser():
 
     parser.add_argument('--track_query_iteration', default='CIP', type=str,
                         help="")
-    parser.add_argument('--mcip_enable', default=None, action='store_true')
-    parser.add_argument('--no_mcip_enable', dest='mcip_enable', action='store_false')
-    parser.add_argument('--mcip_detach_memory', dest='mcip_detach_memory', default=None, action='store_true')
-    parser.add_argument('--no_mcip_detach_memory', dest='mcip_detach_memory', action='store_false')
-    parser.add_argument('--mcip_memory_momentum', default=None, type=float)
-    parser.add_argument('--mcip_use_semantic_memory', dest='mcip_use_semantic_memory', default=None, action='store_true')
-    parser.add_argument('--no_mcip_use_semantic_memory', dest='mcip_use_semantic_memory', action='store_false')
-    parser.add_argument('--mcip_use_motion_ref', dest='mcip_use_motion_ref', default=None, action='store_true')
-    parser.add_argument('--no_mcip_use_motion_ref', dest='mcip_use_motion_ref', action='store_false')
-    parser.add_argument('--mcip_motion_momentum', default=None, type=float)
-    parser.add_argument('--mcip_motion_scale_init', default=None, type=float)
-    parser.add_argument('--mcip_gate_use_txt', default=None, action='store_true')
-    parser.add_argument('--debug_mcip', default=None, action='store_true')
-    parser.add_argument('--mcip_debug_stats_file', default=None, type=str)
-    parser.add_argument('--mcip_debug_log_interval', default=1, type=int)
     parser.add_argument('--attention_protection_mode', default=None, choices=['kl', 'topk', 'none'])
     parser.add_argument('--attention_protection_topk', default=None, type=int)
     parser.add_argument('--attention_protection_conf_thresh', default=None, type=float)
@@ -434,15 +419,6 @@ def main(args):
         if not param.requires_grad:
             print("requires_grad: False ", name)
 
-    if getattr(args, "debug_mcip", False) and getattr(args, "mcip_enable", False):
-        mcip_trainable = [
-            name for name, param in model.named_parameters()
-            if param.requires_grad and is_mcip_checkpoint_key(name)
-        ]
-        print("[M-CIP] Trainable M-CIP parameters:")
-        for name in mcip_trainable:
-            print("[M-CIP]   ", name)
-
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -472,7 +448,6 @@ def main(args):
         load_model(
             model_without_ddp,
             args.pretrained,
-            allow_mcip_missing=getattr(args, "mcip_enable", False),
             ov_dptd_reinit_dead_semantic_gate_id_proj=getattr(args, "ov_dptd_reinit_dead_semantic_gate_id_proj", False),
             ov_dptd_semantic_gate_id_proj_init_std=getattr(args, "ov_dptd_semantic_gate_id_proj_init_std", 1e-3),
         )
@@ -491,14 +466,8 @@ def main(args):
             print(f"Materialized {materialized} checkpoint bias parameters.")
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(model_state, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
-        allowed_mcip_missing = []
-        if getattr(args, "mcip_enable", False):
-            allowed_mcip_missing = [k for k in missing_keys if is_mcip_checkpoint_key(k)]
-            missing_keys = [k for k in missing_keys if not is_mcip_checkpoint_key(k)]
         allowed_ov_dptd_missing = [k for k in missing_keys if is_ov_dptd_checkpoint_key(k)]
         missing_keys = [k for k in missing_keys if not is_ov_dptd_checkpoint_key(k)]
-        if len(allowed_mcip_missing) > 0:
-            print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
         if len(allowed_ov_dptd_missing) > 0:
             print('Allowed missing OV-DPTD Keys: {}'.format(allowed_ov_dptd_missing))
         if len(missing_keys) > 0:

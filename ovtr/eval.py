@@ -441,7 +441,6 @@ def eval(args, cfg):
     model = load_model(
         model,
         args.pretrained,
-        allow_mcip_missing=getattr(args, "mcip_enable", False),
     )
     quant_state_loaded = False
     if quant_controller is not None:

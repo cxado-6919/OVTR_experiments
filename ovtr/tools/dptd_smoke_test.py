@@ -852,7 +852,7 @@ def test_dptd_checkpoint_key_classifier():
     assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_gate_alpha")
     assert is_ov_dptd_checkpoint_key("module.transformer.decoder.ov_dptd_ofa_id_proj.0.weight")
     assert is_ov_dptd_checkpoint_key("dptd_visual_memory_proj.weight")
-    assert not is_ov_dptd_checkpoint_key("track_embed.gate_mlp.weight")
+    assert not is_ov_dptd_checkpoint_key("track_embed.self_attn.in_proj_weight")
 
 
 def main():

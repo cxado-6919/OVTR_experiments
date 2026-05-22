@@ -2,7 +2,7 @@
 
 이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v4까지의 변경점을 정리합니다.
 
-OV-DPTD는 기본 OVTR/M-CIP/QAT/int_msda/TensorRT 경로를 바꾸지 않는 opt-in 기능입니다. `use_ov_dptd=False`이면 기존 OVTR decoder, tracking update, config 기본 동작이 유지됩니다.
+OV-DPTD는 기본 OVTR/QAT/int_msda/TensorRT 경로를 바꾸지 않는 opt-in 기능입니다. `use_ov_dptd=False`이면 기존 OVTR decoder, tracking update, config 기본 동작이 유지됩니다.
 
 ## 전체 구조
 
