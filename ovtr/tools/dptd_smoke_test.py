@@ -10,8 +10,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from detectron2.structures import Instances  # noqa: E402
-from models.ovtr import DPTD_CURRENT_MEMORY_FIELDS, OVTR, RuntimeTrackerBase, resolve_ov_dptd_options  # noqa: E402
+from models.ovtr import DPTD_CURRENT_MEMORY_FIELDS, DPTD_TEMP_FIELDS, OVTR, RuntimeTrackerBase, resolve_ov_dptd_options  # noqa: E402
 from models.transformer import DeformableTransformerDecoderLayer, TransformerDecoder  # noqa: E402
+from util.tool import is_ov_dptd_checkpoint_key  # noqa: E402
 
 
 def _make_decoder(use_ov_dptd=False, num_layers=2, d_model=256, nheads=4, nlevels=2, npoints=2, num_det=3, **decoder_kwargs):
@@ -570,28 +571,48 @@ def test_dptd_semantic_gate_helper_and_deferred_box():
         use_ov_dptd=True,
         use_dptd_semantic_gate=True,
         dptd_semantic_update_suppression_thresh=0.3,
+        dptd_gate_min_appearance=0.8,
     )
     logits = torch.full((1, 5, 1), 5.0)
     ad_offsets = torch.zeros(1, 5, 4, 2, 2, 2)
     historical = torch.zeros_like(ad_offsets)
     tgt = torch.zeros(5, 1, 256)
     debug = {}
-    gate = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(semantic_sign=1.0), 3, tgt, debug)
+    gate_info = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(semantic_sign=1.0), 3, tgt, debug)
+    gate = gate_info["semantic_gate"]
+    raw_gate = gate_info["semantic_gate_raw"]
+    memory_valid = gate_info["semantic_gate_memory_valid"]
     assert gate.shape == (1, 5)
+    assert raw_gate.shape == (1, 5)
+    assert memory_valid.shape == (1, 5)
     assert torch.allclose(gate[:, :3], torch.ones(1, 3))
+    assert torch.equal(memory_valid[:, :3], torch.zeros(1, 3, dtype=torch.bool))
+    assert torch.equal(memory_valid[:, 3:], torch.ones(1, 2, dtype=torch.bool))
     assert not torch.isnan(gate).any()
+    assert not torch.isnan(raw_gate).any()
+    assert torch.all(gate >= raw_gate)
     assert debug["dptd_gate_box_conf_deferred"] is True
+    assert debug["dptd_gate_box_conf_included"] is False
     assert debug["box_consistency_mean"] == 1.0
+    assert "dptd_gate_valid_mean" in debug
+    assert "dptd_gate_raw_valid_mean" in debug
 
-    low_gate = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(semantic_sign=-1.0), 3, tgt, {})
-    assert float(low_gate[0, 3]) < float(gate[0, 3])
+    low_info = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(semantic_sign=-1.0), 3, tgt, {})
+    assert float(low_info["semantic_gate_raw"][0, 3]) < float(raw_gate[0, 3])
 
-    no_memory_gate = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(memory_valid=False), 3, tgt, {})
-    assert torch.allclose(no_memory_gate, torch.ones_like(no_memory_gate))
+    no_memory_debug = {}
+    no_memory_info = decoder._compute_dptd_semantic_gate(logits, ad_offsets, historical, _gate_state(memory_valid=False), 3, tgt, no_memory_debug)
+    assert torch.allclose(no_memory_info["semantic_gate"], torch.ones_like(gate))
+    assert torch.allclose(no_memory_info["semantic_gate_raw"], torch.ones_like(raw_gate))
+    assert not no_memory_info["semantic_gate_memory_valid"].any()
+    assert no_memory_debug["dptd_gate_valid_mean"] == 0.0
+    assert no_memory_debug["dptd_gate_raw_valid_mean"] == 0.0
+    assert no_memory_debug["dptd_gate_low_count"] == 0
 
     one_cls_debug = {}
-    one_cls_gate = decoder._compute_dptd_semantic_gate(torch.zeros(1, 5, 1), ad_offsets, historical, _gate_state(), 3, tgt, one_cls_debug)
-    assert not torch.isnan(one_cls_gate).any()
+    one_cls_info = decoder._compute_dptd_semantic_gate(torch.zeros(1, 5, 1), ad_offsets, historical, _gate_state(), 3, tgt, one_cls_debug)
+    assert not torch.isnan(one_cls_info["semantic_gate"]).any()
+    assert not torch.isnan(one_cls_info["semantic_gate_raw"]).any()
 
 
 def test_dptd_semantic_gate_fusion_track_only():
@@ -613,8 +634,16 @@ def test_dptd_semantic_gate_linear_sum_debug_contract():
     out = _run_decoder(decoder, num_queries=5, num_det=3, historical_offsets=torch.zeros(5, 4, 2, 2, 2), return_dptd_info=True, dptd_gate_state=gate_state)
     info = out[-1]
     assert info["semantic_gate"].shape == (1, 5)
+    assert info["semantic_gate_raw"].shape == (1, 5)
+    assert info["semantic_gate_memory_valid"].shape == (1, 5)
+    assert info["semantic_gate"].grad_fn is None
+    assert info["semantic_gate_raw"].grad_fn is None
+    assert info["semantic_gate_memory_valid"].grad_fn is None
     assert "dptd_gate_mean" in info["debug"]
+    assert "dptd_gate_track_mean" in info["debug"]
+    assert "dptd_gate_raw_valid_mean" in info["debug"]
     assert info["debug"]["dptd_gate_box_conf_deferred"] is True
+    assert info["debug"]["dptd_gate_box_conf_included"] is False
     assert out[1].shape == (2, 1, 5, 256)
 
 
@@ -632,7 +661,9 @@ def test_dptd_semantic_update_suppression_and_visual_consistency_order():
     tracks.dptd_visual_memory[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
     snapshot = OVTR._snapshot_dptd_memory_state(model, tracks)
     _attach_memory_candidates(model, tracks, torch.tensor([[4.0]]), [5], pred_embed=torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
-    tracks.set("_dptd_current_gate", torch.tensor([0.2]))
+    tracks.set("_dptd_current_gate", torch.tensor([0.95]))
+    tracks.set("_dptd_current_gate_raw", torch.tensor([0.2]))
+    tracks.set("_dptd_current_gate_memory_valid", torch.tensor([True]))
     tracks = OVTR._compute_dptd_post_visual_consistency(model, snapshot, tracks)
     assert tracks.has("_dptd_current_visual_consistency")
     assert model.ov_dptd_debug_stats["visual_consistency_mean"] > 0.5
@@ -640,10 +671,84 @@ def test_dptd_semantic_update_suppression_and_visual_consistency_order():
     suppressed = OVTR._extend_dptd_semantic_update_suppression(model, suppression_snapshot, tracks)
     assert suppressed.detach().cpu().tolist() == [10]
     tracks = OVTR._update_dptd_memory_state(model, snapshot, suppression_snapshot, tracks)
-    for field_name in DPTD_CURRENT_MEMORY_FIELDS:
+    for field_name in DPTD_TEMP_FIELDS:
         assert not tracks.has(field_name), field_name
-    assert not tracks.has("_dptd_current_gate")
-    assert not tracks.has("_dptd_current_visual_consistency")
+
+
+def test_dptd_gate_attach_detaches_frame_state():
+    model = _make_memory_model(topk=2)
+    model.use_dptd_semantic_update_suppression = True
+    tracks = _make_memory_tracks(num_tracks=2, obj_idxes=[10, 11])
+    tracks.scores = torch.ones(2)
+    frame_res = {
+        "dptd_gate_values": torch.tensor([[0.9, 0.8]], requires_grad=True),
+        "dptd_gate_raw_values": torch.tensor([[0.4, 0.7]], requires_grad=True),
+        "dptd_gate_memory_valid": torch.tensor([[True, False]]),
+    }
+    tracks = OVTR._attach_dptd_gate_values(model, frame_res, tracks)
+    assert tracks.get("_dptd_current_gate").grad_fn is None
+    assert tracks.get("_dptd_current_gate_raw").grad_fn is None
+    assert tracks.get("_dptd_current_gate_memory_valid").grad_fn is None
+    assert tracks.get("_dptd_current_gate_memory_valid").dtype == torch.bool
+
+
+def test_dptd_duplicate_obj_idx_guard():
+    model = _make_suppression_model()
+    tracks = _make_suppression_tracks()
+    tracks.obj_idxes = torch.tensor([10, 10, -1], dtype=torch.long)
+    _assert_raises(RuntimeError, lambda: OVTR._snapshot_dptd_update_suppression_state(model, tracks))
+
+
+def test_dptd_trainability_and_optimizer_membership():
+    class MiniDPTDModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.decoder = _make_decoder(
+                use_ov_dptd=True,
+                use_dptd_semantic_gate=True,
+                ov_dptd_fusion="semantic_gate",
+            )
+            self.dptd_visual_memory_proj = nn.Linear(4, 4)
+
+    model = MiniDPTDModel()
+    for _, param in model.named_parameters():
+        param.requires_grad_(False)
+    train_tracking_only = ["track_embed", "update_attn", "norm4", "decoder.layers.0", "ov_dptd_", "dptd_visual_memory_proj"]
+    for name, param in model.named_parameters():
+        for keyw in train_tracking_only:
+            if keyw in name:
+                param.requires_grad_(True)
+                break
+
+    required_name_parts = [
+        "transformer.decoder.ov_dptd_gate_alpha",
+        "transformer.decoder.ov_dptd_ofa_ada_proj",
+        "transformer.decoder.ov_dptd_ofa_id_proj",
+        "transformer.decoder.ov_dptd_ofa_out_proj",
+        "dptd_visual_memory_proj",
+    ]
+    named_params = dict(model.named_parameters())
+    for part in required_name_parts:
+        matches = [(name, param) for name, param in named_params.items() if part in name]
+        assert matches, part
+        assert all(param.requires_grad for _, param in matches), part
+
+    param_dicts = [{"params": [p for _, p in model.named_parameters() if p.requires_grad], "lr": 1e-4}]
+    optimizer = torch.optim.AdamW(param_dicts, lr=1e-4)
+    optimizer_param_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    for part in required_name_parts:
+        for name, param in named_params.items():
+            if part in name:
+                assert id(param) in optimizer_param_ids, name
+
+
+def test_dptd_checkpoint_key_classifier():
+    assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_gate_alpha")
+    assert is_ov_dptd_checkpoint_key("module.transformer.decoder.ov_dptd_ofa_id_proj.0.weight")
+    assert is_ov_dptd_checkpoint_key("dptd_visual_memory_proj.weight")
+    assert not is_ov_dptd_checkpoint_key("track_embed.gate_mlp.weight")
+
 
 def main():
     torch.manual_seed(0)
@@ -661,6 +766,10 @@ def main():
     test_dptd_semantic_gate_fusion_track_only()
     test_dptd_semantic_gate_linear_sum_debug_contract()
     test_dptd_semantic_update_suppression_and_visual_consistency_order()
+    test_dptd_gate_attach_detaches_frame_state()
+    test_dptd_duplicate_obj_idx_guard()
+    test_dptd_trainability_and_optimizer_membership()
+    test_dptd_checkpoint_key_classifier()
     print("DPTD smoke passed")
 
 

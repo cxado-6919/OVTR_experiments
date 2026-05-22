@@ -109,14 +109,18 @@ initial_grad_allowed = ['patch2query',
                         'norm5',
                         'linear3',
                         'linear4',
-                        'decoder_norm_inter'
+                        'decoder_norm_inter',
+                        'ov_dptd_',
+                        'dptd_visual_memory_proj',
                         ]
 global_grad_allowed_epoch = 1
 global_grad_allowed_epoch_track = 1 
 train_tracking_only = ['track_embed',
                        'update_attn',
                        'norm4',
-                       'decoder.layers.0']
+                       'decoder.layers.0',
+                       'ov_dptd_',
+                       'dptd_visual_memory_proj']
 train_tracking_keep = ['backbone',
                        'encoder',
                        'tgt_embed',

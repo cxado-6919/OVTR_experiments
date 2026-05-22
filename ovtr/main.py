@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
-from util.tool import is_mcip_checkpoint_key, load_model
+from util.tool import is_mcip_checkpoint_key, is_ov_dptd_checkpoint_key, load_model
 from util.quantization import (
     add_quant_args,
     build_quant_manifest,
@@ -493,8 +493,12 @@ def main(args):
         if getattr(args, "mcip_enable", False):
             allowed_mcip_missing = [k for k in missing_keys if is_mcip_checkpoint_key(k)]
             missing_keys = [k for k in missing_keys if not is_mcip_checkpoint_key(k)]
+        allowed_ov_dptd_missing = [k for k in missing_keys if is_ov_dptd_checkpoint_key(k)]
+        missing_keys = [k for k in missing_keys if not is_ov_dptd_checkpoint_key(k)]
         if len(allowed_mcip_missing) > 0:
             print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
+        if len(allowed_ov_dptd_missing) > 0:
+            print('Allowed missing OV-DPTD Keys: {}'.format(allowed_ov_dptd_missing))
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:

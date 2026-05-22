@@ -108,6 +108,8 @@ DPTD_CURRENT_MEMORY_FIELDS = (
 
 DPTD_TEMP_FIELDS = DPTD_CURRENT_MEMORY_FIELDS + (
     '_dptd_current_gate',
+    '_dptd_current_gate_raw',
+    '_dptd_current_gate_memory_valid',
     '_dptd_current_visual_consistency',
 )
 
@@ -949,12 +951,22 @@ class OVTR(nn.Module):
             'dptd_gate_mean': 1.0,
             'dptd_gate_min': 1.0,
             'dptd_gate_max': 1.0,
+            'dptd_gate_track_mean': 1.0,
+            'dptd_gate_track_min': 1.0,
+            'dptd_gate_track_max': 1.0,
+            'dptd_gate_valid_mean': 0.0,
+            'dptd_gate_valid_min': 0.0,
+            'dptd_gate_valid_max': 0.0,
+            'dptd_gate_raw_valid_mean': 0.0,
+            'dptd_gate_raw_valid_min': 0.0,
+            'dptd_gate_raw_valid_max': 0.0,
             'dptd_gate_low_count': 0,
             'semantic_consistency_mean': 1.0,
             'visual_consistency_mean': 1.0,
             'offset_consistency_mean': 1.0,
             'box_consistency_mean': 1.0,
             'dptd_gate_box_conf_deferred': True,
+            'dptd_gate_box_conf_included': False,
         } if self.use_ov_dptd and (
             self.ov_dptd_store_debug
             or self.use_dptd_update_suppression
@@ -1011,12 +1023,22 @@ class OVTR(nn.Module):
             'dptd_gate_mean',
             'dptd_gate_min',
             'dptd_gate_max',
+            'dptd_gate_track_mean',
+            'dptd_gate_track_min',
+            'dptd_gate_track_max',
+            'dptd_gate_valid_mean',
+            'dptd_gate_valid_min',
+            'dptd_gate_valid_max',
+            'dptd_gate_raw_valid_mean',
+            'dptd_gate_raw_valid_min',
+            'dptd_gate_raw_valid_max',
             'dptd_gate_low_count',
             'semantic_consistency_mean',
             'visual_consistency_mean',
             'offset_consistency_mean',
             'box_consistency_mean',
             'dptd_gate_box_conf_deferred',
+            'dptd_gate_box_conf_included',
         ]:
             if key in debug:
                 self.ov_dptd_debug_stats[key] = debug[key]
@@ -1035,6 +1057,25 @@ class OVTR(nn.Module):
         self.ov_dptd_debug_stats['dptd_update_suppression_restore_success_count'] += int(success_count)
         self.ov_dptd_debug_stats['dptd_update_suppression_restore_skip_count'] += int(skip_count)
 
+    @staticmethod
+    def _validate_dptd_unique_obj_ids(ids, context):
+        if not isinstance(ids, torch.Tensor) or ids.numel() == 0:
+            return
+        valid_ids = ids[ids >= 0].detach().cpu().tolist()
+        seen = set()
+        duplicates = []
+        for track_id in valid_ids:
+            track_id = int(track_id)
+            if track_id in seen and track_id not in duplicates:
+                duplicates.append(track_id)
+            seen.add(track_id)
+        if duplicates:
+            raise RuntimeError(f'DPTD duplicate valid obj_idxes in {context}: {duplicates}')
+
+    def _validate_dptd_track_instance_unique_ids(self, track_instances, context):
+        if track_instances is not None and track_instances.has('obj_idxes'):
+            self._validate_dptd_unique_obj_ids(track_instances.obj_idxes, context)
+
     def _snapshot_dptd_update_suppression_state(self, track_instances):
         if not self.use_dptd_update_suppression:
             return None
@@ -1049,6 +1090,7 @@ class OVTR(nn.Module):
         if not track_instances.has('obj_idxes') or len(track_instances) == 0:
             return {'ids': torch.empty(0, dtype=torch.long), 'fields': {}, 'suppressed_ids': torch.empty(0, dtype=torch.long)}
 
+        self._validate_dptd_track_instance_unique_ids(track_instances, 'suppression snapshot')
         valid_mask = track_instances.obj_idxes >= 0
         old_ids = track_instances.obj_idxes[valid_mask].detach().clone()
         snapshot = {
@@ -1076,6 +1118,8 @@ class OVTR(nn.Module):
             return snapshot['suppressed_ids']
 
         suppressed_ids = []
+        self._validate_dptd_unique_obj_ids(snapshot['ids'], 'suppression snapshot ids')
+        self._validate_dptd_track_instance_unique_ids(track_instances, 'suppression selection')
         current_ids = track_instances.obj_idxes
         current_scores = track_instances.scores
         for track_id in snapshot['ids'].detach().cpu().tolist():
@@ -1106,6 +1150,8 @@ class OVTR(nn.Module):
 
         success_count = 0
         skip_count = 0
+        self._validate_dptd_unique_obj_ids(snapshot['ids'], 'suppression restore snapshot ids')
+        self._validate_dptd_track_instance_unique_ids(track_instances, 'suppression restore')
         current_ids = track_instances.obj_idxes
         snapshot_ids = snapshot['ids'].to(device=current_ids.device, dtype=current_ids.dtype)
         for track_id in suppressed_ids.to(device=current_ids.device, dtype=current_ids.dtype).detach().cpu().tolist():
@@ -1183,6 +1229,7 @@ class OVTR(nn.Module):
         track_instances = self._ensure_dptd_memory_fields(track_instances)
         if not track_instances.has('obj_idxes') or len(track_instances) == 0:
             return {'ids': torch.empty(0, dtype=torch.long), 'fields': {}}
+        self._validate_dptd_track_instance_unique_ids(track_instances, 'memory snapshot')
         valid_mask = track_instances.obj_idxes >= 0
         ids = track_instances.obj_idxes[valid_mask].detach().clone()
         snapshot = {'ids': ids, 'fields': {}}
@@ -1216,17 +1263,48 @@ class OVTR(nn.Module):
             'text_memory_embeddings': text_memory_embeddings.detach() if text_memory_embeddings is not None else None,
         }
 
+    def _normalize_dptd_gate_vector(self, value, field_name, track_instances, dtype=None, default=None):
+        if value is None:
+            value = default
+        if value is None:
+            raise RuntimeError(f'DPTD semantic gate missing {field_name}.')
+        if isinstance(value, torch.Tensor) and value.dim() == 2:
+            value = value[0]
+        if not isinstance(value, torch.Tensor) or value.shape[0] != len(track_instances):
+            raise RuntimeError(f'DPTD semantic gate row mismatch for {field_name}.')
+        target_dtype = dtype or track_instances.scores.dtype
+        return value.to(device=track_instances.scores.device, dtype=target_dtype).detach()
+
     def _attach_dptd_gate_values(self, frame_res, track_instances):
         if not self.use_dptd_semantic_gate:
             return track_instances
-        gate = frame_res.get('dptd_gate_values')
-        if gate is None:
-            gate = torch.ones(len(track_instances), device=track_instances.scores.device, dtype=track_instances.scores.dtype)
-        if isinstance(gate, torch.Tensor) and gate.dim() == 2:
-            gate = gate[0]
-        if not isinstance(gate, torch.Tensor) or gate.shape[0] != len(track_instances):
-            raise RuntimeError('DPTD semantic gate row mismatch in post-process.')
-        track_instances.set('_dptd_current_gate', gate.to(device=track_instances.scores.device, dtype=track_instances.scores.dtype).detach())
+        default_gate = torch.ones(len(track_instances), device=track_instances.scores.device, dtype=track_instances.scores.dtype)
+        gate = self._normalize_dptd_gate_vector(
+            frame_res.get('dptd_gate_values'),
+            'dptd_gate_values',
+            track_instances,
+            default=default_gate,
+        )
+        raw_value = frame_res.get('dptd_gate_raw_values')
+        if raw_value is None and self.use_dptd_semantic_update_suppression:
+            raise RuntimeError('DPTD semantic update suppression requires raw semantic gate values.')
+        raw_gate = self._normalize_dptd_gate_vector(
+            raw_value,
+            'dptd_gate_raw_values',
+            track_instances,
+            default=gate,
+        )
+        default_valid = torch.zeros(len(track_instances), device=track_instances.scores.device, dtype=torch.bool)
+        memory_valid = self._normalize_dptd_gate_vector(
+            frame_res.get('dptd_gate_memory_valid'),
+            'dptd_gate_memory_valid',
+            track_instances,
+            dtype=torch.bool,
+            default=default_valid,
+        )
+        track_instances.set('_dptd_current_gate', gate)
+        track_instances.set('_dptd_current_gate_raw', raw_gate)
+        track_instances.set('_dptd_current_gate_memory_valid', memory_valid.bool())
         return track_instances
 
     def _compute_dptd_post_visual_consistency(self, memory_snapshot, track_instances):
@@ -1265,20 +1343,26 @@ class OVTR(nn.Module):
     def _extend_dptd_semantic_update_suppression(self, snapshot, track_instances):
         if not self.use_dptd_semantic_update_suppression:
             return None
-        if snapshot is None or not track_instances.has('_dptd_current_gate') or not track_instances.has('obj_idxes'):
+        if snapshot is None:
+            return None
+        if not track_instances.has('_dptd_current_gate_raw'):
+            raise RuntimeError('DPTD semantic update suppression requires _dptd_current_gate_raw.')
+        if not track_instances.has('obj_idxes'):
             return None
         old_ids = snapshot.get('ids')
         if not isinstance(old_ids, torch.Tensor) or old_ids.numel() == 0:
             return old_ids
+        self._validate_dptd_unique_obj_ids(old_ids, 'semantic suppression snapshot ids')
+        self._validate_dptd_track_instance_unique_ids(track_instances, 'semantic suppression')
         semantic_ids = []
         current_ids = track_instances.obj_idxes
-        gate = track_instances.get('_dptd_current_gate')
+        raw_gate = track_instances.get('_dptd_current_gate_raw')
         for track_id in old_ids.detach().cpu().tolist():
             matches = torch.nonzero(current_ids == int(track_id), as_tuple=False).flatten()
             if matches.numel() == 0:
                 continue
             row_idx = int(matches[0].item())
-            if float(gate[row_idx].detach().item()) < float(self.dptd_semantic_update_suppression_thresh):
+            if float(raw_gate[row_idx].detach().item()) < float(self.dptd_semantic_update_suppression_thresh):
                 semantic_ids.append(int(track_id))
         previous = snapshot.get('suppressed_ids')
         device = current_ids.device
@@ -1428,6 +1512,9 @@ class OVTR(nn.Module):
             return track_instances
         with torch.no_grad():
             track_instances = self._ensure_dptd_memory_fields(track_instances)
+            self._validate_dptd_track_instance_unique_ids(track_instances, 'memory update')
+            if memory_snapshot is not None:
+                self._validate_dptd_unique_obj_ids(memory_snapshot.get('ids'), 'memory update snapshot ids')
             missing = [name for name in DPTD_CURRENT_MEMORY_FIELDS if not track_instances.has(name)]
             if missing:
                 raise RuntimeError(f'DPTD memory candidate fields missing: {missing}')
@@ -2028,7 +2115,11 @@ class OVTR(nn.Module):
                 raise RuntimeError('OV-DPTD decoder did not return final sampling offsets.')
             out['dptd_sampling_offsets'] = dptd_info['sampling_offsets']
             if dptd_info.get('semantic_gate') is not None:
-                out['dptd_gate_values'] = dptd_info['semantic_gate']
+                out['dptd_gate_values'] = dptd_info['semantic_gate'].detach()
+            if dptd_info.get('semantic_gate_raw') is not None:
+                out['dptd_gate_raw_values'] = dptd_info['semantic_gate_raw'].detach()
+            if dptd_info.get('semantic_gate_memory_valid') is not None:
+                out['dptd_gate_memory_valid'] = dptd_info['semantic_gate_memory_valid'].detach()
             self._update_ov_dptd_debug_stats(dptd_info)
         self._mcip_store_text_feat(out, text_dict)
             

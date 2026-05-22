@@ -11,11 +11,22 @@ MCIP_CHECKPOINT_KEY_MARKERS = (
     "track_embed.motion_scale",
 )
 
+OV_DPTD_CHECKPOINT_KEY_MARKERS = (
+    "ov_dptd_",
+    "dptd_visual_memory_proj.",
+)
+
 
 def is_mcip_checkpoint_key(name):
     if name.startswith("module."):
         name = name[7:]
     return any(marker in name for marker in MCIP_CHECKPOINT_KEY_MARKERS)
+
+
+def is_ov_dptd_checkpoint_key(name):
+    if name.startswith("module."):
+        name = name[7:]
+    return any(marker in name for marker in OV_DPTD_CHECKPOINT_KEY_MARKERS)
 
 
 def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, allow_mcip_missing=False):
@@ -46,6 +57,7 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
             if "_group_a_" not in k:
                 print('Drop parameter {}.'.format(k))
     allowed_mcip_missing = []
+    allowed_ov_dptd_missing = []
     for k in model_state_dict:
         if not (k in state_dict):
             if "_ovtr_quant_" in k:
@@ -56,12 +68,16 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
                 continue
             if allow_mcip_missing and is_mcip_checkpoint_key(k):
                 allowed_mcip_missing.append(k)
+            elif is_ov_dptd_checkpoint_key(k):
+                allowed_ov_dptd_missing.append(k)
             else:
                 print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
     if allowed_mcip_missing:
         print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
+    if allowed_ov_dptd_missing:
+        print('Allowed missing OV-DPTD Keys: {}'.format(allowed_ov_dptd_missing))
     print("|| Weights have been checked completely ||")
     # resume optimizer parameters
     if optimizer is not None and resume:

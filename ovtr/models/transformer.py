@@ -781,13 +781,24 @@ class TransformerDecoder(nn.Module):
             "dptd_gate_mean": 1.0,
             "dptd_gate_min": 1.0,
             "dptd_gate_max": 1.0,
+            "dptd_gate_track_mean": 1.0,
+            "dptd_gate_track_min": 1.0,
+            "dptd_gate_track_max": 1.0,
+            "dptd_gate_valid_mean": 0.0,
+            "dptd_gate_valid_min": 0.0,
+            "dptd_gate_valid_max": 0.0,
+            "dptd_gate_raw_valid_mean": 0.0,
+            "dptd_gate_raw_valid_min": 0.0,
+            "dptd_gate_raw_valid_max": 0.0,
             "dptd_gate_low_count": 0,
             "semantic_consistency_mean": 1.0,
             "visual_consistency_mean": 1.0,
             "offset_consistency_mean": 1.0,
             "box_consistency_mean": 1.0,
             "dptd_gate_box_conf_deferred": True,
+            "dptd_gate_box_conf_included": False,
         }
+
 
     def _normalize_ov_dptd_offsets(self, offsets, tgt):
         if offsets is None:
@@ -818,6 +829,27 @@ class TransformerDecoder(nn.Module):
     def _semantic_gate_ones(self, tgt):
         return torch.ones(tgt.shape[1], tgt.shape[0], device=tgt.device, dtype=tgt.dtype)
 
+    def _semantic_gate_result(self, tgt, fusion_gate=None, raw_gate=None, memory_valid=None):
+        default_gate = self._semantic_gate_ones(tgt)
+        if fusion_gate is None:
+            fusion_gate = default_gate
+        if raw_gate is None:
+            raw_gate = torch.ones_like(fusion_gate)
+        if memory_valid is None:
+            memory_valid = torch.zeros(fusion_gate.shape, device=fusion_gate.device, dtype=torch.bool)
+        return {
+            "semantic_gate": fusion_gate,
+            "semantic_gate_raw": raw_gate,
+            "semantic_gate_memory_valid": memory_valid.bool(),
+        }
+
+    @staticmethod
+    def _dptd_gate_stat(values, default=0.0):
+        if values is None or values.numel() == 0:
+            return float(default), float(default), float(default)
+        values = values.detach().float()
+        return float(values.mean().item()), float(values.min().item()), float(values.max().item())
+
     def _compute_dptd_semantic_gate(
         self,
         logits,
@@ -828,19 +860,19 @@ class TransformerDecoder(nn.Module):
         tgt,
         debug=None,
     ):
-        gate = self._semantic_gate_ones(tgt)
+        default_gate = self._semantic_gate_ones(tgt)
         if not self.use_dptd_semantic_gate or not isinstance(gate_state, dict):
-            return gate
+            return self._semantic_gate_result(tgt, default_gate, torch.ones_like(default_gate))
 
-        bs, num_queries = gate.shape
+        bs, num_queries = default_gate.shape
         if track_start >= num_queries:
-            return gate
+            return self._semantic_gate_result(tgt, default_gate, torch.ones_like(default_gate))
 
         text_memory = self._gate_state_tensor(gate_state, 'text_memory_embeddings', logits, expected_dim=3, dtype=logits.dtype)
         prev_semantic = self._gate_state_tensor(gate_state, 'semantic_proto', logits, expected_dim=3, dtype=logits.dtype)
         memory_valid = self._gate_state_tensor(gate_state, 'memory_valid', logits, expected_dim=2, dtype=torch.bool)
         if text_memory is None or prev_semantic is None or memory_valid is None:
-            return gate
+            return self._semantic_gate_result(tgt, default_gate, torch.ones_like(default_gate))
         if text_memory.shape[0] == 1 and bs != 1:
             text_memory = text_memory.expand(bs, -1, -1)
         if prev_semantic.shape[0] == 1 and bs != 1:
@@ -848,11 +880,11 @@ class TransformerDecoder(nn.Module):
         if memory_valid.shape[0] == 1 and bs != 1:
             memory_valid = memory_valid.expand(bs, -1)
         if prev_semantic.shape[:2] != (bs, num_queries) or memory_valid.shape[:2] != (bs, num_queries):
-            return gate
+            return self._semantic_gate_result(tgt, default_gate, torch.ones_like(default_gate))
 
         num_cls = min(int(logits.shape[-1]), int(text_memory.shape[1]))
         if num_cls <= 0:
-            return gate
+            return self._semantic_gate_result(tgt, default_gate, torch.ones_like(default_gate))
         score = logits[..., :num_cls].float().sigmoid()
         prob = score / score.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         current_semantic = F.normalize(prob @ text_memory[:, :num_cls].float(), dim=-1, eps=1e-6)
@@ -871,30 +903,44 @@ class TransformerDecoder(nn.Module):
             offset_l1 = (ad_sampling_offsets.float() - historical_offsets.float()).abs().mean(dim=(2, 3, 4, 5))
             offset_conf = torch.exp(-offset_l1 / max(float(self.dptd_gate_offset_tau), 1e-6)).clamp(0.0, 1.0)
 
-        valid = memory_valid.bool()
-        track_mask = torch.zeros_like(valid)
+        track_mask = torch.zeros_like(memory_valid, dtype=torch.bool)
         track_mask[:, track_start:] = True
-        valid = valid & track_mask
-        raw_gate = (score_conf * entropy_conf * semantic_conf * offset_conf).clamp(0.0, 1.0)
-        gate = torch.where(valid, raw_gate, torch.ones_like(raw_gate))
-        gate[:, :track_start] = 1.0
-        gate = gate.clamp(min=float(self.dptd_gate_min_appearance), max=1.0).to(dtype=tgt.dtype)
+        valid = memory_valid.bool() & track_mask
+        measured_raw_gate = (score_conf * entropy_conf * semantic_conf * offset_conf).clamp(0.0, 1.0)
+        raw_gate = torch.where(valid, measured_raw_gate, torch.ones_like(measured_raw_gate))
+        raw_gate[:, :track_start] = 1.0
+        fusion_gate = raw_gate.clamp(min=float(self.dptd_gate_min_appearance), max=1.0).to(dtype=tgt.dtype)
+        raw_gate = raw_gate.to(dtype=tgt.dtype)
 
         if debug is not None:
-            track_values = gate[:, track_start:]
-            valid_values = gate[valid]
-            if track_values.numel() > 0:
-                debug['dptd_gate_mean'] = float(track_values.detach().float().mean().item())
-                debug['dptd_gate_min'] = float(track_values.detach().float().min().item())
-                debug['dptd_gate_max'] = float(track_values.detach().float().max().item())
-                debug['dptd_gate_low_count'] = int((track_values.detach().float() < float(self.dptd_semantic_update_suppression_thresh)).sum().item())
-            if valid_values.numel() > 0:
+            track_values = fusion_gate[:, track_start:]
+            track_mean, track_min, track_max = self._dptd_gate_stat(track_values, default=0.0)
+            valid_fusion = fusion_gate[valid]
+            valid_raw = raw_gate[valid]
+            valid_mean, valid_min, valid_max = self._dptd_gate_stat(valid_fusion, default=0.0)
+            raw_valid_mean, raw_valid_min, raw_valid_max = self._dptd_gate_stat(valid_raw, default=0.0)
+            debug['dptd_gate_mean'] = track_mean
+            debug['dptd_gate_min'] = track_min
+            debug['dptd_gate_max'] = track_max
+            debug['dptd_gate_track_mean'] = track_mean
+            debug['dptd_gate_track_min'] = track_min
+            debug['dptd_gate_track_max'] = track_max
+            debug['dptd_gate_valid_mean'] = valid_mean
+            debug['dptd_gate_valid_min'] = valid_min
+            debug['dptd_gate_valid_max'] = valid_max
+            debug['dptd_gate_raw_valid_mean'] = raw_valid_mean
+            debug['dptd_gate_raw_valid_min'] = raw_valid_min
+            debug['dptd_gate_raw_valid_max'] = raw_valid_max
+            debug['dptd_gate_low_count'] = int((valid_raw.detach().float() < float(self.dptd_semantic_update_suppression_thresh)).sum().item()) if valid_raw.numel() > 0 else 0
+            if valid.any():
                 debug['semantic_consistency_mean'] = float(semantic_cos[valid].detach().float().mean().item())
                 debug['offset_consistency_mean'] = float(offset_conf[valid].detach().float().mean().item())
             debug['visual_consistency_mean'] = float(debug.get('visual_consistency_mean', 1.0))
             debug['box_consistency_mean'] = 1.0
             debug['dptd_gate_box_conf_deferred'] = True
-        return gate
+            debug['dptd_gate_box_conf_included'] = False
+        return self._semantic_gate_result(tgt, fusion_gate, raw_gate, valid)
+
 
     def _fuse_ov_dptd_ofa_semantic_gate(self, layer_id, ada_ofa, id_ofa, gate):
         id_delta = self.ov_dptd_ofa_id_proj[layer_id](id_ofa)
@@ -936,6 +982,8 @@ class TransformerDecoder(nn.Module):
         dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
         last_ad_sampling_offsets = None
         last_gate_values = None
+        last_gate_raw_values = None
+        last_gate_memory_valid = None
 
         self.num_queries_cur = tgt.shape[0]
         self.select_text_num = text_dict["select_text_num"]
@@ -1011,7 +1059,7 @@ class TransformerDecoder(nn.Module):
             output = ada_cti
             output_norm = self.norm(output)
             pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
-            gate_values = self._compute_dptd_semantic_gate(
+            gate_info = self._compute_dptd_semantic_gate(
                 pre_outputs_class,
                 ad_sampling_offsets,
                 historical_offsets,
@@ -1020,7 +1068,10 @@ class TransformerDecoder(nn.Module):
                 tgt,
                 debug=dptd_debug,
             )
+            gate_values = gate_info["semantic_gate"]
             last_gate_values = gate_values
+            last_gate_raw_values = gate_info["semantic_gate_raw"]
+            last_gate_memory_valid = gate_info["semantic_gate_memory_valid"]
             if self.ov_dptd_fusion == "semantic_gate":
                 output_ofa = self._fuse_ov_dptd_ofa_semantic_gate(layer_id, ada_ofa, id_ofa, gate_values)
             else:
@@ -1066,7 +1117,9 @@ class TransformerDecoder(nn.Module):
         if return_dptd_info:
             ret.append({
                 "sampling_offsets": last_ad_sampling_offsets,
-                "semantic_gate": last_gate_values,
+                "semantic_gate": last_gate_values.detach() if last_gate_values is not None else None,
+                "semantic_gate_raw": last_gate_raw_values.detach() if last_gate_raw_values is not None else None,
+                "semantic_gate_memory_valid": last_gate_memory_valid.detach() if last_gate_memory_valid is not None else None,
                 "debug": dptd_debug,
             })
         return ret

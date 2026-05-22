@@ -23,4 +23,6 @@ train_tracking_only = [
     'update_attn',
     'norm4',
     'decoder.layers.0',
+    'ov_dptd_',
+    'dptd_visual_memory_proj',
 ]
