@@ -1,6 +1,6 @@
 # OV-DPTD 실행 가이드
 
-이 문서는 OV-DPTD v1-v5를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
+이 문서는 OV-DPTD v1-v6를 학습/평가할 때 사용하는 config 조합, shell script, 주요 인자를 정리합니다.
 
 OV-DPTD 인자는 현재 config field로 관리됩니다. `tools/*.sh`의 `EXTRA_ARGS`는 기존 CLI 인자를 뒤에 붙이는 용도이며, DPTD field는 config 파일에 명시하는 방식을 권장합니다.
 
@@ -127,6 +127,66 @@ use_transformer_ckpt = False
 ```
 
 `ov_dptd_fusion="linear_sum"`과 `ov_dptd_id_path_text="topk_memory"` 조합은 v5에서 RuntimeError입니다. semantic_gate의 small-random ID projection과 nonzero alpha gradient 흐름을 전제로 adapter gradient를 확인하기 때문입니다.
+
+### v6 auxiliary-loss fine-tuning config
+
+v6 auxiliary losses는 DPTD 구조를 바꾸지 않고 training loss만 추가합니다. 기본값은 모두 off이며, `use_dptd_losses=True`일 때도 weight가 0이면 engine에서 0이 곱해집니다.
+
+```python
+use_ov_dptd = True
+ov_dptd_fusion = "semantic_gate"
+ov_dptd_fuse_cti = False
+
+use_dptd_semantic_memory = True
+use_dptd_semantic_gate = True
+
+# v5 top-k text adapter는 선택 사항입니다.
+ov_dptd_id_path_text = "topk_memory"
+dptd_store_topk_text_embeddings = True
+
+use_dptd_losses = True
+dptd_loss_ofa_consistency_weight = 0.02
+dptd_loss_semantic_memory_weight = 0.01
+dptd_loss_visual_memory_weight = 0.01
+dptd_loss_offset_consistency_weight = 1e-4
+dptd_loss_same_category_contrast_weight = 0.0
+
+dptd_loss_min_reliability = 0.5
+dptd_loss_max_entropy = 0.75
+dptd_loss_min_score = 0.3
+dptd_loss_query_scope = "track_only"
+dptd_loss_apply_aux = False
+dptd_loss_ofa_target = "ada_stopgrad"
+dptd_loss_memory_target = "previous_stopgrad"
+dptd_loss_offset_target = "historical_stopgrad"
+dptd_contrast_temperature = 0.07
+dptd_contrast_min_negatives = 1
+dptd_loss_store_debug = True
+
+# inference-only 기능이므로 training에서는 끕니다.
+use_dptd_update_suppression = False
+use_dptd_semantic_update_suppression = False
+
+use_checkpoint_track = False
+use_transformer_ckpt = False
+```
+
+권장 시작점은 OFA consistency `0.02-0.05`, semantic/visual memory `0.01-0.02`, offset consistency `1e-4` 이하, same-category contrast는 `0.0`부터입니다. Offset loss는 LocA에 영향을 줄 수 있으므로 특히 작게 시작하세요.
+
+`use_dptd_losses=True`이면 frame별 다음 loss key가 weight_dict에 항상 들어갑니다. weight가 0이어도 criterion이 같은 key를 반환하므로 logging/engine contract가 안정적입니다.
+
+- `frame_{i}_loss_dptd_ofa_consistency`
+- `frame_{i}_loss_dptd_semantic_memory`
+- `frame_{i}_loss_dptd_visual_memory`
+- `frame_{i}_loss_dptd_offset_consistency`
+- `frame_{i}_loss_dptd_same_category_contrast`
+
+주의할 guard:
+
+- `use_dptd_losses=True`는 `use_ov_dptd=True`가 필요합니다.
+- semantic/visual/contrast memory loss weight를 0보다 크게 쓰려면 `use_dptd_semantic_memory=True`가 필요합니다.
+- `dptd_loss_apply_aux=True`는 v6에서 지원하지 않습니다. final decoder layer loss만 계산합니다.
+- `dptd_loss_query_scope="track_only"`, target mode는 `ada_stopgrad`/`previous_stopgrad`/`historical_stopgrad`만 지원합니다.
 
 ### v4 eval config with suppression
 
@@ -382,6 +442,28 @@ use_dptd_semantic_gate = True
 `dptd_topk_text_embeddings.shape[-1]`은 decoder CTI가 쓰는 text feature dim과 같아야 합니다. 이 dim이 다르면 adapter k/v projection input dim과 맞지 않아 RuntimeError가 납니다.
 
 모든 top-k text score가 `dptd_id_text_score_eps` 이하인 query는 attention을 실행하지 않고 residual 0으로 skip됩니다.
+
+### DPTD loss가 RuntimeError를 내는 경우
+
+v6 auxiliary loss는 DPTD opt-in path 전용입니다. 다음 조합을 먼저 확인합니다.
+
+```python
+use_ov_dptd = True
+use_dptd_losses = True
+dptd_loss_apply_aux = False
+dptd_loss_query_scope = "track_only"
+dptd_loss_ofa_target = "ada_stopgrad"
+dptd_loss_memory_target = "previous_stopgrad"
+dptd_loss_offset_target = "historical_stopgrad"
+```
+
+semantic/visual/contrast loss weight를 0보다 크게 켤 때는 memory state가 필요합니다.
+
+```python
+use_dptd_semantic_memory = True
+```
+
+DPTD loss tensor는 training 중에만 생성됩니다. eval/inference에서 `dptd_loss_tensors`가 없는 것은 정상입니다.
 
 ### Alpha가 계속 0인 경우
 

@@ -1,6 +1,6 @@
-# OV-DPTD v1-v5 변경 사항
+# OV-DPTD v1-v6 변경 사항
 
-이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v5까지의 변경점을 정리합니다.
+이 문서는 OVTR에 추가된 Open-Vocabulary Dual-Path Temporal Decoder(OV-DPTD) v1부터 v6까지의 변경점을 정리합니다.
 
 OV-DPTD는 기본 OVTR/QAT/int_msda/TensorRT 경로를 바꾸지 않는 opt-in 기능입니다. `use_ov_dptd=False`이면 기존 OVTR decoder, tracking update, config 기본 동작이 유지됩니다.
 
@@ -14,7 +14,7 @@ OV-DPTD는 기존 OVTR decoder를 appearance-adaptive path로 유지하고, trac
 - Track query identity: ID path의 track query는 decoder layer를 거치며 갱신된 query가 아니라 frame decode 진입 시점의 initial track query를 고정해서 사용합니다.
 - Classification/category isolation: 항상 AD CTI output 기준입니다.
 - Box/feature alignment/CIP 입력: DPTD가 켜진 경우 fused OFA output 기준입니다.
-- CTI fusion: v5까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
+- CTI fusion: v6까지 기본 off이며 `ov_dptd_fuse_cti=True`는 지원하지 않습니다.
 
 ## v1: Dual-Path Temporal Decoder
 
@@ -251,6 +251,81 @@ Debug stat:
 - `dptd_id_text_residual_norm_mean`
 - `dptd_id_text_residual_norm_max`
 
+## v6: Auxiliary Losses
+
+v6는 v1-v5 decoder 구조를 새로 바꾸는 단계가 아니라, 이미 구현된 DPTD branch를 학습시키기 위한 optional auxiliary loss를 추가한 단계입니다. 기본값은 `use_dptd_losses=False`이고 모든 loss weight는 `0.0`입니다. 이 상태에서는 v5와 output key, loss key, tensor shape, training/eval behavior가 같아야 합니다.
+
+Loss tensor는 training 중 `use_dptd_losses=True`일 때만 보존합니다. eval/inference에서는 loss용 tensor를 만들지 않으며, long-term `Instances` state에도 저장하지 않습니다.
+
+### Loss tensor flow
+
+DPTD decoder는 state 저장용 sampling offset과 loss용 sampling offset을 분리합니다.
+
+- `dptd_info["sampling_offsets"]`: 다음 frame state 저장용 detached final AD sampling offsets
+- `dptd_info["loss_tensors"]["ad_sampling_offsets_final"]`: training loss용 non-detached AD sampling offsets
+
+`loss_tensors`에는 final decoder layer 기준으로 다음 tensor가 들어갑니다.
+
+| Key | Shape | Gradient | 설명 |
+| --- | --- | --- | --- |
+| `ada_ofa_final` | `[bs, nq, hidden_dim]` | target에서 detach 사용 | AD OFA stop-gradient target |
+| `id_ofa_final` | `[bs, nq, hidden_dim]` | yes | top-k text residual 적용 후 ID OFA |
+| `fused_ofa_final` | `[bs, nq, hidden_dim]` | yes | bbox/align/CIP 흐름의 fused OFA |
+| `ad_sampling_offsets_final` | `[bs, nq, nheads, nlevels, npoints, 2]` | yes | offset consistency loss 입력 |
+| `historical_sampling_offsets` | shape-compatible | detached target | 이전 frame offset target |
+| `semantic_gate` | `[bs, nq]` | detached weight | reliability weight |
+| `semantic_gate_memory_valid` | `[bs, nq]` | detached mask | valid memory mask |
+| `num_det` | scalar/int | n/a | detect/track query split |
+
+`_post_process_single_image`는 memory update 전에 previous semantic/visual memory snapshot을 detach target으로 만들고, criterion 계산 뒤 다음 frame으로 넘어가기 전에 `_dptd_prev_*_loss`, `_dptd_current_*_loss`, `_dptd_original_query_idx_loss` 같은 loss temp field를 제거합니다.
+
+### Loss keys
+
+`use_dptd_losses=True`이면 weight가 0이어도 frame별 weight_dict와 criterion output에 다음 key가 항상 포함됩니다. 실제 scaling은 engine의 기존 `loss_dict[key] * weight_dict[key]` 경로를 따르며 criterion 내부에서는 weight를 곱하지 않습니다.
+
+- `frame_{i}_loss_dptd_ofa_consistency`
+- `frame_{i}_loss_dptd_semantic_memory`
+- `frame_{i}_loss_dptd_visual_memory`
+- `frame_{i}_loss_dptd_offset_consistency`
+- `frame_{i}_loss_dptd_same_category_contrast`
+
+### Loss별 valid/skip 조건
+
+- OFA consistency: track query, existing/memory-valid track만 사용합니다. `normalize(id_ofa_final)`을 `normalize(ada_ofa_final.detach())`에 맞춥니다. v1-v5는 AD/ID decoder layer parameter를 공유하므로 ID path loss gradient가 shared decoder parameter에도 흐를 수 있으며, v6 기본 동작으로 허용합니다.
+- Semantic memory consistency: previous semantic memory valid, score/entropy/reliability 조건을 통과한 existing track만 사용합니다. full class probability vector가 아니라 semantic prototype vector끼리 비교합니다.
+- Visual memory consistency: current visual memory candidate와 detached previous visual memory를 비교합니다. 기본 visual source는 v3와 동일하게 `pred_embed`입니다.
+- Offset consistency: current final AD sampling offsets와 historical offsets shape가 정확히 맞을 때만 L1 loss를 계산합니다. mismatch는 crash 없이 zero/skip하고 debug count를 올립니다.
+- Same-category contrast: category 비교는 local selected-class index가 아니라 global category id 기준입니다. positive는 같은 obj의 previous visual memory, negative는 같은 global category이면서 obj가 다른 visual feature/memory입니다. negative 수가 부족하면 zero/skip합니다.
+
+Reliability는 detached semantic gate가 있으면 이를 우선 사용하고, 없으면 score/entropy/previous-memory-valid mask로 계산합니다. detect query는 항상 invalid입니다.
+
+### 권장 초기 weight
+
+모든 weight 기본값은 0입니다. 실험을 시작할 때는 작은 값부터 켜는 것을 권장합니다.
+
+| Loss | 권장 시작값 | 메모 |
+| --- | --- | --- |
+| `dptd_loss_ofa_consistency_weight` | `0.02` 또는 `0.05` | ID path 안정화용 |
+| `dptd_loss_semantic_memory_weight` | `0.01` 또는 `0.02` | semantic proto drift 완화 |
+| `dptd_loss_visual_memory_weight` | `0.01` 또는 `0.02` | visual memory 안정화 |
+| `dptd_loss_offset_consistency_weight` | `1e-4` 이하 | LocA 영향이 커질 수 있어 작게 시작 |
+| `dptd_loss_same_category_contrast_weight` | `0.0`부터 | conservative ablation 권장 |
+
+### v6 Debug stat
+
+`use_dptd_losses=True` and `dptd_loss_store_debug=True`일 때 다음 stat을 criterion/model debug dict에 남깁니다.
+
+- `dptd_loss_valid_track_count`
+- `dptd_loss_ofa_valid_count`
+- `dptd_loss_semantic_valid_count`
+- `dptd_loss_visual_valid_count`
+- `dptd_loss_offset_valid_count`
+- `dptd_loss_contrast_valid_count`
+- `dptd_loss_reliability_mean`
+- `dptd_loss_offset_shape_skip_count`
+- `dptd_loss_no_positive_skip_count`
+- `dptd_loss_no_negative_skip_count`
+
 ## 주요 Config 기본값
 
 | Config | 기본값 | 설명 |
@@ -290,10 +365,27 @@ Debug stat:
 | `ov_dptd_semantic_gate_id_proj_init` | `"small_random"` | semantic_gate ID projection init |
 | `ov_dptd_semantic_gate_id_proj_init_std` | `1e-3` | small-random init std |
 | `ov_dptd_reinit_dead_semantic_gate_id_proj` | `False` | dead checkpoint ID projection 재초기화 |
+| `use_dptd_losses` | `False` | v6 auxiliary loss 활성화 |
+| `dptd_loss_ofa_consistency_weight` | `0.0` | OFA cross-path consistency weight |
+| `dptd_loss_semantic_memory_weight` | `0.0` | semantic memory consistency weight |
+| `dptd_loss_visual_memory_weight` | `0.0` | visual memory consistency weight |
+| `dptd_loss_offset_consistency_weight` | `0.0` | sampling offset consistency weight |
+| `dptd_loss_same_category_contrast_weight` | `0.0` | same-category instance contrast weight |
+| `dptd_loss_min_reliability` | `0.5` | v6 loss valid track 최소 reliability |
+| `dptd_loss_max_entropy` | `0.75` | v6 semantic/visual loss 최대 entropy |
+| `dptd_loss_min_score` | `0.3` | v6 loss 최소 score |
+| `dptd_loss_query_scope` | `"track_only"` | v6은 track query loss만 지원 |
+| `dptd_loss_apply_aux` | `False` | v6은 final decoder layer loss만 지원 |
+| `dptd_loss_ofa_target` | `"ada_stopgrad"` | OFA target mode |
+| `dptd_loss_memory_target` | `"previous_stopgrad"` | memory target mode |
+| `dptd_loss_offset_target` | `"historical_stopgrad"` | offset target mode |
+| `dptd_contrast_temperature` | `0.07` | contrast CE temperature |
+| `dptd_contrast_min_negatives` | `1` | contrast 최소 negative 수 |
+| `dptd_loss_store_debug` | `False` | v6 loss debug stat 저장 |
 
 ## Guard 및 호환성
 
-다음 조합은 v5 범위에서 명확히 막습니다.
+다음 조합은 v6 범위에서 명확히 막습니다.
 
 - `use_ov_dptd=True` and `use_checkpoint_track=True`
 - `use_ov_dptd=True` and `use_transformer_ckpt=True`
@@ -309,10 +401,15 @@ Debug stat:
 - `use_dptd_semantic_gate=True` and `use_dptd_semantic_memory=False`
 - `ov_dptd_fusion="semantic_gate"` and `use_dptd_semantic_gate=False`
 - `use_dptd_semantic_update_suppression=True` and `use_dptd_update_suppression=False`
+- `use_dptd_losses=True` and `use_ov_dptd=False`
+- semantic/visual/contrast memory loss weight > 0 and `use_dptd_semantic_memory=False`
+- `dptd_loss_apply_aux=True`
+- `dptd_loss_query_scope`가 `"track_only"`가 아닌 경우
+- `dptd_loss_ofa_target`, `dptd_loss_memory_target`, `dptd_loss_offset_target`가 v6 지원값이 아닌 경우
 
 ## Debug/Training Log
 
-학습 loop는 다음 DPTD stat을 수집합니다.
+학습 loop는 다음 DPTD stat을 수집합니다. v6 loss debug는 위 v6 섹션의 `dptd_loss_*` stat도 함께 사용합니다.
 
 - `ov_dptd_gate_alpha`
 - `ov_dptd_gate_alpha_grad_norm`

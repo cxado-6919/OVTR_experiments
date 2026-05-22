@@ -69,6 +69,7 @@ class Transformer(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        use_dptd_losses=False,
         dptd_id_text_topk=5,
         dptd_id_text_num_heads=4,
         dptd_id_text_dropout=0.0,
@@ -166,6 +167,7 @@ class Transformer(nn.Module):
             ov_dptd_id_path_text=ov_dptd_id_path_text,
             ov_dptd_fuse_cti=ov_dptd_fuse_cti,
             ov_dptd_store_debug=ov_dptd_store_debug,
+            use_dptd_losses=use_dptd_losses,
             dptd_id_text_topk=dptd_id_text_topk,
             dptd_id_text_num_heads=dptd_id_text_num_heads,
             dptd_id_text_dropout=dptd_id_text_dropout,
@@ -655,6 +657,7 @@ class TransformerDecoder(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        use_dptd_losses=False,
         dptd_id_text_topk=5,
         dptd_id_text_num_heads=4,
         dptd_id_text_dropout=0.0,
@@ -728,6 +731,7 @@ class TransformerDecoder(nn.Module):
         self.ov_dptd_id_path_text = ov_dptd_id_path_text
         self.ov_dptd_fuse_cti = ov_dptd_fuse_cti
         self.ov_dptd_store_debug = ov_dptd_store_debug
+        self.use_dptd_losses = bool(use_dptd_losses)
         self.dptd_id_text_topk = int(dptd_id_text_topk)
         self.dptd_id_text_num_heads = int(dptd_id_text_num_heads)
         self.dptd_id_text_dropout = float(dptd_id_text_dropout)
@@ -1178,6 +1182,7 @@ class TransformerDecoder(nn.Module):
         text_attention_mask = ~text_dict["text_token_mask"]
         pre_outputs_classes = []
         historical_offsets = self._normalize_ov_dptd_offsets(dptd_sampling_offsets, tgt)
+        collect_loss_tensors = bool(self.training and self.use_dptd_losses)
         dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
         if dptd_debug is not None:
             dptd_debug["ov_dptd_gate_alpha"] = float(self.ov_dptd_gate_alpha.detach().item()) if self.ov_dptd_gate_alpha is not None else 0.0
@@ -1187,6 +1192,10 @@ class TransformerDecoder(nn.Module):
         last_gate_values = None
         last_gate_raw_values = None
         last_gate_memory_valid = None
+        last_ada_ofa = None
+        last_id_ofa = None
+        last_fused_ofa = None
+        last_ad_sampling_offsets_loss = None
 
         self.num_queries_cur = tgt.shape[0]
         self.select_text_num = text_dict["select_text_num"]
@@ -1224,8 +1233,10 @@ class TransformerDecoder(nn.Module):
                 cross_attn_mask=memory_mask,
                 num=num,
                 return_sampling_offsets=True,
+                detach_sampling_offsets=not collect_loss_tensors,
             )
-            last_ad_sampling_offsets = ad_sampling_offsets
+            last_ad_sampling_offsets_loss = ad_sampling_offsets if collect_loss_tensors else None
+            last_ad_sampling_offsets = ad_sampling_offsets.detach()
 
             id_tgt = output
             track_start = self.num_queries_cur if num is None else min(max(int(num), 0), self.num_queries_cur)
@@ -1280,6 +1291,10 @@ class TransformerDecoder(nn.Module):
                 output_ofa = self._fuse_ov_dptd_ofa_semantic_gate(layer_id, ada_ofa, id_ofa, gate_values)
             else:
                 output_ofa = self._fuse_ov_dptd_ofa(layer_id, ada_ofa, id_ofa)
+            if collect_loss_tensors:
+                last_ada_ofa = ada_ofa
+                last_id_ofa = id_ofa
+                last_fused_ofa = output_ofa
 
             if self.bbox_embed is not None:
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
@@ -1319,13 +1334,25 @@ class TransformerDecoder(nn.Module):
             query_pos,
         ]
         if return_dptd_info:
-            ret.append({
-                "sampling_offsets": last_ad_sampling_offsets,
+            dptd_info = {
+                "sampling_offsets": last_ad_sampling_offsets.detach() if last_ad_sampling_offsets is not None else None,
                 "semantic_gate": last_gate_values.detach() if last_gate_values is not None else None,
                 "semantic_gate_raw": last_gate_raw_values.detach() if last_gate_raw_values is not None else None,
                 "semantic_gate_memory_valid": last_gate_memory_valid.detach() if last_gate_memory_valid is not None else None,
                 "debug": dptd_debug,
-            })
+            }
+            if collect_loss_tensors:
+                dptd_info["loss_tensors"] = {
+                    "ada_ofa_final": last_ada_ofa.transpose(0, 1),
+                    "id_ofa_final": last_id_ofa.transpose(0, 1),
+                    "fused_ofa_final": last_fused_ofa.transpose(0, 1),
+                    "ad_sampling_offsets_final": last_ad_sampling_offsets_loss,
+                    "historical_sampling_offsets": historical_offsets.detach() if historical_offsets is not None else None,
+                    "semantic_gate": last_gate_values.detach() if last_gate_values is not None else None,
+                    "semantic_gate_memory_valid": last_gate_memory_valid.detach() if last_gate_memory_valid is not None else None,
+                    "num_det": track_start,
+                }
+            ret.append(dptd_info)
         return ret
 
     def get_logits_bias(self, embedding, num_real_queries):
@@ -1706,6 +1733,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
         num=None,
         return_sampling_offsets=False,
+        detach_sampling_offsets=True,
     ):
         """
         Input:
@@ -1739,6 +1767,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
             level_start_index=memory_level_start_index,
             key_padding_mask=memory_key_padding_mask,
             return_sampling_offsets=return_sampling_offsets,
+            detach_sampling_offsets=detach_sampling_offsets,
         )
         sampling_offsets = None
         if return_sampling_offsets:
@@ -1897,6 +1926,7 @@ def build_transformer(args):
         ov_dptd_id_path_text=getattr(args, "ov_dptd_id_path_text", "none"),
         ov_dptd_fuse_cti=getattr(args, "ov_dptd_fuse_cti", False),
         ov_dptd_store_debug=getattr(args, "ov_dptd_store_debug", False),
+        use_dptd_losses=getattr(args, "use_dptd_losses", False),
         dptd_id_text_topk=getattr(args, "dptd_id_text_topk", 5),
         dptd_id_text_num_heads=getattr(args, "dptd_id_text_num_heads", 4),
         dptd_id_text_dropout=getattr(args, "dptd_id_text_dropout", 0.0),

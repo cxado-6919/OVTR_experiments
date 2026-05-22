@@ -86,7 +86,32 @@ OV_DPTD_OPTION_DEFAULTS = {
     'ov_dptd_semantic_gate_id_proj_init': 'small_random',
     'ov_dptd_semantic_gate_id_proj_init_std': 1e-3,
     'ov_dptd_reinit_dead_semantic_gate_id_proj': False,
+    'use_dptd_losses': False,
+    'dptd_loss_ofa_consistency_weight': 0.0,
+    'dptd_loss_semantic_memory_weight': 0.0,
+    'dptd_loss_visual_memory_weight': 0.0,
+    'dptd_loss_offset_consistency_weight': 0.0,
+    'dptd_loss_same_category_contrast_weight': 0.0,
+    'dptd_loss_min_reliability': 0.5,
+    'dptd_loss_max_entropy': 0.75,
+    'dptd_loss_min_score': 0.3,
+    'dptd_loss_query_scope': 'track_only',
+    'dptd_loss_apply_aux': False,
+    'dptd_loss_ofa_target': 'ada_stopgrad',
+    'dptd_loss_memory_target': 'previous_stopgrad',
+    'dptd_loss_offset_target': 'historical_stopgrad',
+    'dptd_contrast_temperature': 0.07,
+    'dptd_contrast_min_negatives': 1,
+    'dptd_loss_store_debug': False,
 }
+
+DPTD_LOSS_NAMES = (
+    'loss_dptd_ofa_consistency',
+    'loss_dptd_semantic_memory',
+    'loss_dptd_visual_memory',
+    'loss_dptd_offset_consistency',
+    'loss_dptd_same_category_contrast',
+)
 
 DPTD_MEMORY_FIELDS = (
     'dptd_semantic_proto',
@@ -116,6 +141,15 @@ DPTD_TEMP_FIELDS = DPTD_CURRENT_MEMORY_FIELDS + (
     '_dptd_current_gate_raw',
     '_dptd_current_gate_memory_valid',
     '_dptd_current_visual_consistency',
+)
+
+DPTD_TEMP_LOSS_FIELDS = (
+    '_dptd_prev_semantic_proto_loss',
+    '_dptd_prev_visual_memory_loss',
+    '_dptd_prev_memory_valid_loss',
+    '_dptd_current_semantic_proto_loss',
+    '_dptd_current_visual_memory_loss',
+    '_dptd_original_query_idx_loss',
 )
 
 
@@ -223,6 +257,47 @@ def _validate_dptd_gate_options(container):
             raise RuntimeError(f'{name} must be in [0, 1].')
 
 
+
+def _validate_dptd_loss_options(container):
+    if not getattr(container, 'use_dptd_losses', False):
+        return
+    if not getattr(container, 'use_ov_dptd', False):
+        raise RuntimeError('DPTD auxiliary losses require use_ov_dptd=True.')
+    if getattr(container, 'dptd_loss_apply_aux', False):
+        raise NotImplementedError('OV-DPTD v6 supports final decoder layer losses only; dptd_loss_apply_aux=True is unsupported.')
+    if getattr(container, 'dptd_loss_query_scope', 'track_only') != 'track_only':
+        raise NotImplementedError("OV-DPTD v6 only supports dptd_loss_query_scope='track_only'.")
+    if getattr(container, 'dptd_loss_ofa_target', 'ada_stopgrad') != 'ada_stopgrad':
+        raise NotImplementedError("OV-DPTD v6 only supports dptd_loss_ofa_target='ada_stopgrad'.")
+    if getattr(container, 'dptd_loss_memory_target', 'previous_stopgrad') != 'previous_stopgrad':
+        raise NotImplementedError("OV-DPTD v6 only supports dptd_loss_memory_target='previous_stopgrad'.")
+    if getattr(container, 'dptd_loss_offset_target', 'historical_stopgrad') != 'historical_stopgrad':
+        raise NotImplementedError("OV-DPTD v6 only supports dptd_loss_offset_target='historical_stopgrad'.")
+    for name in [
+        'dptd_loss_ofa_consistency_weight',
+        'dptd_loss_semantic_memory_weight',
+        'dptd_loss_visual_memory_weight',
+        'dptd_loss_offset_consistency_weight',
+        'dptd_loss_same_category_contrast_weight',
+    ]:
+        if float(getattr(container, name, 0.0)) < 0.0:
+            raise RuntimeError(f'{name} must be >= 0.')
+    memory_weight = (
+        float(getattr(container, 'dptd_loss_semantic_memory_weight', 0.0))
+        + float(getattr(container, 'dptd_loss_visual_memory_weight', 0.0))
+        + float(getattr(container, 'dptd_loss_same_category_contrast_weight', 0.0))
+    )
+    if memory_weight > 0.0 and not getattr(container, 'use_dptd_semantic_memory', False):
+        raise RuntimeError('DPTD semantic/visual/contrast losses require use_dptd_semantic_memory=True when weighted.')
+    for name in ['dptd_loss_min_reliability', 'dptd_loss_max_entropy', 'dptd_loss_min_score']:
+        value = float(getattr(container, name))
+        if value < 0.0 or value > 1.0:
+            raise RuntimeError(f'{name} must be in [0, 1].')
+    if float(getattr(container, 'dptd_contrast_temperature', 0.07)) <= 0.0:
+        raise RuntimeError('dptd_contrast_temperature must be > 0.')
+    if int(getattr(container, 'dptd_contrast_min_negatives', 1)) < 1:
+        raise RuntimeError('dptd_contrast_min_negatives must be >= 1.')
+
 def resolve_attention_protection_options(args, cfg):
     """Apply config/CLI/default attention protection options to both args and cfg."""
     for name, default in ATTENTION_PROTECTION_OPTION_DEFAULTS.items():
@@ -254,6 +329,7 @@ def resolve_ov_dptd_options(args, cfg):
     _validate_dptd_memory_options(args)
     _validate_dptd_gate_options(args)
     _validate_dptd_id_text_options(args)
+    _validate_dptd_loss_options(args)
 
     if not getattr(args, 'use_ov_dptd', False):
         return
@@ -381,6 +457,18 @@ class OVFrameMatcher(SetCriterion):
                         calculate_negative_samples=True,
                         num_queries=900,
                         train_with_artificial_img_seqs=False,
+                        use_dptd_losses=False,
+                        dptd_loss_min_reliability=0.5,
+                        dptd_loss_max_entropy=0.75,
+                        dptd_loss_min_score=0.3,
+                        dptd_loss_query_scope='track_only',
+                        dptd_loss_apply_aux=False,
+                        dptd_loss_ofa_target='ada_stopgrad',
+                        dptd_loss_memory_target='previous_stopgrad',
+                        dptd_loss_offset_target='historical_stopgrad',
+                        dptd_contrast_temperature=0.07,
+                        dptd_contrast_min_negatives=1,
+                        dptd_loss_store_debug=False,
                         ):
         """ Create the criterion.
         Parameters:
@@ -403,6 +491,22 @@ class OVFrameMatcher(SetCriterion):
         self.num_queries = num_queries
         self.calculate_negative_samples = calculate_negative_samples
         self.train_with_artificial_img_seqs = train_with_artificial_img_seqs
+        self.use_dptd_losses = bool(use_dptd_losses)
+        self.use_ov_dptd = bool(use_dptd_losses)
+        self.use_dptd_semantic_memory = True
+        self.dptd_loss_min_reliability = float(dptd_loss_min_reliability)
+        self.dptd_loss_max_entropy = float(dptd_loss_max_entropy)
+        self.dptd_loss_min_score = float(dptd_loss_min_score)
+        self.dptd_loss_query_scope = dptd_loss_query_scope
+        self.dptd_loss_apply_aux = bool(dptd_loss_apply_aux)
+        self.dptd_loss_ofa_target = dptd_loss_ofa_target
+        self.dptd_loss_memory_target = dptd_loss_memory_target
+        self.dptd_loss_offset_target = dptd_loss_offset_target
+        self.dptd_contrast_temperature = float(dptd_contrast_temperature)
+        self.dptd_contrast_min_negatives = int(dptd_contrast_min_negatives)
+        self.dptd_loss_store_debug = bool(dptd_loss_store_debug)
+        _validate_dptd_loss_options(self)
+        self.dptd_loss_debug_stats = {}
 
     def initialize(self, gt_instances: List[Instances]):
         self.gt_instances = gt_instances
@@ -594,6 +698,229 @@ class OVFrameMatcher(SetCriterion):
         losses = {"loss_align_pre": loss_encoder_align}
         return losses
     
+
+    def _zero_dptd_loss_like(self, reference):
+        if isinstance(reference, torch.Tensor):
+            return reference.sum() * 0.0
+        device = self.sample_device if self.sample_device is not None else torch.device('cpu')
+        return torch.zeros((), device=device)
+
+    def _dptd_zero_loss_dict(self, reference):
+        zero = self._zero_dptd_loss_like(reference)
+        return {name: zero for name in DPTD_LOSS_NAMES}
+
+    def _cosine_distance_loss(self, pred, target, weights):
+        if pred.numel() == 0:
+            return self._zero_dptd_loss_like(pred)
+        pred = F.normalize(pred.float(), dim=-1, eps=1e-6)
+        target = F.normalize(target.float(), dim=-1, eps=1e-6)
+        distance = 1.0 - F.cosine_similarity(pred, target, dim=-1, eps=1e-6)
+        weights = weights.to(device=distance.device, dtype=distance.dtype)
+        denom = weights.sum().clamp_min(1e-6)
+        return (distance * weights).sum() / denom
+
+    def _gather_dptd_loss_tensor(self, value, original_indices):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor) and value.dim() >= 2:
+            return value[0, original_indices]
+        return value
+
+    def _select_dptd_loss_indices(self, outputs, track_instances, keep_indices):
+        loss_tensors = outputs.get('dptd_loss_tensors')
+        if not isinstance(loss_tensors, dict):
+            return None
+        if track_instances.has('_dptd_original_query_idx_loss'):
+            original_indices = track_instances.get('_dptd_original_query_idx_loss').to(device=track_instances.pred_logits.device, dtype=torch.long)
+        else:
+            original_indices = torch.nonzero(keep_indices, as_tuple=False).flatten().to(device=track_instances.pred_logits.device, dtype=torch.long)
+        if original_indices.numel() != len(track_instances):
+            raise RuntimeError('DPTD loss original query mapping row mismatch.')
+        num_det = int(loss_tensors.get('num_det', self.num_queries))
+        track_mask = original_indices >= num_det
+        existing_mask = track_instances.obj_idxes >= 0 if track_instances.has('obj_idxes') else torch.zeros_like(track_mask)
+        if track_instances.has('_dptd_prev_memory_valid_loss'):
+            prev_valid = track_instances.get('_dptd_prev_memory_valid_loss').to(device=track_mask.device, dtype=torch.bool)
+        else:
+            prev_valid = existing_mask.clone()
+        memory_valid = prev_valid.clone()
+        if track_instances.has('_dptd_current_gate_memory_valid'):
+            gate_valid = track_instances.get('_dptd_current_gate_memory_valid').to(device=track_mask.device, dtype=torch.bool)
+            memory_valid = memory_valid | gate_valid
+        base_valid = track_mask & existing_mask & memory_valid
+        return {
+            'loss_tensors': loss_tensors,
+            'original_indices': original_indices,
+            'num_det': num_det,
+            'track_mask': track_mask,
+            'existing_mask': existing_mask,
+            'prev_valid': prev_valid,
+            'memory_valid': memory_valid,
+            'base_valid': base_valid,
+        }
+
+    def _dptd_reliability_weights(self, track_instances, selection):
+        device = track_instances.pred_logits.device
+        dtype = track_instances.pred_logits.dtype
+        memory_valid = selection['memory_valid'].to(device=device)
+        if track_instances.has('_dptd_current_gate'):
+            reliability = track_instances.get('_dptd_current_gate').to(device=device, dtype=dtype).detach() * memory_valid.to(dtype=dtype)
+        else:
+            scores = track_instances.scores.to(device=device, dtype=dtype) if track_instances.has('scores') else track_instances.pred_logits.sigmoid().max(dim=-1).values
+            if track_instances.has('_dptd_current_semantic_entropy'):
+                entropy = track_instances.get('_dptd_current_semantic_entropy').to(device=device, dtype=dtype).detach()
+            else:
+                entropy = torch.zeros_like(scores)
+            min_score = float(self.dptd_loss_min_score)
+            max_entropy = max(float(self.dptd_loss_max_entropy), 1e-6)
+            score_conf = ((scores - min_score) / max(1.0 - min_score, 1e-6)).clamp(0.0, 1.0)
+            entropy_conf = ((max_entropy - entropy) / max_entropy).clamp(0.0, 1.0)
+            reliability = score_conf * entropy_conf * memory_valid.to(dtype=dtype)
+        reliability = reliability.detach()
+        valid = selection['base_valid'] & (reliability >= float(self.dptd_loss_min_reliability))
+        return reliability, valid
+
+    def _dptd_same_category_contrast_loss(self, track_instances, selection, valid_mask, weights):
+        if not track_instances.has('_dptd_current_visual_memory_loss') or not track_instances.has('_dptd_prev_visual_memory_loss'):
+            return self._zero_dptd_loss_like(track_instances.pred_logits), 0, 0, 0
+        select_id = track_instances.get_fields().get('select_id', None)
+        # select_id is not an Instances field in normal flow, so use outputs-level select_id in caller via temporary attr fallback.
+        select_id = getattr(self, '_dptd_current_select_id', None)
+        if select_id is None:
+            return self._zero_dptd_loss_like(track_instances.pred_logits), 0, 0, int(valid_mask.sum().item())
+        select_id = select_id.to(device=track_instances.pred_logits.device, dtype=torch.long)
+        num_cls = int(select_id.numel())
+        if num_cls <= 0:
+            return self._zero_dptd_loss_like(track_instances.pred_logits), 0, 0, int(valid_mask.sum().item())
+        logits = track_instances.pred_logits[:, :num_cls]
+        top1_local = logits.sigmoid().argmax(dim=-1)
+        top1_global = select_id[top1_local]
+        if track_instances.has('_dptd_current_topk_class_indices'):
+            stored_top1 = track_instances.get('_dptd_current_topk_class_indices')[:, 0]
+            valid_stored = stored_top1 >= 0
+            top1_global = torch.where(valid_stored, stored_top1.to(device=top1_global.device, dtype=top1_global.dtype), top1_global)
+        current_visual = track_instances.get('_dptd_current_visual_memory_loss')
+        prev_visual = track_instances.get('_dptd_prev_visual_memory_loss').detach()
+        obj_ids = track_instances.obj_idxes if track_instances.has('obj_idxes') else torch.full_like(top1_global, -1)
+        losses = []
+        no_pos = 0
+        no_neg = 0
+        for row_idx in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
+            if top1_global[row_idx].detach().item() < 0:
+                no_pos += 1
+                continue
+            positive = prev_visual[row_idx]
+            if positive.float().norm().item() <= 1e-6:
+                no_pos += 1
+                continue
+            neg_mask = (
+                valid_mask
+                & (top1_global == top1_global[row_idx])
+                & (obj_ids != obj_ids[row_idx])
+            )
+            neg_indices = torch.nonzero(neg_mask, as_tuple=False).flatten()
+            if neg_indices.numel() < int(self.dptd_contrast_min_negatives):
+                no_neg += 1
+                continue
+            anchor = F.normalize(current_visual[row_idx].float().unsqueeze(0), dim=-1, eps=1e-6)
+            positive = F.normalize(positive.float().unsqueeze(0), dim=-1, eps=1e-6)
+            negatives = F.normalize(current_visual[neg_indices].detach().float(), dim=-1, eps=1e-6)
+            keys = torch.cat([positive, negatives], dim=0)
+            logits_i = torch.matmul(anchor, keys.t()) / float(self.dptd_contrast_temperature)
+            loss_i = F.cross_entropy(logits_i, torch.zeros(1, device=logits_i.device, dtype=torch.long))
+            losses.append(loss_i * weights[row_idx].to(device=loss_i.device, dtype=loss_i.dtype))
+        if not losses:
+            return self._zero_dptd_loss_like(current_visual), 0, no_pos, no_neg
+        return torch.stack(losses).sum() / weights[valid_mask].sum().clamp_min(1e-6), len(losses), no_pos, no_neg
+
+    def compute_dptd_aux_losses(self, outputs, track_instances, keep_indices):
+        reference = outputs.get('pred_logits', track_instances.pred_logits)
+        losses = self._dptd_zero_loss_dict(reference)
+        if not self.use_dptd_losses:
+            return {}
+        selection = self._select_dptd_loss_indices(outputs, track_instances, keep_indices)
+        if selection is None:
+            return losses
+        loss_tensors = selection['loss_tensors']
+        original_indices = selection['original_indices']
+        reliability, valid_mask = self._dptd_reliability_weights(track_instances, selection)
+        valid_count = int(valid_mask.detach().sum().item())
+
+        ada_ofa = self._gather_dptd_loss_tensor(loss_tensors.get('ada_ofa_final'), original_indices)
+        id_ofa = self._gather_dptd_loss_tensor(loss_tensors.get('id_ofa_final'), original_indices)
+        if ada_ofa is not None and id_ofa is not None and valid_mask.any():
+            losses['loss_dptd_ofa_consistency'] = self._cosine_distance_loss(id_ofa[valid_mask], ada_ofa.detach()[valid_mask], reliability[valid_mask])
+            ofa_count = int(valid_mask.detach().sum().item())
+        else:
+            ofa_count = 0
+
+        semantic_valid = valid_mask.clone()
+        if track_instances.has('_dptd_current_semantic_entropy'):
+            semantic_valid = semantic_valid & (track_instances.get('_dptd_current_semantic_entropy') <= float(self.dptd_loss_max_entropy))
+        if track_instances.has('scores'):
+            semantic_valid = semantic_valid & (track_instances.scores >= float(self.dptd_loss_min_score))
+        if track_instances.has('_dptd_current_semantic_proto_loss') and track_instances.has('_dptd_prev_semantic_proto_loss') and semantic_valid.any():
+            cur_sem = track_instances.get('_dptd_current_semantic_proto_loss')
+            prev_sem = track_instances.get('_dptd_prev_semantic_proto_loss').detach()
+            losses['loss_dptd_semantic_memory'] = self._cosine_distance_loss(cur_sem[semantic_valid], prev_sem[semantic_valid], reliability[semantic_valid])
+            semantic_count = int(semantic_valid.detach().sum().item())
+        else:
+            semantic_count = 0
+
+        visual_valid = valid_mask.clone()
+        if track_instances.has('scores'):
+            visual_valid = visual_valid & (track_instances.scores >= float(self.dptd_loss_min_score))
+        if track_instances.has('_dptd_current_semantic_entropy'):
+            visual_valid = visual_valid & (track_instances.get('_dptd_current_semantic_entropy') <= float(self.dptd_loss_max_entropy))
+        if track_instances.has('_dptd_current_visual_memory_loss') and track_instances.has('_dptd_prev_visual_memory_loss') and visual_valid.any():
+            cur_vis = track_instances.get('_dptd_current_visual_memory_loss')
+            prev_vis = track_instances.get('_dptd_prev_visual_memory_loss').detach()
+            losses['loss_dptd_visual_memory'] = self._cosine_distance_loss(cur_vis[visual_valid], prev_vis[visual_valid], reliability[visual_valid])
+            visual_count = int(visual_valid.detach().sum().item())
+        else:
+            visual_count = 0
+
+        offset_count = 0
+        offset_skip = 0
+        ad_offsets = loss_tensors.get('ad_sampling_offsets_final')
+        hist_offsets = loss_tensors.get('historical_sampling_offsets')
+        if isinstance(ad_offsets, torch.Tensor) and isinstance(hist_offsets, torch.Tensor) and tuple(ad_offsets.shape) == tuple(hist_offsets.shape):
+            pred_offsets = ad_offsets[0, original_indices]
+            target_offsets = hist_offsets.detach()[0, original_indices]
+            if valid_mask.any():
+                offset_l1 = (pred_offsets[valid_mask] - target_offsets[valid_mask]).abs().flatten(1).mean(dim=1)
+                weights = reliability[valid_mask].to(device=offset_l1.device, dtype=offset_l1.dtype)
+                losses['loss_dptd_offset_consistency'] = (offset_l1 * weights).sum() / weights.sum().clamp_min(1e-6)
+                offset_count = int(valid_mask.detach().sum().item())
+        else:
+            offset_skip = 1 if ad_offsets is not None or hist_offsets is not None else 0
+
+        self._dptd_current_select_id = outputs.get('select_id')
+        contrast_loss, contrast_count, no_pos, no_neg = self._dptd_same_category_contrast_loss(
+            track_instances,
+            selection,
+            valid_mask,
+            reliability,
+        )
+        self._dptd_current_select_id = None
+        losses['loss_dptd_same_category_contrast'] = contrast_loss
+
+        if self.dptd_loss_store_debug:
+            rel_valid = reliability[valid_mask]
+            self.dptd_loss_debug_stats = {
+                'dptd_loss_valid_track_count': valid_count,
+                'dptd_loss_ofa_valid_count': ofa_count,
+                'dptd_loss_semantic_valid_count': semantic_count,
+                'dptd_loss_visual_valid_count': visual_count,
+                'dptd_loss_offset_valid_count': offset_count,
+                'dptd_loss_contrast_valid_count': contrast_count,
+                'dptd_loss_reliability_mean': float(rel_valid.mean().item()) if rel_valid.numel() else 0.0,
+                'dptd_loss_offset_shape_skip_count': offset_skip,
+                'dptd_loss_no_positive_skip_count': no_pos,
+                'dptd_loss_no_negative_skip_count': no_neg,
+            }
+        return losses
+
     def match_for_single_frame(self, outputs: dict, is_first=None, sample_idx=None):
         outputs_without_aux = {k: v for k, v in outputs.items() if 
                                k != 'aux_outputs' and k != 'enc_outputs'}
@@ -700,13 +1027,18 @@ class OVFrameMatcher(SetCriterion):
         self.num_samples += len(gt_instances_i) + num_disappear_track
         self.sample_device = device
 
+        frame_prefix = f'frame_{self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]}_'
         for loss in self.losses:
             new_track_loss = self.get_loss(loss,
                                            outputs=outputs_i,
                                            gt_instances=[gt_instances_i],
                                            indices=[(matched_indices[:, 0], matched_indices[:, 1])],
                                            num_boxes=1)
-            self._accumulate_losses(f'frame_{self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]}_', new_track_loss)
+            self._accumulate_losses(frame_prefix, new_track_loss)
+
+        if self.use_dptd_losses:
+            dptd_losses = self.compute_dptd_aux_losses(outputs_without_aux, track_instances, keep_indices)
+            self._accumulate_losses(frame_prefix, dptd_losses)
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -829,6 +1161,8 @@ class OVTR(nn.Module):
                     dptd_gate_debug=False,
                     use_dptd_semantic_update_suppression=False,
                     dptd_semantic_update_suppression_thresh=0.3,
+                    use_dptd_losses=False,
+                    dptd_loss_store_debug=False,
                  ):
         """ Initializes the model.
         Parameters:
@@ -976,6 +1310,8 @@ class OVTR(nn.Module):
         self.dptd_gate_debug = dptd_gate_debug
         self.use_dptd_semantic_update_suppression = use_dptd_semantic_update_suppression
         self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
+        self.use_dptd_losses = bool(use_dptd_losses)
+        self.dptd_loss_store_debug = bool(dptd_loss_store_debug)
         self.dptd_memory_dim = int(self.text_embeddings.shape[0])
         self.dptd_id_text_feature_dim = int(getattr(self.transformer.decoder, 'dptd_id_text_feature_dim', hidden_dim))
         self.dptd_visual_memory_proj = None
@@ -992,6 +1328,7 @@ class OVTR(nn.Module):
         _validate_dptd_memory_options(self)
         _validate_dptd_gate_options(self)
         _validate_dptd_id_text_options(self)
+        _validate_dptd_loss_options(self)
         self.supports_mot_batch = (
             (not use_checkpoint)
             and (len(self.transformer.encoder.fusion_layers) == 0)
@@ -1042,12 +1379,23 @@ class OVTR(nn.Module):
             'dptd_id_text_skipped_no_topk_count': 0,
             'dptd_id_text_residual_norm_mean': 0.0,
             'dptd_id_text_residual_norm_max': 0.0,
+            'dptd_loss_valid_track_count': 0,
+            'dptd_loss_ofa_valid_count': 0,
+            'dptd_loss_semantic_valid_count': 0,
+            'dptd_loss_visual_valid_count': 0,
+            'dptd_loss_offset_valid_count': 0,
+            'dptd_loss_contrast_valid_count': 0,
+            'dptd_loss_reliability_mean': 0.0,
+            'dptd_loss_offset_shape_skip_count': 0,
+            'dptd_loss_no_positive_skip_count': 0,
+            'dptd_loss_no_negative_skip_count': 0,
         } if self.use_ov_dptd and (
             self.ov_dptd_store_debug
             or self.use_dptd_update_suppression
             or self.dptd_memory_debug
             or self.dptd_gate_debug
             or self.dptd_id_text_debug
+            or self.dptd_loss_store_debug
         ) else {}
 
     def _dptd_offset_shape(self, num_queries):
@@ -1554,6 +1902,7 @@ class OVTR(nn.Module):
             '_dptd_current_semantic_entropy': entropy.to(dtype=torch.float32).detach(),
             '_dptd_current_topk_class_indices': topk_indices.to(dtype=torch.long).detach(),
             '_dptd_current_topk_class_scores': topk_scores.to(dtype=torch.float32).detach(),
+            '_dptd_current_semantic_proto_loss': semantic_proto.to(dtype=target_dtype),
         }
         if getattr(self, 'dptd_store_topk_text_embeddings', True):
             if id_text_embeddings is None:
@@ -1622,17 +1971,88 @@ class OVTR(nn.Module):
         target_dtype = track_instances.query_tgt.dtype if track_instances.has('query_tgt') else visual_memory.dtype
         if getattr(self, 'ov_dptd_debug_stats', {}):
             self.ov_dptd_debug_stats['dptd_memory_visual_source'] = visual_source
-        return visual_memory.to(dtype=target_dtype).detach()
+        return visual_memory.to(dtype=target_dtype)
 
     def _attach_dptd_memory_candidates(self, frame_res, track_instances):
         if not self.use_dptd_semantic_memory:
             return track_instances
-        with torch.no_grad():
+        keep_loss_graph = bool(self.training and self.use_dptd_losses)
+        if keep_loss_graph:
             semantic_candidates = self._compute_dptd_semantic_memory_candidates(frame_res, track_instances)
             visual_candidate = self._compute_dptd_visual_memory_candidates(frame_res, track_instances)
-            for name, value in semantic_candidates.items():
+        else:
+            with torch.no_grad():
+                semantic_candidates = self._compute_dptd_semantic_memory_candidates(frame_res, track_instances)
+                visual_candidate = self._compute_dptd_visual_memory_candidates(frame_res, track_instances)
+        for name, value in semantic_candidates.items():
+            if name in DPTD_TEMP_LOSS_FIELDS and keep_loss_graph:
+                track_instances.set(name, value)
+            elif name in DPTD_TEMP_LOSS_FIELDS:
+                continue
+            else:
                 track_instances.set(name, value.detach())
-            track_instances.set('_dptd_current_visual_memory', visual_candidate.detach())
+        track_instances.set('_dptd_current_visual_memory', visual_candidate.detach())
+        if keep_loss_graph:
+            track_instances.set('_dptd_current_visual_memory_loss', visual_candidate)
+        return track_instances
+
+    def _attach_dptd_loss_prev_targets(self, memory_snapshot, track_instances):
+        if not (self.training and self.use_dptd_losses):
+            return track_instances
+        device = track_instances.pred_logits.device if track_instances.has('pred_logits') else track_instances.query_tgt.device
+        idx = torch.arange(len(track_instances), device=device, dtype=torch.long)
+        track_instances.set('_dptd_original_query_idx_loss', idx)
+        if not self.use_dptd_semantic_memory:
+            return track_instances
+
+        sem_source = (
+            track_instances.get('_dptd_current_semantic_proto_loss')
+            if track_instances.has('_dptd_current_semantic_proto_loss')
+            else track_instances.dptd_semantic_proto
+        )
+        vis_source = (
+            track_instances.get('_dptd_current_visual_memory_loss')
+            if track_instances.has('_dptd_current_visual_memory_loss')
+            else track_instances.dptd_visual_memory
+        )
+        prev_semantic = torch.zeros_like(sem_source).detach()
+        prev_visual = torch.zeros_like(vis_source).detach()
+        prev_valid = torch.zeros(len(track_instances), device=device, dtype=torch.bool)
+        if memory_snapshot is not None and track_instances.has('obj_idxes'):
+            snapshot_ids = memory_snapshot.get('ids')
+            fields = memory_snapshot.get('fields', {})
+            if (
+                isinstance(snapshot_ids, torch.Tensor)
+                and 'dptd_semantic_proto' in fields
+                and 'dptd_visual_memory' in fields
+            ):
+                snapshot_ids = snapshot_ids.to(device=track_instances.obj_idxes.device, dtype=track_instances.obj_idxes.dtype)
+                old_semantic = fields['dptd_semantic_proto'].to(device=prev_semantic.device, dtype=prev_semantic.dtype)
+                old_visual = fields['dptd_visual_memory'].to(device=prev_visual.device, dtype=prev_visual.dtype)
+                for row_idx in range(len(track_instances)):
+                    track_id = track_instances.obj_idxes[row_idx]
+                    if int(track_id.detach().item()) < 0:
+                        continue
+                    matches = torch.nonzero(snapshot_ids == track_id, as_tuple=False).flatten()
+                    if matches.numel() != 1:
+                        continue
+                    old_idx = int(matches[0].item())
+                    if old_semantic[old_idx].float().norm().item() <= 1e-6 or old_visual[old_idx].float().norm().item() <= 1e-6:
+                        continue
+                    prev_semantic[row_idx] = old_semantic[old_idx]
+                    prev_visual[row_idx] = old_visual[old_idx]
+                    prev_valid[row_idx] = True
+        track_instances.set('_dptd_prev_semantic_proto_loss', prev_semantic.detach())
+        track_instances.set('_dptd_prev_visual_memory_loss', prev_visual.detach())
+        track_instances.set('_dptd_prev_memory_valid_loss', prev_valid.detach())
+        return track_instances
+
+    def _remove_dptd_loss_temp_fields(self, track_instances):
+        if track_instances is None:
+            return track_instances
+        for field_name in DPTD_TEMP_LOSS_FIELDS:
+            if track_instances.has(field_name):
+                track_instances.remove(field_name)
         return track_instances
 
     def _remove_dptd_memory_candidate_fields(self, track_instances):
@@ -1641,7 +2061,7 @@ class OVTR(nn.Module):
         for field_name in DPTD_TEMP_FIELDS:
             if track_instances.has(field_name):
                 track_instances.remove(field_name)
-        return track_instances
+        return self._remove_dptd_loss_temp_fields(track_instances)
 
     def _set_dptd_memory_debug_stats(self, **stats):
         if not (self.dptd_memory_debug and getattr(self, 'ov_dptd_debug_stats', {})):
@@ -2265,6 +2685,10 @@ class OVTR(nn.Module):
                 out['dptd_gate_raw_values'] = dptd_info['semantic_gate_raw'].detach()
             if dptd_info.get('semantic_gate_memory_valid') is not None:
                 out['dptd_gate_memory_valid'] = dptd_info['semantic_gate_memory_valid'].detach()
+            if self.training and self.use_dptd_losses:
+                if dptd_info.get('loss_tensors') is None:
+                    raise RuntimeError('OV-DPTD v6 expected dptd_info["loss_tensors"] during training.')
+                out['dptd_loss_tensors'] = dptd_info['loss_tensors']
             self._update_ov_dptd_debug_stats(dptd_info)
             
         if self.aux_loss:
@@ -2293,6 +2717,7 @@ class OVTR(nn.Module):
         track_instances.query_pos = frame_res["query_pos_track"][0]
         self._attach_dptd_sampling_offsets(frame_res, track_instances)
         track_instances = self._attach_dptd_memory_candidates(frame_res, track_instances)
+        track_instances = self._attach_dptd_loss_prev_targets(dptd_memory_snapshot, track_instances)
         track_instances = self._attach_dptd_gate_values(frame_res, track_instances)
         self._select_dptd_update_suppressed_ids(dptd_suppression_snapshot, track_instances)
         track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
@@ -2301,6 +2726,7 @@ class OVTR(nn.Module):
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res, is_first, sample_idx=sample_idx)
+            track_instances = self._remove_dptd_loss_temp_fields(track_instances)
         else:
             if self.train_with_artificial_img_seqs:
                 track_instances, _track_discard = protect_track_preds(track_instances, num_queries=self.num_queries, miss_tolerance=self.track_base.miss_tolerance, ious_thresh=self.ious_thresh) 
@@ -2519,12 +2945,36 @@ def build(args, cfg):
                                     'frame_{}_aux{}_loss_align'.format(i, j): args.align_loss_coef,
                                     })
 
+    if args.use_dptd_losses:
+        dptd_loss_weight_by_name = {
+            'loss_dptd_ofa_consistency': args.dptd_loss_ofa_consistency_weight,
+            'loss_dptd_semantic_memory': args.dptd_loss_semantic_memory_weight,
+            'loss_dptd_visual_memory': args.dptd_loss_visual_memory_weight,
+            'loss_dptd_offset_consistency': args.dptd_loss_offset_consistency_weight,
+            'loss_dptd_same_category_contrast': args.dptd_loss_same_category_contrast_weight,
+        }
+        for i in range(0, num_frames_per_batch):
+            for loss_name, loss_weight in dptd_loss_weight_by_name.items():
+                weight_dict[f'frame_{i}_{loss_name}'] = loss_weight
+
     losses = ['labels', 'boxes', 'align']
 
     criterion = OVFrameMatcher(None, matcher=matcher, weight_dict=weight_dict, losses=losses, random_drop=args.random_drop,
                                 train_with_artificial_img_seqs=cfg.train_with_artificial_img_seqs,
                                 calculate_negative_samples=args.calculate_negative_samples,
                                 num_queries=cfg.num_queries,
+                                use_dptd_losses=args.use_dptd_losses,
+                                dptd_loss_min_reliability=args.dptd_loss_min_reliability,
+                                dptd_loss_max_entropy=args.dptd_loss_max_entropy,
+                                dptd_loss_min_score=args.dptd_loss_min_score,
+                                dptd_loss_query_scope=args.dptd_loss_query_scope,
+                                dptd_loss_apply_aux=args.dptd_loss_apply_aux,
+                                dptd_loss_ofa_target=args.dptd_loss_ofa_target,
+                                dptd_loss_memory_target=args.dptd_loss_memory_target,
+                                dptd_loss_offset_target=args.dptd_loss_offset_target,
+                                dptd_contrast_temperature=args.dptd_contrast_temperature,
+                                dptd_contrast_min_negatives=args.dptd_contrast_min_negatives,
+                                dptd_loss_store_debug=args.dptd_loss_store_debug,
                                 )
     criterion.to(device)
 
@@ -2582,5 +3032,7 @@ def build(args, cfg):
         dptd_gate_debug=args.dptd_gate_debug,
         use_dptd_semantic_update_suppression=args.use_dptd_semantic_update_suppression,
         dptd_semantic_update_suppression_thresh=args.dptd_semantic_update_suppression_thresh,
+        use_dptd_losses=args.use_dptd_losses,
+        dptd_loss_store_debug=args.dptd_loss_store_debug,
     )
     return model, criterion

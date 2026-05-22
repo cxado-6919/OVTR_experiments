@@ -396,6 +396,7 @@ class MultiScaleDeformableAttention(nn.Module):
         level_start_index: Optional[torch.Tensor] = None,
         override_sampling_offsets: Optional[torch.Tensor] = None,
         return_sampling_offsets: bool = False,
+        detach_sampling_offsets: bool = True,
         **kwargs
     ) -> torch.Tensor:
 
@@ -548,7 +549,8 @@ class MultiScaleDeformableAttention(nn.Module):
             output = output.permute(1, 0, 2)
 
         if return_sampling_offsets:
-            return output, sampling_offsets.detach()
+            returned_offsets = sampling_offsets.detach() if detach_sampling_offsets else sampling_offsets
+            return output, returned_offsets
         return output
 
 

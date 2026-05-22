@@ -12,7 +12,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from detectron2.structures import Instances  # noqa: E402
-from models.ovtr import DPTD_CURRENT_MEMORY_FIELDS, DPTD_TEMP_FIELDS, OVTR, RuntimeTrackerBase, resolve_ov_dptd_options  # noqa: E402
+from models.ovtr import (  # noqa: E402
+    DPTD_CURRENT_MEMORY_FIELDS,
+    DPTD_LOSS_NAMES,
+    DPTD_TEMP_FIELDS,
+    DPTD_TEMP_LOSS_FIELDS,
+    OVFrameMatcher,
+    OVTR,
+    RuntimeTrackerBase,
+    resolve_ov_dptd_options,
+)
 from models.transformer import DeformableTransformerDecoderLayer, TransformerDecoder  # noqa: E402
 from util.tool import is_ov_dptd_checkpoint_key, maybe_warn_or_reinit_dead_ov_dptd_semantic_gate  # noqa: E402
 
@@ -201,6 +210,23 @@ def _args_cfg(**overrides):
         dptd_id_text_score_eps=1e-8,
         dptd_id_text_debug=False,
         dptd_store_topk_text_embeddings=True,
+        use_dptd_losses=False,
+        dptd_loss_ofa_consistency_weight=0.0,
+        dptd_loss_semantic_memory_weight=0.0,
+        dptd_loss_visual_memory_weight=0.0,
+        dptd_loss_offset_consistency_weight=0.0,
+        dptd_loss_same_category_contrast_weight=0.0,
+        dptd_loss_min_reliability=0.5,
+        dptd_loss_max_entropy=0.75,
+        dptd_loss_min_score=0.3,
+        dptd_loss_query_scope="track_only",
+        dptd_loss_apply_aux=False,
+        dptd_loss_ofa_target="ada_stopgrad",
+        dptd_loss_memory_target="previous_stopgrad",
+        dptd_loss_offset_target="historical_stopgrad",
+        dptd_contrast_temperature=0.07,
+        dptd_contrast_min_negatives=1,
+        dptd_loss_store_debug=False,
         hidden_dim=256,
         use_checkpoint_track=False,
         use_transformer_ckpt=False,
@@ -269,6 +295,10 @@ def test_dptd_guards():
         use_dptd_semantic_gate=True,
         ov_dptd_fusion="semantic_gate",
     ))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_ov_dptd=False, use_dptd_losses=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_losses=True, dptd_loss_semantic_memory_weight=0.1)))
+    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_losses=True, dptd_loss_apply_aux=True)))
+    _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_losses=True, dptd_loss_query_scope="all")))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="small_random", ov_dptd_semantic_gate_id_proj_init_std=0.0)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="bad")))
 
@@ -769,7 +799,7 @@ def test_dptd_semantic_update_suppression_and_visual_consistency_order():
     suppressed = OVTR._extend_dptd_semantic_update_suppression(model, suppression_snapshot, tracks)
     assert suppressed.detach().cpu().tolist() == [10]
     tracks = OVTR._update_dptd_memory_state(model, snapshot, suppression_snapshot, tracks)
-    for field_name in DPTD_TEMP_FIELDS:
+    for field_name in DPTD_TEMP_FIELDS + DPTD_TEMP_LOSS_FIELDS:
         assert not tracks.has(field_name), field_name
 
 
@@ -935,6 +965,133 @@ def test_dptd_topk_text_initial_forward_equivalence_and_grad():
     )
     assert grad_norm > 0.0
     assert out[-1]["debug"]["dptd_id_text_applied_count"] > 0
+
+
+
+def test_dptd_loss_tensor_contract_and_offsets_non_detached():
+    decoder = _make_decoder(use_ov_dptd=True, use_dptd_losses=True)
+    decoder.train()
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+    )
+    info = out[-1]
+    assert info["sampling_offsets"].grad_fn is None
+    assert "loss_tensors" in info
+    loss_tensors = info["loss_tensors"]
+    assert loss_tensors["ada_ofa_final"].shape == (1, 5, 256)
+    assert loss_tensors["id_ofa_final"].shape == (1, 5, 256)
+    assert loss_tensors["fused_ofa_final"].shape == (1, 5, 256)
+    assert loss_tensors["ad_sampling_offsets_final"].shape == (1, 5, 4, 2, 2, 2)
+    assert loss_tensors["ad_sampling_offsets_final"].requires_grad
+    assert loss_tensors["ad_sampling_offsets_final"].grad_fn is not None
+    assert int(loss_tensors["num_det"]) == 3
+
+
+def _make_dptd_loss_criterion(**kwargs):
+    return OVFrameMatcher(
+        None,
+        matcher=None,
+        weight_dict={},
+        losses=[],
+        use_dptd_losses=True,
+        dptd_loss_store_debug=True,
+        **kwargs,
+    )
+
+
+def _make_dptd_loss_tracks(num_queries=4):
+    tracks = Instances((1, 1))
+    tracks.obj_idxes = torch.tensor([-1, -1, 10, 11], dtype=torch.long)[:num_queries]
+    tracks.pred_logits = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [4.0, 0.0, -1.0],
+        [3.5, 0.0, -1.0],
+    ], dtype=torch.float32)[:num_queries]
+    tracks.scores = tracks.pred_logits.sigmoid().max(dim=-1).values
+    tracks.set("_dptd_original_query_idx_loss", torch.arange(num_queries, dtype=torch.long))
+    tracks.set("_dptd_prev_memory_valid_loss", torch.tensor([False, False, True, True])[:num_queries])
+    tracks.set("_dptd_current_gate", torch.tensor([1.0, 1.0, 0.8, 0.9])[:num_queries])
+    tracks.set("_dptd_current_gate_memory_valid", torch.tensor([False, False, True, True])[:num_queries])
+    tracks.set("_dptd_current_semantic_entropy", torch.tensor([1.0, 1.0, 0.1, 0.1])[:num_queries])
+    tracks.set("_dptd_current_semantic_proto_loss", torch.randn(num_queries, 4, requires_grad=True))
+    tracks.set("_dptd_prev_semantic_proto_loss", torch.randn(num_queries, 4))
+    tracks.set("_dptd_current_visual_memory_loss", torch.randn(num_queries, 4, requires_grad=True))
+    tracks.set("_dptd_prev_visual_memory_loss", torch.randn(num_queries, 4))
+    tracks.set("_dptd_current_topk_class_indices", torch.tensor([[-1], [-1], [5], [5]], dtype=torch.long)[:num_queries])
+    return tracks
+
+
+def test_dptd_aux_loss_values_backward_and_skips():
+    criterion = _make_dptd_loss_criterion()
+    tracks = _make_dptd_loss_tracks()
+    ada = torch.randn(1, 4, 4, requires_grad=True)
+    id_ofa = torch.randn(1, 4, 4, requires_grad=True)
+    ad_offsets = torch.randn(1, 4, 2, 1, 2, 2, requires_grad=True)
+    hist_offsets = torch.zeros_like(ad_offsets).detach()
+    outputs = {
+        "pred_logits": tracks.pred_logits.unsqueeze(0),
+        "select_id": torch.tensor([5, 7, 9], dtype=torch.long),
+        "dptd_loss_tensors": {
+            "ada_ofa_final": ada,
+            "id_ofa_final": id_ofa,
+            "fused_ofa_final": torch.randn(1, 4, 4, requires_grad=True),
+            "ad_sampling_offsets_final": ad_offsets,
+            "historical_sampling_offsets": hist_offsets,
+            "semantic_gate": tracks.get("_dptd_current_gate").unsqueeze(0),
+            "semantic_gate_memory_valid": tracks.get("_dptd_current_gate_memory_valid").unsqueeze(0),
+            "num_det": 2,
+        },
+    }
+    losses = criterion.compute_dptd_aux_losses(outputs, tracks, torch.ones(4, dtype=torch.bool))
+    assert set(losses) == set(DPTD_LOSS_NAMES)
+    total = sum(losses.values())
+    total.backward()
+    assert id_ofa.grad is not None and float(id_ofa.grad.detach().norm()) > 0.0
+    assert ada.grad is None or float(ada.grad.detach().norm()) == 0.0
+    assert ad_offsets.grad is not None and float(ad_offsets.grad.detach().norm()) > 0.0
+    assert tracks.get("_dptd_current_visual_memory_loss").grad is not None
+    assert criterion.dptd_loss_debug_stats["dptd_loss_ofa_valid_count"] == 2
+    assert criterion.dptd_loss_debug_stats["dptd_loss_contrast_valid_count"] > 0
+
+    mismatch_outputs = dict(outputs)
+    mismatch_tensors = dict(outputs["dptd_loss_tensors"])
+    mismatch_tensors["historical_sampling_offsets"] = torch.zeros(1, 3, 2, 1, 2, 2)
+    mismatch_outputs["dptd_loss_tensors"] = mismatch_tensors
+    mismatch_losses = criterion.compute_dptd_aux_losses(mismatch_outputs, _make_dptd_loss_tracks(), torch.ones(4, dtype=torch.bool))
+    assert torch.allclose(mismatch_losses["loss_dptd_offset_consistency"], torch.tensor(0.0))
+    assert criterion.dptd_loss_debug_stats["dptd_loss_offset_shape_skip_count"] == 1
+
+
+def test_dptd_aux_loss_no_valid_and_artificial_keep_remap():
+    criterion = _make_dptd_loss_criterion()
+    tracks = _make_dptd_loss_tracks()
+    tracks.obj_idxes[:] = -1
+    outputs = {
+        "pred_logits": tracks.pred_logits.unsqueeze(0),
+        "select_id": torch.tensor([5, 7, 9], dtype=torch.long),
+        "dptd_loss_tensors": {
+            "ada_ofa_final": torch.randn(1, 4, 4, requires_grad=True),
+            "id_ofa_final": torch.randn(1, 4, 4, requires_grad=True),
+            "fused_ofa_final": torch.randn(1, 4, 4, requires_grad=True),
+            "ad_sampling_offsets_final": torch.randn(1, 4, 2, 1, 2, 2, requires_grad=True),
+            "historical_sampling_offsets": torch.randn(1, 4, 2, 1, 2, 2),
+            "num_det": 2,
+        },
+    }
+    losses = criterion.compute_dptd_aux_losses(outputs, tracks, torch.ones(4, dtype=torch.bool))
+    for value in losses.values():
+        assert torch.allclose(value, torch.tensor(0.0))
+
+    tracks = _make_dptd_loss_tracks(num_queries=3)
+    tracks.set("_dptd_original_query_idx_loss", torch.tensor([1, 2, 3], dtype=torch.long))
+    keep_indices = torch.tensor([False, True, True, True])
+    selection = criterion._select_dptd_loss_indices(outputs, tracks, keep_indices)
+    assert selection["track_mask"].tolist() == [False, True, True]
 
 
 def test_dptd_trainability_and_optimizer_membership():
@@ -1108,6 +1265,9 @@ def main():
     test_dptd_topk_text_dim_and_cat_mismatch_guards()
     test_dptd_topk_text_adapter_zero_init_masks_and_track_only()
     test_dptd_topk_text_initial_forward_equivalence_and_grad()
+    test_dptd_loss_tensor_contract_and_offsets_non_detached()
+    test_dptd_aux_loss_values_backward_and_skips()
+    test_dptd_aux_loss_no_valid_and_artificial_keep_remap()
     test_dptd_trainability_and_optimizer_membership()
     test_dptd_semantic_gate_init_not_dead_and_second_step_grad()
     test_dptd_semantic_gate_initial_forward_equivalence()
