@@ -1480,12 +1480,13 @@ class TransformerDecoder(nn.Module):
 
             query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :])
             raw_query_pos = self.ref_point_head(query_sine_embed)
-            pos_scale = self.query_scale(output) if self.query_scale is not None else 1
-            query_pos = pos_scale * raw_query_pos
+            ada_pos_scale = self.query_scale(output) if self.query_scale is not None else 1
+            ada_query_pos = ada_pos_scale * raw_query_pos
+            query_pos = ada_query_pos
 
             ada_cti, ada_ofa, ad_sampling_offsets = layer(
                 tgt=output,
-                tgt_query_pos=query_pos,
+                tgt_query_pos=ada_query_pos,
                 tgt_query_sine_embed=query_sine_embed,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 tgt_reference_points=reference_points_input,
@@ -1511,6 +1512,13 @@ class TransformerDecoder(nn.Module):
                 id_tgt = output.clone()
                 id_tgt[track_start:] = fixed_track_tgt[track_start:]
 
+            id_pos_scale = self.query_scale(id_tgt) if self.query_scale is not None else 1
+            id_query_pos = id_pos_scale * raw_query_pos
+            if dptd_debug is not None and track_start < self.num_queries_cur:
+                dptd_debug["dptd_id_query_pos_track_diff_mean"] = float(
+                    (ada_query_pos[track_start:] - id_query_pos[track_start:]).detach().abs().mean().item()
+                )
+
             adjusted_historical_offsets, offset_residual = self._compute_dptd_offset_residual(
                 layer_id,
                 historical_offsets,
@@ -1524,7 +1532,7 @@ class TransformerDecoder(nn.Module):
 
             id_ofa, _, id_debug = layer.forward_identity_path(
                 tgt=id_tgt,
-                tgt_query_pos=query_pos,
+                tgt_query_pos=id_query_pos,
                 tgt_query_sine_embed=query_sine_embed,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 tgt_reference_points=reference_points_input,

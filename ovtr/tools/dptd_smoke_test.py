@@ -184,6 +184,7 @@ def _args_cfg(**overrides):
         dptd_memory_ema=0.8,
         dptd_memory_min_score=0.4,
         dptd_memory_max_entropy=0.75,
+        dptd_memory_min_gate=0.0,
         dptd_memory_use_alignment_feature=True,
         dptd_memory_allow_untrained_visual_projection=False,
         dptd_memory_store_topk=5,
@@ -268,6 +269,8 @@ def test_dptd_guards():
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_update_suppression=True, dptd_update_suppression_track_id_based=False)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_ov_dptd=False, use_dptd_semantic_memory=True)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_memory=True, dptd_memory_use_alignment_feature=False)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_memory=True, dptd_memory_min_gate=-0.1)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_memory=True, dptd_memory_min_gate=1.1)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=False)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, use_dptd_semantic_update_suppression=True)))
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_fusion="semantic_gate")))
@@ -456,6 +459,7 @@ def _make_memory_model(topk=2, allow_projection=False, id_text_topk=None, text_d
     fake_model.dptd_memory_ema = 0.8
     fake_model.dptd_memory_min_score = 0.4
     fake_model.dptd_memory_max_entropy = 0.75
+    fake_model.dptd_memory_min_gate = 0.0
     fake_model.dptd_memory_use_alignment_feature = True
     fake_model.dptd_memory_allow_untrained_visual_projection = allow_projection
     fake_model.dptd_memory_store_topk = topk
@@ -482,6 +486,8 @@ def _make_memory_model(topk=2, allow_projection=False, id_text_topk=None, text_d
         "dptd_memory_entropy_mean": 0.0,
         "dptd_memory_semantic_proto_cosine_delta_mean": 0.0,
         "dptd_memory_topk_change_rate": 0.0,
+        "dptd_memory_gate_reliable_count": 0,
+        "dptd_memory_gate_suppressed_count": 0,
         "dptd_memory_visual_source": "none",
     }
     return fake_model
@@ -599,6 +605,87 @@ def test_dptd_memory_existing_ema_not_confused_by_zero_age():
     assert torch.allclose(tracks.dptd_visual_memory, expected_visual, atol=1e-6)
     assert not torch.allclose(tracks.dptd_semantic_proto, current_semantic)
     assert tracks.dptd_memory_age.tolist() == [0]
+
+
+
+def _prepare_memory_gate_update(raw_gate=None, min_gate=0.5):
+    model = _make_memory_model(topk=2)
+    model.dptd_memory_min_score = 0.0
+    model.dptd_memory_max_entropy = 1.0
+    model.dptd_memory_min_gate = float(min_gate)
+    tracks = _make_memory_tracks(num_tracks=1, obj_idxes=[10])
+    OVTR._ensure_dptd_memory_fields(model, tracks)
+    tracks.dptd_semantic_proto[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    tracks.dptd_visual_memory[0] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    tracks.dptd_topk_class_indices[0] = torch.tensor([3, -1])
+    tracks.dptd_topk_class_scores[0] = torch.tensor([0.8, 0.0])
+    tracks.dptd_memory_age[0] = 2
+    old_semantic = tracks.dptd_semantic_proto.detach().clone()
+    old_visual = tracks.dptd_visual_memory.detach().clone()
+    old_topk = tracks.dptd_topk_class_indices.detach().clone()
+    snapshot = OVTR._snapshot_dptd_memory_state(model, tracks)
+    _attach_memory_candidates(
+        model,
+        tracks,
+        torch.tensor([[4.0]]),
+        [7],
+        pred_embed=torch.tensor([[0.0, 0.0, 1.0, 0.0]]),
+    )
+    tracks.scores = torch.tensor([0.9])
+    current_semantic = tracks._dptd_current_semantic_proto.detach().clone()
+    current_visual = tracks._dptd_current_visual_memory.detach().clone()
+    if raw_gate is not None:
+        tracks.set("_dptd_current_gate_raw", raw_gate.detach().clone())
+    return model, tracks, snapshot, old_semantic, old_visual, old_topk, current_semantic, current_visual
+
+
+def test_dptd_memory_min_gate_blocks_existing_ema_update():
+    model, tracks, snapshot, old_semantic, old_visual, old_topk, _, _ = _prepare_memory_gate_update(torch.tensor([0.2]), min_gate=0.5)
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    assert torch.equal(updated.dptd_semantic_proto, old_semantic)
+    assert torch.equal(updated.dptd_visual_memory, old_visual)
+    assert torch.equal(updated.dptd_topk_class_indices, old_topk)
+    assert updated.dptd_memory_age.tolist() == [3]
+    assert model.ov_dptd_debug_stats["dptd_memory_gate_reliable_count"] == 0
+    assert model.ov_dptd_debug_stats["dptd_memory_gate_suppressed_count"] == 1
+
+
+def test_dptd_memory_min_gate_allows_existing_ema_update():
+    model, tracks, snapshot, old_semantic, old_visual, _, current_semantic, current_visual = _prepare_memory_gate_update(torch.tensor([0.8]), min_gate=0.5)
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    expected_semantic = torch.nn.functional.normalize(0.8 * old_semantic + 0.2 * current_semantic, dim=-1, eps=1e-6)
+    expected_visual = torch.nn.functional.normalize(0.8 * old_visual + 0.2 * current_visual, dim=-1, eps=1e-6)
+    assert torch.allclose(updated.dptd_semantic_proto, expected_semantic, atol=1e-6)
+    assert torch.allclose(updated.dptd_visual_memory, expected_visual, atol=1e-6)
+    assert updated.dptd_memory_age.tolist() == [0]
+    assert model.ov_dptd_debug_stats["dptd_memory_gate_reliable_count"] == 1
+    assert model.ov_dptd_debug_stats["dptd_memory_gate_suppressed_count"] == 0
+
+
+def test_dptd_memory_min_gate_missing_or_bad_shape_falls_back():
+    model, tracks, snapshot, old_semantic, old_visual, _, current_semantic, current_visual = _prepare_memory_gate_update(None, min_gate=0.5)
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    expected_semantic = torch.nn.functional.normalize(0.8 * old_semantic + 0.2 * current_semantic, dim=-1, eps=1e-6)
+    expected_visual = torch.nn.functional.normalize(0.8 * old_visual + 0.2 * current_visual, dim=-1, eps=1e-6)
+    assert torch.allclose(updated.dptd_semantic_proto, expected_semantic, atol=1e-6)
+    assert torch.allclose(updated.dptd_visual_memory, expected_visual, atol=1e-6)
+
+    model, tracks, snapshot, old_semantic, old_visual, _, current_semantic, current_visual = _prepare_memory_gate_update(torch.tensor([[0.1, 0.2]]), min_gate=0.5)
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    expected_semantic = torch.nn.functional.normalize(0.8 * old_semantic + 0.2 * current_semantic, dim=-1, eps=1e-6)
+    expected_visual = torch.nn.functional.normalize(0.8 * old_visual + 0.2 * current_visual, dim=-1, eps=1e-6)
+    assert torch.allclose(updated.dptd_semantic_proto, expected_semantic, atol=1e-6)
+    assert torch.allclose(updated.dptd_visual_memory, expected_visual, atol=1e-6)
+
+
+def test_dptd_memory_min_gate_zero_preserves_existing_behavior():
+    model, tracks, snapshot, old_semantic, old_visual, _, current_semantic, current_visual = _prepare_memory_gate_update(torch.tensor([0.0]), min_gate=0.0)
+    updated = OVTR._update_dptd_memory_state(model, snapshot, None, tracks)
+    expected_semantic = torch.nn.functional.normalize(0.8 * old_semantic + 0.2 * current_semantic, dim=-1, eps=1e-6)
+    expected_visual = torch.nn.functional.normalize(0.8 * old_visual + 0.2 * current_visual, dim=-1, eps=1e-6)
+    assert torch.allclose(updated.dptd_semantic_proto, expected_semantic, atol=1e-6)
+    assert torch.allclose(updated.dptd_visual_memory, expected_visual, atol=1e-6)
+    assert updated.dptd_memory_age.tolist() == [0]
 
 
 def test_dptd_memory_keep_low_conf_high_entropy_and_suppressed():
@@ -724,6 +811,67 @@ def _gate_state(
         "topk_text_embeddings": topk_text,
         "topk_text_scores": topk_scores,
     }
+
+
+class _UnitRawQueryPos(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = int(d_model)
+
+    def forward(self, x):
+        return torch.ones(x.shape[0], x.shape[1], self.d_model, device=x.device, dtype=x.dtype)
+
+
+class _CaptureQueryScale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+        self.outputs = []
+
+    def forward(self, x):
+        scale = 2.0 + 0.01 * x
+        self.inputs.append(x.detach().clone())
+        self.outputs.append(scale.detach().clone())
+        return scale
+
+
+def test_dptd_id_path_query_pos_recomputed_from_fixed_track_tgt():
+    torch.manual_seed(17)
+    decoder = _make_decoder(use_ov_dptd=True, num_layers=2)
+    decoder.ref_point_head = _UnitRawQueryPos(256)
+    scale = _CaptureQueryScale()
+    decoder.query_scale = scale
+    captures = []
+    for layer in decoder.layers:
+        original_identity_path = layer.forward_identity_path
+
+        def wrapped_identity_path(*args, _original=original_identity_path, **kwargs):
+            captures.append({
+                "tgt": kwargs["tgt"].detach().clone(),
+                "tgt_query_pos": kwargs["tgt_query_pos"].detach().clone(),
+            })
+            return _original(*args, **kwargs)
+
+        layer.forward_identity_path = wrapped_identity_path
+
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3),
+    )
+    assert len(captures) == 2
+    captured = captures[-1]
+    id_scale = scale.outputs[-1]
+    ada_scale = scale.outputs[-2]
+    assert torch.allclose(scale.inputs[-1], captured["tgt"], atol=1e-6)
+    assert torch.allclose(captured["tgt_query_pos"], id_scale, atol=1e-6)
+    assert not torch.allclose(captured["tgt_query_pos"][3:], ada_scale[3:], atol=1e-6)
+    assert captured["tgt_query_pos"].shape == captured["tgt"].shape
+    assert torch.isfinite(captured["tgt_query_pos"]).all()
+    assert out[-1]["debug"]["dptd_id_query_pos_track_diff_mean"] > 0.0
 
 
 def test_dptd_semantic_gate_helper_and_deferred_box():
@@ -1801,9 +1949,14 @@ def main():
     test_dptd_update_suppression_after_track_base_update()
     test_dptd_memory_init_topk_detach_and_entropy_single_class()
     test_dptd_memory_existing_ema_not_confused_by_zero_age()
+    test_dptd_memory_min_gate_blocks_existing_ema_update()
+    test_dptd_memory_min_gate_allows_existing_ema_update()
+    test_dptd_memory_min_gate_missing_or_bad_shape_falls_back()
+    test_dptd_memory_min_gate_zero_preserves_existing_behavior()
     test_dptd_memory_keep_low_conf_high_entropy_and_suppressed()
     test_dptd_memory_missing_pred_embed_and_selected_class_changes()
     test_dptd_memory_track_base_new_row_and_instances_cat()
+    test_dptd_id_path_query_pos_recomputed_from_fixed_track_tgt()
     test_dptd_semantic_gate_helper_and_deferred_box()
     test_dptd_semantic_gate_fusion_track_only()
     test_dptd_semantic_gate_linear_sum_debug_contract()

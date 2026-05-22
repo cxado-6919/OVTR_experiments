@@ -63,6 +63,7 @@ use_dptd_semantic_memory = False
 dptd_memory_ema = 0.8
 dptd_memory_min_score = 0.4
 dptd_memory_max_entropy = 0.75
+dptd_memory_min_gate = 0.0
 dptd_memory_use_alignment_feature = True
 dptd_memory_allow_untrained_visual_projection = False
 dptd_memory_store_topk = 5

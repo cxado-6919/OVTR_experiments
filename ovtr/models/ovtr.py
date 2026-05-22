@@ -59,6 +59,7 @@ OV_DPTD_OPTION_DEFAULTS = {
     'dptd_memory_ema': 0.8,
     'dptd_memory_min_score': 0.4,
     'dptd_memory_max_entropy': 0.75,
+    'dptd_memory_min_gate': 0.0,
     'dptd_memory_use_alignment_feature': True,
     'dptd_memory_allow_untrained_visual_projection': False,
     'dptd_memory_store_topk': 5,
@@ -183,10 +184,13 @@ def _validate_dptd_memory_options(container):
         raise RuntimeError('dptd_memory_ema must satisfy 0 <= ema < 1.')
     min_score = float(getattr(container, 'dptd_memory_min_score', 0.4))
     max_entropy = float(getattr(container, 'dptd_memory_max_entropy', 0.75))
+    min_gate = float(getattr(container, 'dptd_memory_min_gate', 0.0))
     if min_score < 0.0 or min_score > 1.0:
         raise RuntimeError('dptd_memory_min_score must be in [0, 1].')
     if max_entropy < 0.0 or max_entropy > 1.0:
         raise RuntimeError('dptd_memory_max_entropy must be in [0, 1].')
+    if min_gate < 0.0 or min_gate > 1.0:
+        raise RuntimeError('dptd_memory_min_gate must be in [0, 1].')
     if int(getattr(container, 'dptd_memory_store_topk', 5)) < 1:
         raise RuntimeError('dptd_memory_store_topk must be >= 1.')
 
@@ -1179,6 +1183,7 @@ class OVTR(nn.Module):
                     dptd_memory_ema=0.8,
                     dptd_memory_min_score=0.4,
                     dptd_memory_max_entropy=0.75,
+                    dptd_memory_min_gate=0.0,
                     dptd_memory_use_alignment_feature=True,
                     dptd_memory_allow_untrained_visual_projection=False,
                     dptd_memory_store_topk=5,
@@ -1340,6 +1345,7 @@ class OVTR(nn.Module):
         self.dptd_memory_ema = dptd_memory_ema
         self.dptd_memory_min_score = dptd_memory_min_score
         self.dptd_memory_max_entropy = dptd_memory_max_entropy
+        self.dptd_memory_min_gate = float(dptd_memory_min_gate)
         self.dptd_memory_use_alignment_feature = dptd_memory_use_alignment_feature
         self.dptd_memory_allow_untrained_visual_projection = dptd_memory_allow_untrained_visual_projection
         self.dptd_memory_store_topk = int(dptd_memory_store_topk)
@@ -1421,6 +1427,8 @@ class OVTR(nn.Module):
             'dptd_memory_entropy_mean': 0.0,
             'dptd_memory_semantic_proto_cosine_delta_mean': 0.0,
             'dptd_memory_topk_change_rate': 0.0,
+            'dptd_memory_gate_reliable_count': 0,
+            'dptd_memory_gate_suppressed_count': 0,
             'dptd_memory_visual_source': 'none',
             'dptd_gate_mean': 1.0,
             'dptd_gate_min': 1.0,
@@ -2238,6 +2246,18 @@ class OVTR(nn.Module):
             current_topk_text_scores = (
                 track_instances.get('_dptd_current_topk_text_scores') if store_text_topk else None
             )
+            gate_reliable_count = 0
+            gate_suppressed_count = 0
+            raw_gate_values = None
+            gate_min = float(getattr(self, 'dptd_memory_min_gate', 0.0))
+            if getattr(self, 'use_dptd_semantic_gate', False) and gate_min > 0.0 and track_instances.has('_dptd_current_gate_raw'):
+                raw_gate = track_instances.get('_dptd_current_gate_raw')
+                if (
+                    isinstance(raw_gate, torch.Tensor)
+                    and raw_gate.shape[0] == len(track_instances)
+                    and raw_gate.numel() == len(track_instances)
+                ):
+                    raw_gate_values = raw_gate.detach().reshape(len(track_instances))
 
             for row_idx in range(len(track_instances)):
                 if not track_instances.has('obj_idxes'):
@@ -2302,10 +2322,11 @@ class OVTR(nn.Module):
                     or old_semantic.float().norm().item() <= eps
                     or old_visual.float().norm().item() <= eps
                 )
-                reliable = (
+                base_reliable = (
                     float(track_instances.scores[row_idx].detach().item()) >= float(self.dptd_memory_min_score)
                     and float(current_entropy[row_idx].detach().item()) <= float(self.dptd_memory_max_entropy)
                 )
+                reliable = base_reliable
                 entropy_values.append(float(current_entropy[row_idx].detach().item()))
 
                 if track_id in suppressed_ids:
@@ -2348,6 +2369,14 @@ class OVTR(nn.Module):
                     track_instances.dptd_memory_age[row_idx] = 0
                     init_count += 1
                     continue
+
+                if base_reliable and raw_gate_values is not None:
+                    gate_value = float(raw_gate_values[row_idx].detach().item())
+                    if gate_value >= gate_min:
+                        gate_reliable_count += 1
+                    else:
+                        reliable = False
+                        gate_suppressed_count += 1
 
                 if reliable:
                     new_semantic = F.normalize(
@@ -2413,6 +2442,8 @@ class OVTR(nn.Module):
                 dptd_memory_entropy_mean=(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
                 dptd_memory_semantic_proto_cosine_delta_mean=(sum(cosine_deltas) / len(cosine_deltas)) if cosine_deltas else 0.0,
                 dptd_memory_topk_change_rate=(topk_changed / topk_compared) if topk_compared else 0.0,
+                dptd_memory_gate_reliable_count=gate_reliable_count,
+                dptd_memory_gate_suppressed_count=gate_suppressed_count,
             )
         return self._remove_dptd_memory_candidate_fields(track_instances)
 
@@ -3139,6 +3170,7 @@ def build(args, cfg):
         dptd_memory_ema=args.dptd_memory_ema,
         dptd_memory_min_score=args.dptd_memory_min_score,
         dptd_memory_max_entropy=args.dptd_memory_max_entropy,
+        dptd_memory_min_gate=args.dptd_memory_min_gate,
         dptd_memory_use_alignment_feature=args.dptd_memory_use_alignment_feature,
         dptd_memory_allow_untrained_visual_projection=args.dptd_memory_allow_untrained_visual_projection,
         dptd_memory_store_topk=args.dptd_memory_store_topk,
