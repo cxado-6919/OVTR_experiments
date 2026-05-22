@@ -59,6 +59,27 @@ dptd_update_suppression_restore_fields = [
     "output_embedding_txt",
 ]
 dptd_update_suppression_track_id_based = True
+use_dptd_semantic_memory = False
+dptd_memory_ema = 0.8
+dptd_memory_min_score = 0.4
+dptd_memory_max_entropy = 0.75
+dptd_memory_use_alignment_feature = True
+dptd_memory_allow_untrained_visual_projection = False
+dptd_memory_store_topk = 5
+dptd_memory_debug = False
+use_dptd_semantic_gate = False
+dptd_gate_mode = "heuristic"
+dptd_gate_min_score = 0.3
+dptd_gate_max_entropy = 0.8
+dptd_gate_semantic_cos_tau = 0.25
+dptd_gate_visual_cos_tau = 0.25
+dptd_gate_offset_tau = 0.2
+dptd_gate_box_iou_tau = 0.3
+dptd_gate_temperature = 10.0
+dptd_gate_min_appearance = 0.1
+dptd_gate_debug = False
+use_dptd_semantic_update_suppression = False
+dptd_semantic_update_suppression_thresh = 0.3
 
 # scaling
 prior_prob = 0.005

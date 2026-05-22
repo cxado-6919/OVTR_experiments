@@ -6,6 +6,7 @@
 
 from typing import Optional
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from torch import Tensor, nn
 from torch.nn.init import xavier_uniform_, constant_, normal_
@@ -44,7 +45,7 @@ class Transformer(nn.Module):
         enc_n_points=4,
         dec_n_points=4,
         # two stage
-        two_stage_type="no", 
+        two_stage_type="no",
         embed_init_tgt=False,
         extra_track_attn=True,
         # for text
@@ -54,8 +55,8 @@ class Transformer(nn.Module):
         use_text_cross_attention=False,
         fusion_dropout=0.1,
         fusion_droppath=0.0,
-        prior_prob=0.01, 
-        log_scale=0.0, 
+        prior_prob=0.01,
+        log_scale=0.0,
         text_dim=256,
         attention_protection=False,
         attention_protection_mode="kl",
@@ -68,6 +69,18 @@ class Transformer(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        use_dptd_semantic_gate=False,
+        dptd_gate_mode="heuristic",
+        dptd_gate_min_score=0.3,
+        dptd_gate_max_entropy=0.8,
+        dptd_gate_semantic_cos_tau=0.25,
+        dptd_gate_visual_cos_tau=0.25,
+        dptd_gate_offset_tau=0.2,
+        dptd_gate_box_iou_tau=0.3,
+        dptd_gate_temperature=10.0,
+        dptd_gate_min_appearance=0.1,
+        dptd_gate_debug=False,
+        dptd_semantic_update_suppression_thresh=0.3,
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -127,8 +140,8 @@ class Transformer(nn.Module):
             d_model=d_model,
             query_dim=query_dim,
             num_feature_levels=num_feature_levels,
-            prior_prob=prior_prob, 
-            log_scale=log_scale, 
+            prior_prob=prior_prob,
+            log_scale=log_scale,
             text_dim=text_dim,
             num_queries=num_queries,
             attention_protection=attention_protection,
@@ -143,6 +156,18 @@ class Transformer(nn.Module):
             ov_dptd_id_path_text=ov_dptd_id_path_text,
             ov_dptd_fuse_cti=ov_dptd_fuse_cti,
             ov_dptd_store_debug=ov_dptd_store_debug,
+            use_dptd_semantic_gate=use_dptd_semantic_gate,
+            dptd_gate_mode=dptd_gate_mode,
+            dptd_gate_min_score=dptd_gate_min_score,
+            dptd_gate_max_entropy=dptd_gate_max_entropy,
+            dptd_gate_semantic_cos_tau=dptd_gate_semantic_cos_tau,
+            dptd_gate_visual_cos_tau=dptd_gate_visual_cos_tau,
+            dptd_gate_offset_tau=dptd_gate_offset_tau,
+            dptd_gate_box_iou_tau=dptd_gate_box_iou_tau,
+            dptd_gate_temperature=dptd_gate_temperature,
+            dptd_gate_min_appearance=dptd_gate_min_appearance,
+            dptd_gate_debug=dptd_gate_debug,
+            dptd_semantic_update_suppression_thresh=dptd_semantic_update_suppression_thresh,
         )
 
         self.d_model = d_model
@@ -173,7 +198,7 @@ class Transformer(nn.Module):
             self.enc_output = nn.Linear(d_model, d_model)
             self.enc_output_norm = nn.LayerNorm(d_model)
             self.two_stage_wh_embedding = None
-            
+
         if two_stage_type == "no":
             self.init_ref_points(num_queries)  # init self.refpoint_embed
 
@@ -181,7 +206,7 @@ class Transformer(nn.Module):
         self.enc_out_bbox_embed = None
 
         self.attention_protection = attention_protection
-            
+
         self._reset_parameters()
         if hasattr(self.decoder, "reset_ov_dptd_fusion_parameters"):
             self.decoder.reset_ov_dptd_fusion_parameters()
@@ -286,6 +311,7 @@ class Transformer(nn.Module):
         ref_pts=None,
         text_dict=None,
         dptd_sampling_offsets=None,
+        dptd_gate_state=None,
         return_dptd_info=False,
     ):
         text_dict = self._ensure_encoded_text(text_dict)
@@ -350,6 +376,7 @@ class Transformer(nn.Module):
             num=self.num_queries,
             enc_output_undetach=None,
             dptd_sampling_offsets=dptd_sampling_offsets,
+            dptd_gate_state=dptd_gate_state,
             return_dptd_info=return_dptd_info,
         )
 
@@ -382,9 +409,10 @@ class Transformer(nn.Module):
         text_dict=None,
         cache=None,
         dptd_sampling_offsets=None,
+        dptd_gate_state=None,
         return_dptd_info=False,
     ):
-    
+
         """
         Input:
             - srcs: List of multi features [bs, ci, hi, wi]
@@ -425,6 +453,7 @@ class Transformer(nn.Module):
             ref_pts=ref_pts,
             text_dict=text_dict,
             dptd_sampling_offsets=dptd_sampling_offsets,
+            dptd_gate_state=dptd_gate_state,
             return_dptd_info=return_dptd_info,
         )
 
@@ -500,7 +529,7 @@ class TransformerEncoder(nn.Module):
         return reference_points
 
     def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None, text_feature=None, text_attention_mask=None):
-    
+
         """
         Input:
             - src: [bs, sum(hi*wi), 256]
@@ -590,8 +619,8 @@ class TransformerDecoder(nn.Module):
         d_model=256,
         query_dim=4,
         num_feature_levels=1,
-        prior_prob=0.01, 
-        log_scale=0.0, 
+        prior_prob=0.01,
+        log_scale=0.0,
         text_dim=256,
         num_queries=900,
         attention_protection=False,
@@ -606,6 +635,18 @@ class TransformerDecoder(nn.Module):
         ov_dptd_id_path_text="none",
         ov_dptd_fuse_cti=False,
         ov_dptd_store_debug=False,
+        use_dptd_semantic_gate=False,
+        dptd_gate_mode="heuristic",
+        dptd_gate_min_score=0.3,
+        dptd_gate_max_entropy=0.8,
+        dptd_gate_semantic_cos_tau=0.25,
+        dptd_gate_visual_cos_tau=0.25,
+        dptd_gate_offset_tau=0.2,
+        dptd_gate_box_iou_tau=0.3,
+        dptd_gate_temperature=10.0,
+        dptd_gate_min_appearance=0.1,
+        dptd_gate_debug=False,
+        dptd_semantic_update_suppression_thresh=0.3,
     ):
         super().__init__()
         if num_layers > 0:
@@ -613,7 +654,7 @@ class TransformerDecoder(nn.Module):
         else:
             self.layers = []
         self.num_layers = num_layers
-        self.norm = norm 
+        self.norm = norm
         self.query_dim = query_dim
         assert query_dim in [2, 4], "query_dim should be 2/4 but {}".format(query_dim)
         self.num_feature_levels = num_feature_levels
@@ -657,9 +698,28 @@ class TransformerDecoder(nn.Module):
         self.ov_dptd_id_path_text = ov_dptd_id_path_text
         self.ov_dptd_fuse_cti = ov_dptd_fuse_cti
         self.ov_dptd_store_debug = ov_dptd_store_debug
+        self.use_dptd_semantic_gate = use_dptd_semantic_gate
+        self.dptd_gate_mode = dptd_gate_mode
+        self.dptd_gate_min_score = dptd_gate_min_score
+        self.dptd_gate_max_entropy = dptd_gate_max_entropy
+        self.dptd_gate_semantic_cos_tau = dptd_gate_semantic_cos_tau
+        self.dptd_gate_visual_cos_tau = dptd_gate_visual_cos_tau
+        self.dptd_gate_offset_tau = dptd_gate_offset_tau
+        self.dptd_gate_box_iou_tau = dptd_gate_box_iou_tau
+        self.dptd_gate_temperature = dptd_gate_temperature
+        self.dptd_gate_min_appearance = dptd_gate_min_appearance
+        self.dptd_gate_debug = dptd_gate_debug
+        self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
+        self.ov_dptd_gate_alpha = nn.Parameter(torch.tensor(0.0)) if self.use_ov_dptd else None
         if self.use_ov_dptd:
-            if self.ov_dptd_fusion != "linear_sum":
-                raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_fusion='linear_sum'.")
+            if self.ov_dptd_fusion not in ("linear_sum", "semantic_gate"):
+                raise NotImplementedError("OV-DPTD only supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
+            if self.ov_dptd_fusion == "semantic_gate" and not self.use_dptd_semantic_gate:
+                raise RuntimeError("ov_dptd_fusion='semantic_gate' requires use_dptd_semantic_gate=True.")
+            if self.ov_dptd_fuse_cti:
+                raise NotImplementedError("OV-DPTD v4 keeps CTI fusion disabled; ov_dptd_fuse_cti=True is unsupported.")
+            if self.use_dptd_semantic_gate and self.dptd_gate_mode != "heuristic":
+                raise NotImplementedError("OV-DPTD v4 only supports dptd_gate_mode='heuristic'.")
             if self.ov_dptd_id_path_text != "none":
                 raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
             self.ov_dptd_ofa_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
@@ -718,6 +778,15 @@ class TransformerDecoder(nn.Module):
             "ov_dptd_num_track_queries": 0,
             "ov_dptd_historical_offset_used_count": 0,
             "ov_dptd_historical_offset_fallback_count": 0,
+            "dptd_gate_mean": 1.0,
+            "dptd_gate_min": 1.0,
+            "dptd_gate_max": 1.0,
+            "dptd_gate_low_count": 0,
+            "semantic_consistency_mean": 1.0,
+            "visual_consistency_mean": 1.0,
+            "offset_consistency_mean": 1.0,
+            "box_consistency_mean": 1.0,
+            "dptd_gate_box_conf_deferred": True,
         }
 
     def _normalize_ov_dptd_offsets(self, offsets, tgt):
@@ -734,6 +803,104 @@ class TransformerDecoder(nn.Module):
         if offsets.shape[:2] != (bs, num_queries):
             return None
         return offsets.to(device=tgt.device, dtype=tgt.dtype)
+
+    def _gate_state_tensor(self, gate_state, name, like, expected_dim=None, dtype=None):
+        if not isinstance(gate_state, dict) or name not in gate_state:
+            return None
+        value = gate_state[name]
+        if value is None or not isinstance(value, torch.Tensor):
+            return None
+        value = value.to(device=like.device, dtype=dtype or like.dtype)
+        if expected_dim is not None and value.dim() == expected_dim - 1:
+            value = value.unsqueeze(0)
+        return value
+
+    def _semantic_gate_ones(self, tgt):
+        return torch.ones(tgt.shape[1], tgt.shape[0], device=tgt.device, dtype=tgt.dtype)
+
+    def _compute_dptd_semantic_gate(
+        self,
+        logits,
+        ad_sampling_offsets,
+        historical_offsets,
+        gate_state,
+        track_start,
+        tgt,
+        debug=None,
+    ):
+        gate = self._semantic_gate_ones(tgt)
+        if not self.use_dptd_semantic_gate or not isinstance(gate_state, dict):
+            return gate
+
+        bs, num_queries = gate.shape
+        if track_start >= num_queries:
+            return gate
+
+        text_memory = self._gate_state_tensor(gate_state, 'text_memory_embeddings', logits, expected_dim=3, dtype=logits.dtype)
+        prev_semantic = self._gate_state_tensor(gate_state, 'semantic_proto', logits, expected_dim=3, dtype=logits.dtype)
+        memory_valid = self._gate_state_tensor(gate_state, 'memory_valid', logits, expected_dim=2, dtype=torch.bool)
+        if text_memory is None or prev_semantic is None or memory_valid is None:
+            return gate
+        if text_memory.shape[0] == 1 and bs != 1:
+            text_memory = text_memory.expand(bs, -1, -1)
+        if prev_semantic.shape[0] == 1 and bs != 1:
+            prev_semantic = prev_semantic.expand(bs, -1, -1)
+        if memory_valid.shape[0] == 1 and bs != 1:
+            memory_valid = memory_valid.expand(bs, -1)
+        if prev_semantic.shape[:2] != (bs, num_queries) or memory_valid.shape[:2] != (bs, num_queries):
+            return gate
+
+        num_cls = min(int(logits.shape[-1]), int(text_memory.shape[1]))
+        if num_cls <= 0:
+            return gate
+        score = logits[..., :num_cls].float().sigmoid()
+        prob = score / score.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        current_semantic = F.normalize(prob @ text_memory[:, :num_cls].float(), dim=-1, eps=1e-6)
+        entropy_den = math.log(num_cls) if num_cls > 1 else 1.0
+        entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=-1) / entropy_den
+        entropy = entropy.clamp(0.0, 1.0)
+
+        score_max = score.max(dim=-1).values
+        score_conf = ((score_max - float(self.dptd_gate_min_score)) / max(1.0 - float(self.dptd_gate_min_score), 1e-6)).clamp(0.0, 1.0)
+        entropy_conf = ((float(self.dptd_gate_max_entropy) - entropy) / max(float(self.dptd_gate_max_entropy), 1e-6)).clamp(0.0, 1.0)
+        semantic_cos = F.cosine_similarity(current_semantic, prev_semantic.float(), dim=-1, eps=1e-6).clamp(-1.0, 1.0)
+        semantic_conf = torch.sigmoid((semantic_cos - float(self.dptd_gate_semantic_cos_tau)) * float(self.dptd_gate_temperature)).clamp(0.0, 1.0)
+
+        offset_conf = torch.ones_like(score_conf)
+        if historical_offsets is not None and tuple(historical_offsets.shape) == tuple(ad_sampling_offsets.shape):
+            offset_l1 = (ad_sampling_offsets.float() - historical_offsets.float()).abs().mean(dim=(2, 3, 4, 5))
+            offset_conf = torch.exp(-offset_l1 / max(float(self.dptd_gate_offset_tau), 1e-6)).clamp(0.0, 1.0)
+
+        valid = memory_valid.bool()
+        track_mask = torch.zeros_like(valid)
+        track_mask[:, track_start:] = True
+        valid = valid & track_mask
+        raw_gate = (score_conf * entropy_conf * semantic_conf * offset_conf).clamp(0.0, 1.0)
+        gate = torch.where(valid, raw_gate, torch.ones_like(raw_gate))
+        gate[:, :track_start] = 1.0
+        gate = gate.clamp(min=float(self.dptd_gate_min_appearance), max=1.0).to(dtype=tgt.dtype)
+
+        if debug is not None:
+            track_values = gate[:, track_start:]
+            valid_values = gate[valid]
+            if track_values.numel() > 0:
+                debug['dptd_gate_mean'] = float(track_values.detach().float().mean().item())
+                debug['dptd_gate_min'] = float(track_values.detach().float().min().item())
+                debug['dptd_gate_max'] = float(track_values.detach().float().max().item())
+                debug['dptd_gate_low_count'] = int((track_values.detach().float() < float(self.dptd_semantic_update_suppression_thresh)).sum().item())
+            if valid_values.numel() > 0:
+                debug['semantic_consistency_mean'] = float(semantic_cos[valid].detach().float().mean().item())
+                debug['offset_consistency_mean'] = float(offset_conf[valid].detach().float().mean().item())
+            debug['visual_consistency_mean'] = float(debug.get('visual_consistency_mean', 1.0))
+            debug['box_consistency_mean'] = 1.0
+            debug['dptd_gate_box_conf_deferred'] = True
+        return gate
+
+    def _fuse_ov_dptd_ofa_semantic_gate(self, layer_id, ada_ofa, id_ofa, gate):
+        id_delta = self.ov_dptd_ofa_id_proj[layer_id](id_ofa)
+        correction = (1.0 - gate.transpose(0, 1).unsqueeze(-1).to(dtype=ada_ofa.dtype)) * id_delta
+        return ada_ofa + self.ov_dptd_gate_alpha.to(dtype=ada_ofa.dtype) * correction
+
 
     def _forward_ov_dptd(
         self,
@@ -752,6 +919,7 @@ class TransformerDecoder(nn.Module):
         tgt_key_padding_mask: Optional[Tensor] = None,
         enc_output_undetach=None,
         dptd_sampling_offsets=None,
+        dptd_gate_state=None,
         return_dptd_info=False,
     ):
         if self.use_transformer_ckpt:
@@ -767,6 +935,7 @@ class TransformerDecoder(nn.Module):
         historical_offsets = self._normalize_ov_dptd_offsets(dptd_sampling_offsets, tgt)
         dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
         last_ad_sampling_offsets = None
+        last_gate_values = None
 
         self.num_queries_cur = tgt.shape[0]
         self.select_text_num = text_dict["select_text_num"]
@@ -839,8 +1008,23 @@ class TransformerDecoder(nn.Module):
                 dptd_debug["ov_dptd_historical_offset_used_count"] += id_debug.get("used_count", 0)
                 dptd_debug["ov_dptd_historical_offset_fallback_count"] += id_debug.get("fallback_count", 0)
 
-            output_ofa = self._fuse_ov_dptd_ofa(layer_id, ada_ofa, id_ofa)
-            output = self._fuse_ov_dptd_cti(layer_id, ada_cti, id_ofa) if self.ov_dptd_fuse_cti else ada_cti
+            output = ada_cti
+            output_norm = self.norm(output)
+            pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
+            gate_values = self._compute_dptd_semantic_gate(
+                pre_outputs_class,
+                ad_sampling_offsets,
+                historical_offsets,
+                dptd_gate_state,
+                track_start,
+                tgt,
+                debug=dptd_debug,
+            )
+            last_gate_values = gate_values
+            if self.ov_dptd_fusion == "semantic_gate":
+                output_ofa = self._fuse_ov_dptd_ofa_semantic_gate(layer_id, ada_ofa, id_ofa, gate_values)
+            else:
+                output_ofa = self._fuse_ov_dptd_ofa(layer_id, ada_ofa, id_ofa)
 
             if self.bbox_embed is not None:
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
@@ -854,9 +1038,6 @@ class TransformerDecoder(nn.Module):
                 else:
                     reference_points = new_reference_points
 
-            output_norm = self.norm(output)
-
-            pre_outputs_class = self.pre_class_embed(output_norm.transpose(0, 1), text_dict, layer_id)
             if self.attention_protection:
                 tgt_mask = attention_protection(
                     pre_outputs_class,
@@ -885,6 +1066,7 @@ class TransformerDecoder(nn.Module):
         if return_dptd_info:
             ret.append({
                 "sampling_offsets": last_ad_sampling_offsets,
+                "semantic_gate": last_gate_values,
                 "debug": dptd_debug,
             })
         return ret
@@ -895,27 +1077,27 @@ class TransformerDecoder(nn.Module):
         bias = dot_product_proj_tokens_bias.repeat(num_real_queries, 1, 1, 1).permute(1,2,0,3)
         log_scale = (self.log_scale.exp() + self.eps).repeat(bs, num_real_queries, cls_len, 1).permute(3,0,1,2)
         return bias, log_scale
-    
+
     def logits_with_bias(self, dot_product_logit, bias, log_scale):
         dot_product_logit = dot_product_logit[..., : self.select_text_num]
         dot_product_logit = (dot_product_logit / log_scale) + bias
         dot_product_logit = torch.clamp(dot_product_logit, max=500)
         dot_product_logit = torch.clamp(dot_product_logit, min=-500)
         return dot_product_logit
-    
+
     def pre_class_embed(self, output, text_dict, layer_id=-1, encoder=False):
         if encoder:
-            outputs_class = self.advance_enc_class_embed(output, text_dict) 
-            outputs_class = self.logits_with_bias(outputs_class, self.text_bias[layer_id,:,:self.num_queries_det,:], self.log_scale_cls[layer_id,:,:self.num_queries_det,:]) 
+            outputs_class = self.advance_enc_class_embed(output, text_dict)
+            outputs_class = self.logits_with_bias(outputs_class, self.text_bias[layer_id,:,:self.num_queries_det,:], self.log_scale_cls[layer_id,:,:self.num_queries_det,:])
         else:
             outputs_class = self.advance_class_embed[layer_id](output, text_dict)
-            outputs_class = self.logits_with_bias(outputs_class, self.text_bias[layer_id,:,:self.num_queries_cur,:], self.log_scale_cls[layer_id,:,:self.num_queries_cur,:]) 
+            outputs_class = self.logits_with_bias(outputs_class, self.text_bias[layer_id,:,:self.num_queries_cur,:], self.log_scale_cls[layer_id,:,:self.num_queries_cur,:])
         return outputs_class
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 src_padding_mask=None, tgt_mask: Optional[Tensor] = None, num=None, pos: Optional[Tensor] = None,
                 text_dict=None, memory_mask: Optional[Tensor] = None, tgt_key_padding_mask: Optional[Tensor] = None,
-                enc_output_undetach=None, dptd_sampling_offsets=None, return_dptd_info=False
+                enc_output_undetach=None, dptd_sampling_offsets=None, dptd_gate_state=None, return_dptd_info=False
                 ):
         if self.use_ov_dptd:
             return self._forward_ov_dptd(
@@ -934,9 +1116,10 @@ class TransformerDecoder(nn.Module):
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 enc_output_undetach=enc_output_undetach,
                 dptd_sampling_offsets=dptd_sampling_offsets,
+                dptd_gate_state=dptd_gate_state,
                 return_dptd_info=return_dptd_info,
             )
-    
+
         """
         Input:
             - tgt: nq, bs, d_model
@@ -951,7 +1134,7 @@ class TransformerDecoder(nn.Module):
         ref_points = []
         text_attention_mask = ~text_dict["text_token_mask"]
         pre_outputs_classes = []
-        
+
         self.num_queries_cur = tgt.shape[0]
         self.select_text_num = text_dict["select_text_num"]
         self.text_bias, self.log_scale_cls = self.get_logits_bias(text_dict["encoded_text"], self.num_queries_cur)
@@ -966,13 +1149,13 @@ class TransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[None, :]
-            
+
             query_sine_embed = gen_sineembed_for_position(
                     reference_points_input[:, :, 0, :]
             )  # nq, bs, 256*2
 
             # conditional query
-            raw_query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, 256 
+            raw_query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, 256
             pos_scale = self.query_scale(output) if self.query_scale is not None else 1
             query_pos = pos_scale * raw_query_pos
 
@@ -1070,7 +1253,7 @@ class TransformerDecoder(nn.Module):
                 intermediate_cti.append(output_norm)
                 intermediate_ofa.append(output_ofa)
                 pre_outputs_classes.append(pre_outputs_class)
-            
+
 
         return [
             torch.stack([itm_out_cti.transpose(0, 1) for itm_out_cti in intermediate_cti]),
@@ -1228,14 +1411,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
         return tgt
-    
+
     def forward_ffn_align(self, tgt):
         with torch.amp.autocast("cuda", enabled=False):
             tgt2 = self.linear4(self.dropout6(self.activation(self.linear3(tgt))))
         tgt = tgt + self.dropout7(tgt2)
         tgt = self.norm5(tgt)
         return tgt
-    
+
     def _forward_track_attn(self, tgt, query_pos, attn_mask=None, num=None):
         q = k = self.with_pos_embed(tgt, query_pos)
         if q.shape[1] > num:
@@ -1276,13 +1459,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # extra track attention
         if self.extra_track_attn:
             tgt = self._forward_track_attn(
-                tgt.transpose(0, 1), 
-                tgt_query_pos.transpose(0, 1), 
+                tgt.transpose(0, 1),
+                tgt_query_pos.transpose(0, 1),
                 attn_mask=None,
                 num=num).transpose(0,1)
-            
+
         if self_attn_mask is not None:
-            self_attn_mask = self_attn_mask.squeeze(dim=0) 
+            self_attn_mask = self_attn_mask.squeeze(dim=0)
 
         if self.self_attn is not None:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
@@ -1443,8 +1626,8 @@ def build_transformer(args):
         fusion_dropout=args.fusion_dropout,
         fusion_droppath=args.fusion_droppath,
         extra_track_attn=args.extra_track_attn,
-        prior_prob=args.prior_prob, 
-        log_scale=args.log_scale, 
+        prior_prob=args.prior_prob,
+        log_scale=args.log_scale,
         text_dim=args.text_dim,
         attention_protection=getattr(args, "attention_protection", False),
         attention_protection_mode=getattr(args, "attention_protection_mode", "kl"),
@@ -1457,4 +1640,16 @@ def build_transformer(args):
         ov_dptd_id_path_text=getattr(args, "ov_dptd_id_path_text", "none"),
         ov_dptd_fuse_cti=getattr(args, "ov_dptd_fuse_cti", False),
         ov_dptd_store_debug=getattr(args, "ov_dptd_store_debug", False),
+        use_dptd_semantic_gate=getattr(args, "use_dptd_semantic_gate", False),
+        dptd_gate_mode=getattr(args, "dptd_gate_mode", "heuristic"),
+        dptd_gate_min_score=getattr(args, "dptd_gate_min_score", 0.3),
+        dptd_gate_max_entropy=getattr(args, "dptd_gate_max_entropy", 0.8),
+        dptd_gate_semantic_cos_tau=getattr(args, "dptd_gate_semantic_cos_tau", 0.25),
+        dptd_gate_visual_cos_tau=getattr(args, "dptd_gate_visual_cos_tau", 0.25),
+        dptd_gate_offset_tau=getattr(args, "dptd_gate_offset_tau", 0.2),
+        dptd_gate_box_iou_tau=getattr(args, "dptd_gate_box_iou_tau", 0.3),
+        dptd_gate_temperature=getattr(args, "dptd_gate_temperature", 10.0),
+        dptd_gate_min_appearance=getattr(args, "dptd_gate_min_appearance", 0.1),
+        dptd_gate_debug=getattr(args, "dptd_gate_debug", False),
+        dptd_semantic_update_suppression_thresh=getattr(args, "dptd_semantic_update_suppression_thresh", 0.3),
     )

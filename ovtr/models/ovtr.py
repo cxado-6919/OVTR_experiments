@@ -64,7 +64,114 @@ OV_DPTD_OPTION_DEFAULTS = {
         'output_embedding_txt',
     ],
     'dptd_update_suppression_track_id_based': True,
+    'use_dptd_semantic_memory': False,
+    'dptd_memory_ema': 0.8,
+    'dptd_memory_min_score': 0.4,
+    'dptd_memory_max_entropy': 0.75,
+    'dptd_memory_use_alignment_feature': True,
+    'dptd_memory_allow_untrained_visual_projection': False,
+    'dptd_memory_store_topk': 5,
+    'dptd_memory_debug': False,
+    'use_dptd_semantic_gate': False,
+    'dptd_gate_mode': 'heuristic',
+    'dptd_gate_min_score': 0.3,
+    'dptd_gate_max_entropy': 0.8,
+    'dptd_gate_semantic_cos_tau': 0.25,
+    'dptd_gate_visual_cos_tau': 0.25,
+    'dptd_gate_offset_tau': 0.2,
+    'dptd_gate_box_iou_tau': 0.3,
+    'dptd_gate_temperature': 10.0,
+    'dptd_gate_min_appearance': 0.1,
+    'dptd_gate_debug': False,
+    'use_dptd_semantic_update_suppression': False,
+    'dptd_semantic_update_suppression_thresh': 0.3,
 }
+
+DPTD_MEMORY_FIELDS = (
+    'dptd_semantic_proto',
+    'dptd_visual_memory',
+    'dptd_semantic_conf',
+    'dptd_semantic_entropy',
+    'dptd_memory_age',
+    'dptd_topk_class_indices',
+    'dptd_topk_class_scores',
+)
+
+DPTD_CURRENT_MEMORY_FIELDS = (
+    '_dptd_current_semantic_proto',
+    '_dptd_current_visual_memory',
+    '_dptd_current_semantic_conf',
+    '_dptd_current_semantic_entropy',
+    '_dptd_current_topk_class_indices',
+    '_dptd_current_topk_class_scores',
+)
+
+DPTD_TEMP_FIELDS = DPTD_CURRENT_MEMORY_FIELDS + (
+    '_dptd_current_gate',
+    '_dptd_current_visual_consistency',
+)
+
+
+def _validate_dptd_memory_options(container):
+    if not getattr(container, 'use_dptd_semantic_memory', False):
+        return
+    if not getattr(container, 'use_ov_dptd', False):
+        raise RuntimeError('DPTD semantic memory requires use_ov_dptd=True.')
+    if (
+        not getattr(container, 'dptd_memory_use_alignment_feature', True)
+        and not getattr(container, 'dptd_memory_allow_untrained_visual_projection', False)
+    ):
+        raise RuntimeError(
+            'DPTD semantic memory needs alignment features or '
+            'dptd_memory_allow_untrained_visual_projection=True.'
+        )
+    ema = float(getattr(container, 'dptd_memory_ema', 0.8))
+    if ema < 0.0 or ema >= 1.0:
+        raise RuntimeError('dptd_memory_ema must satisfy 0 <= ema < 1.')
+    min_score = float(getattr(container, 'dptd_memory_min_score', 0.4))
+    max_entropy = float(getattr(container, 'dptd_memory_max_entropy', 0.75))
+    if min_score < 0.0 or min_score > 1.0:
+        raise RuntimeError('dptd_memory_min_score must be in [0, 1].')
+    if max_entropy < 0.0 or max_entropy > 1.0:
+        raise RuntimeError('dptd_memory_max_entropy must be in [0, 1].')
+    if int(getattr(container, 'dptd_memory_store_topk', 5)) < 1:
+        raise RuntimeError('dptd_memory_store_topk must be >= 1.')
+
+
+def _validate_dptd_gate_options(container):
+    if getattr(container, 'ov_dptd_fuse_cti', False):
+        raise NotImplementedError('OV-DPTD v4 keeps CTI fusion disabled; ov_dptd_fuse_cti=True is unsupported.')
+    if getattr(container, 'dptd_gate_mode', 'heuristic') != 'heuristic':
+        raise NotImplementedError("OV-DPTD v4 only supports dptd_gate_mode='heuristic'.")
+    if getattr(container, 'use_dptd_semantic_update_suppression', False) and not getattr(container, 'use_dptd_update_suppression', False):
+        raise RuntimeError('DPTD semantic update suppression requires use_dptd_update_suppression=True.')
+    if getattr(container, 'ov_dptd_fusion', 'linear_sum') == 'semantic_gate' and not getattr(container, 'use_dptd_semantic_gate', False):
+        raise RuntimeError("ov_dptd_fusion='semantic_gate' requires use_dptd_semantic_gate=True.")
+    if not getattr(container, 'use_dptd_semantic_gate', False):
+        return
+    if not getattr(container, 'use_ov_dptd', False):
+        raise RuntimeError('DPTD semantic gate requires use_ov_dptd=True.')
+    if not getattr(container, 'use_dptd_semantic_memory', False):
+        raise RuntimeError('DPTD semantic gate requires use_dptd_semantic_memory=True.')
+    if getattr(container, 'ov_dptd_fusion', 'linear_sum') not in ('linear_sum', 'semantic_gate'):
+        raise NotImplementedError("OV-DPTD semantic gate supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
+    for name in [
+        'dptd_gate_min_score',
+        'dptd_gate_max_entropy',
+        'dptd_gate_semantic_cos_tau',
+        'dptd_gate_visual_cos_tau',
+        'dptd_gate_offset_tau',
+        'dptd_gate_box_iou_tau',
+        'dptd_gate_temperature',
+        'dptd_gate_min_appearance',
+        'dptd_semantic_update_suppression_thresh',
+    ]:
+        value = float(getattr(container, name))
+        if name.endswith('_tau') or name == 'dptd_gate_temperature':
+            if value <= 0.0:
+                raise RuntimeError(f'{name} must be > 0.')
+        elif value < 0.0 or value > 1.0:
+            raise RuntimeError(f'{name} must be in [0, 1].')
 
 
 def resolve_mcip_options(args, cfg):
@@ -93,6 +200,8 @@ def resolve_ov_dptd_options(args, cfg):
         and not getattr(args, 'dptd_update_suppression_track_id_based', True)
     ):
         raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
+    _validate_dptd_memory_options(args)
+    _validate_dptd_gate_options(args)
 
     if not getattr(args, 'use_ov_dptd', False):
         return
@@ -103,8 +212,8 @@ def resolve_ov_dptd_options(args, cfg):
         raise RuntimeError('OV-DPTD v1 does not support use_transformer_ckpt=True.')
     if getattr(args, 'quant_deploy', 'none') == 'int_msda':
         raise RuntimeError('OV-DPTD v1 does not support --quant_deploy int_msda.')
-    if getattr(args, 'ov_dptd_fusion', 'linear_sum') != 'linear_sum':
-        raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_fusion='linear_sum'.")
+    if getattr(args, 'ov_dptd_fusion', 'linear_sum') not in ('linear_sum', 'semantic_gate'):
+        raise NotImplementedError("OV-DPTD supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
     if getattr(args, 'ov_dptd_id_path_text', 'none') != 'none':
         raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
 
@@ -635,6 +744,27 @@ class OVTR(nn.Module):
                     dptd_update_suppression_thresh=0.4,
                     dptd_update_suppression_restore_fields=None,
                     dptd_update_suppression_track_id_based=True,
+                    use_dptd_semantic_memory=False,
+                    dptd_memory_ema=0.8,
+                    dptd_memory_min_score=0.4,
+                    dptd_memory_max_entropy=0.75,
+                    dptd_memory_use_alignment_feature=True,
+                    dptd_memory_allow_untrained_visual_projection=False,
+                    dptd_memory_store_topk=5,
+                    dptd_memory_debug=False,
+                    use_dptd_semantic_gate=False,
+                    dptd_gate_mode='heuristic',
+                    dptd_gate_min_score=0.3,
+                    dptd_gate_max_entropy=0.8,
+                    dptd_gate_semantic_cos_tau=0.25,
+                    dptd_gate_visual_cos_tau=0.25,
+                    dptd_gate_offset_tau=0.2,
+                    dptd_gate_box_iou_tau=0.3,
+                    dptd_gate_temperature=10.0,
+                    dptd_gate_min_appearance=0.1,
+                    dptd_gate_debug=False,
+                    use_dptd_semantic_update_suppression=False,
+                    dptd_semantic_update_suppression_thresh=0.3,
                  ):
         """ Initializes the model.
         Parameters:
@@ -754,12 +884,41 @@ class OVTR(nn.Module):
             else list(OV_DPTD_OPTION_DEFAULTS['dptd_update_suppression_restore_fields'])
         )
         self.dptd_update_suppression_track_id_based = dptd_update_suppression_track_id_based
+        self.use_dptd_semantic_memory = use_dptd_semantic_memory
+        self.dptd_memory_ema = dptd_memory_ema
+        self.dptd_memory_min_score = dptd_memory_min_score
+        self.dptd_memory_max_entropy = dptd_memory_max_entropy
+        self.dptd_memory_use_alignment_feature = dptd_memory_use_alignment_feature
+        self.dptd_memory_allow_untrained_visual_projection = dptd_memory_allow_untrained_visual_projection
+        self.dptd_memory_store_topk = int(dptd_memory_store_topk)
+        self.dptd_memory_debug = dptd_memory_debug
+        self.use_dptd_semantic_gate = use_dptd_semantic_gate
+        self.dptd_gate_mode = dptd_gate_mode
+        self.dptd_gate_min_score = dptd_gate_min_score
+        self.dptd_gate_max_entropy = dptd_gate_max_entropy
+        self.dptd_gate_semantic_cos_tau = dptd_gate_semantic_cos_tau
+        self.dptd_gate_visual_cos_tau = dptd_gate_visual_cos_tau
+        self.dptd_gate_offset_tau = dptd_gate_offset_tau
+        self.dptd_gate_box_iou_tau = dptd_gate_box_iou_tau
+        self.dptd_gate_temperature = dptd_gate_temperature
+        self.dptd_gate_min_appearance = dptd_gate_min_appearance
+        self.dptd_gate_debug = dptd_gate_debug
+        self.use_dptd_semantic_update_suppression = use_dptd_semantic_update_suppression
+        self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
+        self.dptd_memory_dim = int(self.text_embeddings.shape[0])
+        self.dptd_visual_memory_proj = None
+        if self.use_dptd_semantic_memory and self.dptd_memory_allow_untrained_visual_projection:
+            self.dptd_visual_memory_proj = nn.Linear(hidden_dim, self.dptd_memory_dim)
+            nn.init.xavier_uniform_(self.dptd_visual_memory_proj.weight)
+            nn.init.constant_(self.dptd_visual_memory_proj.bias, 0)
         if self.use_ov_dptd and self.use_checkpoint:
             raise RuntimeError('OV-DPTD v1 does not support use_checkpoint_track=True.')
         if self.use_dptd_update_suppression and not self.use_ov_dptd:
             raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
         if self.use_dptd_update_suppression and not self.dptd_update_suppression_track_id_based:
             raise RuntimeError('DPTD update suppression v2 requires track-id based restoration.')
+        _validate_dptd_memory_options(self)
+        _validate_dptd_gate_options(self)
         self.supports_mot_batch = (
             (not use_checkpoint)
             and (len(self.transformer.encoder.fusion_layers) == 0)
@@ -780,7 +939,28 @@ class OVTR(nn.Module):
             'dptd_update_suppressed_ids': [],
             'dptd_update_suppression_restore_success_count': 0,
             'dptd_update_suppression_restore_skip_count': 0,
-        } if self.use_ov_dptd and (self.ov_dptd_store_debug or self.use_dptd_update_suppression) else {}
+            'dptd_memory_update_count': 0,
+            'dptd_memory_keep_count': 0,
+            'dptd_memory_init_count': 0,
+            'dptd_memory_entropy_mean': 0.0,
+            'dptd_memory_semantic_proto_cosine_delta_mean': 0.0,
+            'dptd_memory_topk_change_rate': 0.0,
+            'dptd_memory_visual_source': 'none',
+            'dptd_gate_mean': 1.0,
+            'dptd_gate_min': 1.0,
+            'dptd_gate_max': 1.0,
+            'dptd_gate_low_count': 0,
+            'semantic_consistency_mean': 1.0,
+            'visual_consistency_mean': 1.0,
+            'offset_consistency_mean': 1.0,
+            'box_consistency_mean': 1.0,
+            'dptd_gate_box_conf_deferred': True,
+        } if self.use_ov_dptd and (
+            self.ov_dptd_store_debug
+            or self.use_dptd_update_suppression
+            or self.dptd_memory_debug
+            or self.dptd_gate_debug
+        ) else {}
 
     def _dptd_offset_shape(self, num_queries):
         decoder_layers = getattr(self.transformer.decoder, 'layers', [])
@@ -828,6 +1008,15 @@ class OVTR(nn.Module):
             'ov_dptd_num_track_queries',
             'ov_dptd_historical_offset_used_count',
             'ov_dptd_historical_offset_fallback_count',
+            'dptd_gate_mean',
+            'dptd_gate_min',
+            'dptd_gate_max',
+            'dptd_gate_low_count',
+            'semantic_consistency_mean',
+            'visual_consistency_mean',
+            'offset_consistency_mean',
+            'box_consistency_mean',
+            'dptd_gate_box_conf_deferred',
         ]:
             if key in debug:
                 self.ov_dptd_debug_stats[key] = debug[key]
@@ -946,6 +1135,481 @@ class OVTR(nn.Module):
         self._add_dptd_update_suppression_debug(success_count=success_count, skip_count=skip_count)
         return track_instances
 
+    def _ensure_dptd_memory_fields(self, track_instances):
+        if not self.use_dptd_semantic_memory:
+            return track_instances
+        num_tracks = len(track_instances)
+        if track_instances.has('query_tgt'):
+            device = track_instances.query_tgt.device
+            dtype = track_instances.query_tgt.dtype
+        elif track_instances.has('scores'):
+            device = track_instances.scores.device
+            dtype = track_instances.scores.dtype
+        else:
+            device = self.text_embeddings.device
+            dtype = self.text_embeddings.dtype
+        memory_dim = getattr(self, 'dptd_memory_dim', None)
+        if memory_dim is None:
+            memory_dim = self.text_embeddings.shape[0]
+        memory_dim = int(memory_dim)
+        topk = int(self.dptd_memory_store_topk)
+
+        def _needs_tensor(name, shape, expected_dtype):
+            needs_init = not track_instances.has(name)
+            if not needs_init:
+                value = track_instances.get(name)
+                needs_init = not isinstance(value, torch.Tensor) or tuple(value.shape) != tuple(shape)
+            if needs_init:
+                fill = -1 if name == 'dptd_topk_class_indices' else 0
+                value = torch.full(shape, fill, device=device, dtype=expected_dtype)
+                track_instances.set(name, value)
+            else:
+                value = track_instances.get(name)
+                if value.device != device or value.dtype != expected_dtype:
+                    track_instances.set(name, value.to(device=device, dtype=expected_dtype))
+
+        _needs_tensor('dptd_semantic_proto', (num_tracks, memory_dim), dtype)
+        _needs_tensor('dptd_visual_memory', (num_tracks, memory_dim), dtype)
+        _needs_tensor('dptd_semantic_conf', (num_tracks,), torch.float32)
+        _needs_tensor('dptd_semantic_entropy', (num_tracks,), torch.float32)
+        _needs_tensor('dptd_memory_age', (num_tracks,), torch.long)
+        _needs_tensor('dptd_topk_class_indices', (num_tracks, topk), torch.long)
+        _needs_tensor('dptd_topk_class_scores', (num_tracks, topk), torch.float32)
+        return track_instances
+
+    def _snapshot_dptd_memory_state(self, track_instances):
+        if not self.use_dptd_semantic_memory:
+            return None
+        track_instances = self._ensure_dptd_memory_fields(track_instances)
+        if not track_instances.has('obj_idxes') or len(track_instances) == 0:
+            return {'ids': torch.empty(0, dtype=torch.long), 'fields': {}}
+        valid_mask = track_instances.obj_idxes >= 0
+        ids = track_instances.obj_idxes[valid_mask].detach().clone()
+        snapshot = {'ids': ids, 'fields': {}}
+        for field_name in DPTD_MEMORY_FIELDS:
+            if not track_instances.has(field_name):
+                continue
+            value = track_instances.get(field_name)
+            if isinstance(value, torch.Tensor) and value.shape[0] == len(track_instances):
+                snapshot['fields'][field_name] = value[valid_mask].detach().clone()
+        return snapshot
+
+    def _make_dptd_gate_state(self, track_instances, text_memory_embeddings):
+        if not self.use_dptd_semantic_gate:
+            return None
+        track_instances = self._ensure_dptd_memory_fields(track_instances)
+        semantic = track_instances.dptd_semantic_proto.detach()
+        visual = track_instances.dptd_visual_memory.detach()
+        memory_valid = (
+            (track_instances.obj_idxes >= 0)
+            & (semantic.float().norm(dim=-1) > 1e-6)
+            & (visual.float().norm(dim=-1) > 1e-6)
+        )
+        return {
+            'semantic_proto': semantic,
+            'visual_memory': visual,
+            'memory_age': track_instances.dptd_memory_age.detach(),
+            'pred_boxes': track_instances.pred_boxes.detach() if track_instances.has('pred_boxes') else None,
+            'historical_offsets': track_instances.dptd_sampling_offsets.detach() if track_instances.has('dptd_sampling_offsets') else None,
+            'obj_idxes': track_instances.obj_idxes.detach(),
+            'memory_valid': memory_valid.detach(),
+            'text_memory_embeddings': text_memory_embeddings.detach() if text_memory_embeddings is not None else None,
+        }
+
+    def _attach_dptd_gate_values(self, frame_res, track_instances):
+        if not self.use_dptd_semantic_gate:
+            return track_instances
+        gate = frame_res.get('dptd_gate_values')
+        if gate is None:
+            gate = torch.ones(len(track_instances), device=track_instances.scores.device, dtype=track_instances.scores.dtype)
+        if isinstance(gate, torch.Tensor) and gate.dim() == 2:
+            gate = gate[0]
+        if not isinstance(gate, torch.Tensor) or gate.shape[0] != len(track_instances):
+            raise RuntimeError('DPTD semantic gate row mismatch in post-process.')
+        track_instances.set('_dptd_current_gate', gate.to(device=track_instances.scores.device, dtype=track_instances.scores.dtype).detach())
+        return track_instances
+
+    def _compute_dptd_post_visual_consistency(self, memory_snapshot, track_instances):
+        if not (self.use_dptd_semantic_gate and track_instances.has('_dptd_current_visual_memory')):
+            return track_instances
+        current_visual = track_instances.get('_dptd_current_visual_memory')
+        consistency = torch.ones(len(track_instances), device=current_visual.device, dtype=torch.float32)
+        if memory_snapshot is not None and 'dptd_visual_memory' in memory_snapshot.get('fields', {}) and track_instances.has('obj_idxes'):
+            snapshot_ids = memory_snapshot['ids'].to(device=track_instances.obj_idxes.device, dtype=track_instances.obj_idxes.dtype)
+            old_visual = memory_snapshot['fields']['dptd_visual_memory'].to(device=current_visual.device, dtype=current_visual.dtype)
+            measured = []
+            for row_idx in range(len(track_instances)):
+                track_id = track_instances.obj_idxes[row_idx]
+                if int(track_id.detach().item()) < 0:
+                    continue
+                matches = torch.nonzero(snapshot_ids == track_id, as_tuple=False).flatten()
+                if matches.numel() == 0:
+                    continue
+                old_value = old_visual[int(matches[0].item())]
+                if old_value.float().norm().item() <= 1e-6:
+                    continue
+                cosine = F.cosine_similarity(
+                    current_visual[row_idx].float().unsqueeze(0),
+                    old_value.float().unsqueeze(0),
+                    dim=-1,
+                    eps=1e-6,
+                )[0].clamp(-1.0, 1.0)
+                conf = torch.sigmoid((cosine - float(self.dptd_gate_visual_cos_tau)) * float(self.dptd_gate_temperature)).clamp(0.0, 1.0)
+                consistency[row_idx] = conf.to(dtype=consistency.dtype)
+                measured.append(conf.detach().float())
+            if measured and self.ov_dptd_debug_stats:
+                self.ov_dptd_debug_stats['visual_consistency_mean'] = float(torch.stack(measured).mean().item())
+        track_instances.set('_dptd_current_visual_consistency', consistency.detach())
+        return track_instances
+
+    def _extend_dptd_semantic_update_suppression(self, snapshot, track_instances):
+        if not self.use_dptd_semantic_update_suppression:
+            return None
+        if snapshot is None or not track_instances.has('_dptd_current_gate') or not track_instances.has('obj_idxes'):
+            return None
+        old_ids = snapshot.get('ids')
+        if not isinstance(old_ids, torch.Tensor) or old_ids.numel() == 0:
+            return old_ids
+        semantic_ids = []
+        current_ids = track_instances.obj_idxes
+        gate = track_instances.get('_dptd_current_gate')
+        for track_id in old_ids.detach().cpu().tolist():
+            matches = torch.nonzero(current_ids == int(track_id), as_tuple=False).flatten()
+            if matches.numel() == 0:
+                continue
+            row_idx = int(matches[0].item())
+            if float(gate[row_idx].detach().item()) < float(self.dptd_semantic_update_suppression_thresh):
+                semantic_ids.append(int(track_id))
+        previous = snapshot.get('suppressed_ids')
+        device = current_ids.device
+        dtype = current_ids.dtype
+        if previous is not None and isinstance(previous, torch.Tensor) and previous.numel() > 0:
+            all_ids = set(int(v) for v in previous.detach().cpu().tolist())
+        else:
+            all_ids = set()
+        all_ids.update(semantic_ids)
+        snapshot['suppressed_ids'] = torch.tensor(sorted(all_ids), device=device, dtype=dtype)
+        if self.ov_dptd_debug_stats:
+            ids = snapshot['suppressed_ids'].detach().cpu().tolist()
+            self.ov_dptd_debug_stats['dptd_update_suppressed_count'] = len(ids)
+            self.ov_dptd_debug_stats['dptd_update_suppressed_ids'] = ids
+        return snapshot['suppressed_ids']
+
+
+    def _dptd_memory_visual_projection(self, image_feature):
+        proj = getattr(self, 'dptd_visual_memory_proj', None)
+        if proj is None:
+            raise RuntimeError('DPTD visual memory projection fallback is not initialized.')
+        return proj(image_feature)
+
+    def _compute_dptd_semantic_memory_candidates(self, frame_res, track_instances):
+        text_embeddings = frame_res.pop('dptd_text_memory_embeddings', None)
+        if text_embeddings is None:
+            raise RuntimeError('DPTD semantic memory requires frame_res["dptd_text_memory_embeddings"].')
+        select_id = frame_res['select_id']
+        if not isinstance(select_id, torch.Tensor):
+            select_id = torch.as_tensor(select_id, device=track_instances.pred_logits.device, dtype=torch.long)
+        else:
+            select_id = select_id.to(device=track_instances.pred_logits.device, dtype=torch.long)
+        num_cls = int(select_id.numel())
+        if num_cls <= 0:
+            raise RuntimeError('DPTD semantic memory received an empty selected class set.')
+        if track_instances.pred_logits.shape[-1] < num_cls:
+            raise RuntimeError(
+                'DPTD semantic memory logits shorter than selected classes: '
+                f'{track_instances.pred_logits.shape[-1]} < {num_cls}'
+            )
+
+        logits = track_instances.pred_logits[..., :num_cls].float()
+        score = logits.sigmoid()
+        prob = score / score.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        text_embeddings = text_embeddings.to(device=prob.device, dtype=prob.dtype)
+        semantic_proto = F.normalize(prob @ text_embeddings, dim=-1, eps=1e-6)
+        semantic_conf = score.max(dim=-1).values
+        entropy_den = math.log(num_cls) if num_cls > 1 else 1.0
+        entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=-1) / entropy_den
+        entropy = entropy.clamp(0.0, 1.0)
+
+        store_topk = int(self.dptd_memory_store_topk)
+        actual_topk = min(store_topk, num_cls)
+        _, topk_local = torch.topk(score, k=actual_topk, dim=-1)
+        topk_scores = torch.gather(prob, dim=-1, index=topk_local)
+        topk_indices = select_id[topk_local]
+        if actual_topk < store_topk:
+            pad_shape = (len(track_instances), store_topk - actual_topk)
+            topk_indices = torch.cat([
+                topk_indices,
+                torch.full(pad_shape, -1, device=topk_indices.device, dtype=topk_indices.dtype),
+            ], dim=-1)
+            topk_scores = torch.cat([
+                topk_scores,
+                torch.zeros(pad_shape, device=topk_scores.device, dtype=topk_scores.dtype),
+            ], dim=-1)
+
+        target_dtype = track_instances.query_tgt.dtype if track_instances.has('query_tgt') else semantic_proto.dtype
+        return {
+            '_dptd_current_semantic_proto': semantic_proto.to(dtype=target_dtype).detach(),
+            '_dptd_current_semantic_conf': semantic_conf.to(dtype=torch.float32).detach(),
+            '_dptd_current_semantic_entropy': entropy.to(dtype=torch.float32).detach(),
+            '_dptd_current_topk_class_indices': topk_indices.to(dtype=torch.long).detach(),
+            '_dptd_current_topk_class_scores': topk_scores.to(dtype=torch.float32).detach(),
+        }
+
+    def _compute_dptd_visual_memory_candidates(self, frame_res, track_instances):
+        visual_source = 'alignment_feature'
+        if self.dptd_memory_use_alignment_feature and 'pred_embed' in frame_res:
+            visual_memory = frame_res['pred_embed'][0]
+        elif self.dptd_memory_allow_untrained_visual_projection:
+            visual_source = 'projection_fallback'
+            visual_memory = self._dptd_memory_visual_projection(track_instances.output_embedding_img)
+        else:
+            raise RuntimeError(
+                'DPTD visual memory requires frame_res["pred_embed"] unless '
+                'dptd_memory_allow_untrained_visual_projection=True.'
+            )
+        if visual_memory.shape[0] != len(track_instances):
+            raise RuntimeError(
+                'DPTD visual memory row mismatch: '
+                f'{visual_memory.shape[0]} != {len(track_instances)}'
+            )
+        memory_dim = int(getattr(self, 'dptd_memory_dim', visual_memory.shape[-1]))
+        if visual_memory.shape[-1] != memory_dim:
+            raise RuntimeError(
+                'DPTD visual memory dim mismatch: '
+                f'{visual_memory.shape[-1]} != {memory_dim}'
+            )
+        visual_memory = F.normalize(visual_memory.float(), dim=-1, eps=1e-6)
+        target_dtype = track_instances.query_tgt.dtype if track_instances.has('query_tgt') else visual_memory.dtype
+        if getattr(self, 'ov_dptd_debug_stats', {}):
+            self.ov_dptd_debug_stats['dptd_memory_visual_source'] = visual_source
+        return visual_memory.to(dtype=target_dtype).detach()
+
+    def _attach_dptd_memory_candidates(self, frame_res, track_instances):
+        if not self.use_dptd_semantic_memory:
+            return track_instances
+        with torch.no_grad():
+            semantic_candidates = self._compute_dptd_semantic_memory_candidates(frame_res, track_instances)
+            visual_candidate = self._compute_dptd_visual_memory_candidates(frame_res, track_instances)
+            for name, value in semantic_candidates.items():
+                track_instances.set(name, value.detach())
+            track_instances.set('_dptd_current_visual_memory', visual_candidate.detach())
+        return track_instances
+
+    def _remove_dptd_memory_candidate_fields(self, track_instances):
+        if track_instances is None:
+            return track_instances
+        for field_name in DPTD_TEMP_FIELDS:
+            if track_instances.has(field_name):
+                track_instances.remove(field_name)
+        return track_instances
+
+    def _set_dptd_memory_debug_stats(self, **stats):
+        if not (self.dptd_memory_debug and getattr(self, 'ov_dptd_debug_stats', {})):
+            return
+        for name, value in stats.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    value = 0.0
+                elif value.numel() == 1:
+                    value = value.detach().item()
+                else:
+                    value = value.detach().float().mean().item()
+            if isinstance(value, bool):
+                self.ov_dptd_debug_stats[name] = bool(value)
+            elif isinstance(value, int):
+                self.ov_dptd_debug_stats[name] = int(value)
+            elif isinstance(value, str):
+                self.ov_dptd_debug_stats[name] = value
+            else:
+                self.ov_dptd_debug_stats[name] = float(value)
+
+    def _update_dptd_memory_state(self, memory_snapshot, suppression_snapshot, track_instances):
+        if not self.use_dptd_semantic_memory:
+            return track_instances
+        with torch.no_grad():
+            track_instances = self._ensure_dptd_memory_fields(track_instances)
+            missing = [name for name in DPTD_CURRENT_MEMORY_FIELDS if not track_instances.has(name)]
+            if missing:
+                raise RuntimeError(f'DPTD memory candidate fields missing: {missing}')
+
+            suppressed_ids = set()
+            if suppression_snapshot is not None:
+                suppressed = suppression_snapshot.get('suppressed_ids')
+                if isinstance(suppressed, torch.Tensor) and suppressed.numel() > 0:
+                    suppressed_ids = set(int(v) for v in suppressed.detach().cpu().tolist())
+
+            snapshot_ids = memory_snapshot['ids'] if memory_snapshot is not None else torch.empty(0, dtype=torch.long)
+            snapshot_ids_cpu = snapshot_ids.detach().cpu().tolist() if isinstance(snapshot_ids, torch.Tensor) else []
+            snapshot_index = {int(track_id): idx for idx, track_id in enumerate(snapshot_ids_cpu)}
+            snapshot_fields = memory_snapshot.get('fields', {}) if memory_snapshot is not None else {}
+
+            update_count = 0
+            keep_count = 0
+            init_count = 0
+            entropy_values = []
+            cosine_deltas = []
+            topk_changed = 0
+            topk_compared = 0
+            ema = float(self.dptd_memory_ema)
+            eps = 1e-6
+
+            current_semantic = track_instances.get('_dptd_current_semantic_proto')
+            current_visual = track_instances.get('_dptd_current_visual_memory')
+            current_conf = track_instances.get('_dptd_current_semantic_conf')
+            current_entropy = track_instances.get('_dptd_current_semantic_entropy')
+            current_topk_indices = track_instances.get('_dptd_current_topk_class_indices')
+            current_topk_scores = track_instances.get('_dptd_current_topk_class_scores')
+
+            for row_idx in range(len(track_instances)):
+                if not track_instances.has('obj_idxes'):
+                    continue
+                track_id = int(track_instances.obj_idxes[row_idx].detach().item())
+                if track_id < 0:
+                    continue
+
+                old_idx = snapshot_index.get(track_id)
+                has_old = old_idx is not None
+                old_semantic = (
+                    snapshot_fields['dptd_semantic_proto'][old_idx].to(
+                        device=track_instances.dptd_semantic_proto.device,
+                        dtype=track_instances.dptd_semantic_proto.dtype,
+                    )
+                    if has_old and 'dptd_semantic_proto' in snapshot_fields
+                    else track_instances.dptd_semantic_proto[row_idx]
+                )
+                old_visual = (
+                    snapshot_fields['dptd_visual_memory'][old_idx].to(
+                        device=track_instances.dptd_visual_memory.device,
+                        dtype=track_instances.dptd_visual_memory.dtype,
+                    )
+                    if has_old and 'dptd_visual_memory' in snapshot_fields
+                    else track_instances.dptd_visual_memory[row_idx]
+                )
+                old_age = (
+                    snapshot_fields['dptd_memory_age'][old_idx].to(
+                        device=track_instances.dptd_memory_age.device,
+                        dtype=track_instances.dptd_memory_age.dtype,
+                    )
+                    if has_old and 'dptd_memory_age' in snapshot_fields
+                    else track_instances.dptd_memory_age[row_idx]
+                )
+                old_topk = (
+                    snapshot_fields['dptd_topk_class_indices'][old_idx].to(
+                        device=track_instances.dptd_topk_class_indices.device,
+                        dtype=track_instances.dptd_topk_class_indices.dtype,
+                    )
+                    if has_old and 'dptd_topk_class_indices' in snapshot_fields
+                    else track_instances.dptd_topk_class_indices[row_idx]
+                )
+
+                is_new = (
+                    not has_old
+                    or old_semantic.float().norm().item() <= eps
+                    or old_visual.float().norm().item() <= eps
+                )
+                reliable = (
+                    float(track_instances.scores[row_idx].detach().item()) >= float(self.dptd_memory_min_score)
+                    and float(current_entropy[row_idx].detach().item()) <= float(self.dptd_memory_max_entropy)
+                )
+                entropy_values.append(float(current_entropy[row_idx].detach().item()))
+
+                if track_id in suppressed_ids:
+                    track_instances.dptd_semantic_proto[row_idx] = old_semantic
+                    track_instances.dptd_visual_memory[row_idx] = old_visual
+                    if has_old and 'dptd_semantic_conf' in snapshot_fields:
+                        track_instances.dptd_semantic_conf[row_idx] = snapshot_fields['dptd_semantic_conf'][old_idx].to(
+                            device=track_instances.dptd_semantic_conf.device,
+                            dtype=track_instances.dptd_semantic_conf.dtype,
+                        )
+                    if has_old and 'dptd_semantic_entropy' in snapshot_fields:
+                        track_instances.dptd_semantic_entropy[row_idx] = snapshot_fields['dptd_semantic_entropy'][old_idx].to(
+                            device=track_instances.dptd_semantic_entropy.device,
+                            dtype=track_instances.dptd_semantic_entropy.dtype,
+                        )
+                    if has_old and 'dptd_topk_class_indices' in snapshot_fields:
+                        track_instances.dptd_topk_class_indices[row_idx] = old_topk
+                    if has_old and 'dptd_topk_class_scores' in snapshot_fields:
+                        track_instances.dptd_topk_class_scores[row_idx] = snapshot_fields['dptd_topk_class_scores'][old_idx].to(
+                            device=track_instances.dptd_topk_class_scores.device,
+                            dtype=track_instances.dptd_topk_class_scores.dtype,
+                        )
+                    track_instances.dptd_memory_age[row_idx] = old_age + 1
+                    keep_count += 1
+                    continue
+
+                if is_new:
+                    track_instances.dptd_semantic_proto[row_idx] = current_semantic[row_idx]
+                    track_instances.dptd_visual_memory[row_idx] = current_visual[row_idx]
+                    track_instances.dptd_semantic_conf[row_idx] = current_conf[row_idx]
+                    track_instances.dptd_semantic_entropy[row_idx] = current_entropy[row_idx]
+                    track_instances.dptd_topk_class_indices[row_idx] = current_topk_indices[row_idx]
+                    track_instances.dptd_topk_class_scores[row_idx] = current_topk_scores[row_idx]
+                    track_instances.dptd_memory_age[row_idx] = 0
+                    init_count += 1
+                    continue
+
+                if reliable:
+                    new_semantic = F.normalize(
+                        ema * old_semantic.float() + (1.0 - ema) * current_semantic[row_idx].float(),
+                        dim=-1,
+                        eps=1e-6,
+                    ).to(dtype=track_instances.dptd_semantic_proto.dtype)
+                    new_visual = F.normalize(
+                        ema * old_visual.float() + (1.0 - ema) * current_visual[row_idx].float(),
+                        dim=-1,
+                        eps=1e-6,
+                    ).to(dtype=track_instances.dptd_visual_memory.dtype)
+                    track_instances.dptd_semantic_proto[row_idx] = new_semantic
+                    track_instances.dptd_visual_memory[row_idx] = new_visual
+                    track_instances.dptd_semantic_conf[row_idx] = current_conf[row_idx]
+                    track_instances.dptd_semantic_entropy[row_idx] = current_entropy[row_idx]
+                    track_instances.dptd_topk_class_indices[row_idx] = current_topk_indices[row_idx]
+                    track_instances.dptd_topk_class_scores[row_idx] = current_topk_scores[row_idx]
+                    track_instances.dptd_memory_age[row_idx] = 0
+                    cosine_delta = 1.0 - F.cosine_similarity(
+                        old_semantic.float().unsqueeze(0),
+                        new_semantic.float().unsqueeze(0),
+                        dim=-1,
+                        eps=1e-6,
+                    )[0]
+                    cosine_deltas.append(float(cosine_delta.detach().item()))
+                    topk_changed += int(not torch.equal(old_topk.detach().cpu(), current_topk_indices[row_idx].detach().cpu()))
+                    topk_compared += 1
+                    update_count += 1
+                else:
+                    track_instances.dptd_semantic_proto[row_idx] = old_semantic
+                    track_instances.dptd_visual_memory[row_idx] = old_visual
+                    if has_old and 'dptd_semantic_conf' in snapshot_fields:
+                        track_instances.dptd_semantic_conf[row_idx] = snapshot_fields['dptd_semantic_conf'][old_idx].to(
+                            device=track_instances.dptd_semantic_conf.device,
+                            dtype=track_instances.dptd_semantic_conf.dtype,
+                        )
+                    if has_old and 'dptd_semantic_entropy' in snapshot_fields:
+                        track_instances.dptd_semantic_entropy[row_idx] = snapshot_fields['dptd_semantic_entropy'][old_idx].to(
+                            device=track_instances.dptd_semantic_entropy.device,
+                            dtype=track_instances.dptd_semantic_entropy.dtype,
+                        )
+                    if has_old and 'dptd_topk_class_indices' in snapshot_fields:
+                        track_instances.dptd_topk_class_indices[row_idx] = old_topk
+                    if has_old and 'dptd_topk_class_scores' in snapshot_fields:
+                        track_instances.dptd_topk_class_scores[row_idx] = snapshot_fields['dptd_topk_class_scores'][old_idx].to(
+                            device=track_instances.dptd_topk_class_scores.device,
+                            dtype=track_instances.dptd_topk_class_scores.dtype,
+                        )
+                    track_instances.dptd_memory_age[row_idx] = old_age + 1
+                    keep_count += 1
+
+            self._set_dptd_memory_debug_stats(
+                dptd_memory_update_count=update_count,
+                dptd_memory_keep_count=keep_count,
+                dptd_memory_init_count=init_count,
+                dptd_memory_entropy_mean=(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
+                dptd_memory_semantic_proto_cosine_delta_mean=(sum(cosine_deltas) / len(cosine_deltas)) if cosine_deltas else 0.0,
+                dptd_memory_topk_change_rate=(topk_changed / topk_compared) if topk_compared else 0.0,
+            )
+        return self._remove_dptd_memory_candidate_fields(track_instances)
+
+
     def _generate_empty_tracks(self, cls_pad_len=1203):
         track_instances = Instances((1, 1))
         num_queries = self.num_queries
@@ -968,6 +1632,8 @@ class OVTR(nn.Module):
                 device,
                 track_instances.query_tgt.dtype,
             )
+        if self.use_dptd_semantic_memory:
+            self._ensure_dptd_memory_fields(track_instances)
 
         if not self.training:
             track_instances.cls_idxes = torch.full((num_queries,), -1, dtype=torch.long, device=device)
@@ -1286,6 +1952,7 @@ class OVTR(nn.Module):
 
         # Prepare queries and embeddings for alignment
         text_query = self.text_embeddings[:, select_id].to(masks[0].device).t()
+        dptd_text_memory_embeddings = text_query.detach() if self.use_dptd_semantic_memory else None
         image_align = self.image_embeddings[:, select_id].to(masks[0].device).t()
         
         image_feat_ori = (image_align.float()).detach()
@@ -1300,6 +1967,7 @@ class OVTR(nn.Module):
             if self.use_ov_dptd and track_instances.has('dptd_sampling_offsets')
             else None
         )
+        dptd_gate_state = self._make_dptd_gate_state(track_instances, dptd_text_memory_embeddings)
         transformer_outputs = self.transformer(
             srcs,
             masks,
@@ -1309,6 +1977,7 @@ class OVTR(nn.Module):
             ref_pts=track_instances.ref_pts,
             text_dict=text_dict,
             dptd_sampling_offsets=dptd_sampling_offsets,
+            dptd_gate_state=dptd_gate_state,
             return_dptd_info=self.use_ov_dptd,
         )
         dptd_info = None
@@ -1352,10 +2021,14 @@ class OVTR(nn.Module):
             "image_feat": image_feat_ori,
             "extra_labels": extra_labels,
             }
+        if self.use_dptd_semantic_memory:
+            out['dptd_text_memory_embeddings'] = dptd_text_memory_embeddings
         if self.use_ov_dptd:
             if dptd_info is None or dptd_info.get('sampling_offsets') is None:
                 raise RuntimeError('OV-DPTD decoder did not return final sampling offsets.')
             out['dptd_sampling_offsets'] = dptd_info['sampling_offsets']
+            if dptd_info.get('semantic_gate') is not None:
+                out['dptd_gate_values'] = dptd_info['semantic_gate']
             self._update_ov_dptd_debug_stats(dptd_info)
         self._mcip_store_text_feat(out, text_dict)
             
@@ -1375,6 +2048,7 @@ class OVTR(nn.Module):
             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
 
         dptd_suppression_snapshot = self._snapshot_dptd_update_suppression_state(track_instances)
+        dptd_memory_snapshot = self._snapshot_dptd_memory_state(track_instances)
 
         track_instances.scores = track_scores
         track_instances.pred_logits = frame_res['pred_logits'][0]
@@ -1384,6 +2058,8 @@ class OVTR(nn.Module):
         track_instances.query_pos = frame_res["query_pos_track"][0]
         self._attach_dptd_sampling_offsets(frame_res, track_instances)
         self._mcip_attach_semantic_observations(frame_res, track_instances)
+        track_instances = self._attach_dptd_memory_candidates(frame_res, track_instances)
+        track_instances = self._attach_dptd_gate_values(frame_res, track_instances)
         self._select_dptd_update_suppressed_ids(dptd_suppression_snapshot, track_instances)
         track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
 
@@ -1401,6 +2077,17 @@ class OVTR(nn.Module):
             track_instances = self.track_base.update(track_instances, _track_discard, is_repeat=is_repeat)
             track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
             track_instances = self._mcip_verify_track_fields(track_instances)
+
+        track_instances = self._compute_dptd_post_visual_consistency(dptd_memory_snapshot, track_instances)
+        self._extend_dptd_semantic_update_suppression(dptd_suppression_snapshot, track_instances)
+        track_instances = self._restore_dptd_update_suppressed_state(dptd_suppression_snapshot, track_instances)
+        track_instances = self._compute_dptd_post_visual_consistency(dptd_memory_snapshot, track_instances)
+        track_instances = self._update_dptd_memory_state(
+            dptd_memory_snapshot,
+            dptd_suppression_snapshot,
+            track_instances,
+        )
+        frame_res['track_instances'] = track_instances
 
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks(cls_pad_len=track_instances.pred_logits.shape[1])
@@ -1468,6 +2155,12 @@ class OVTR(nn.Module):
             raise RuntimeError('DPTD update suppression is inference-only.')
         if self.use_dptd_update_suppression and not self.use_ov_dptd:
             raise RuntimeError('DPTD update suppression requires use_ov_dptd=True.')
+        if getattr(self, 'use_dptd_semantic_memory', False) and not self.use_ov_dptd:
+            raise RuntimeError('DPTD semantic memory requires use_ov_dptd=True.')
+        if getattr(self, 'use_dptd_semantic_gate', False) and not getattr(self, 'use_dptd_semantic_memory', False):
+            raise RuntimeError('DPTD semantic gate requires use_dptd_semantic_memory=True.')
+        if getattr(self, 'use_dptd_semantic_update_suppression', False) and not getattr(self, 'use_dptd_update_suppression', False):
+            raise RuntimeError('DPTD semantic update suppression requires use_dptd_update_suppression=True.')
 
     def forward(self, data):
         frames_by_time, targets_by_time, batch_size = self._transpose_batch_inputs(data)
@@ -1635,5 +2328,26 @@ def build(args, cfg):
         dptd_update_suppression_thresh=args.dptd_update_suppression_thresh,
         dptd_update_suppression_restore_fields=args.dptd_update_suppression_restore_fields,
         dptd_update_suppression_track_id_based=args.dptd_update_suppression_track_id_based,
+        use_dptd_semantic_memory=args.use_dptd_semantic_memory,
+        dptd_memory_ema=args.dptd_memory_ema,
+        dptd_memory_min_score=args.dptd_memory_min_score,
+        dptd_memory_max_entropy=args.dptd_memory_max_entropy,
+        dptd_memory_use_alignment_feature=args.dptd_memory_use_alignment_feature,
+        dptd_memory_allow_untrained_visual_projection=args.dptd_memory_allow_untrained_visual_projection,
+        dptd_memory_store_topk=args.dptd_memory_store_topk,
+        dptd_memory_debug=args.dptd_memory_debug,
+        use_dptd_semantic_gate=args.use_dptd_semantic_gate,
+        dptd_gate_mode=args.dptd_gate_mode,
+        dptd_gate_min_score=args.dptd_gate_min_score,
+        dptd_gate_max_entropy=args.dptd_gate_max_entropy,
+        dptd_gate_semantic_cos_tau=args.dptd_gate_semantic_cos_tau,
+        dptd_gate_visual_cos_tau=args.dptd_gate_visual_cos_tau,
+        dptd_gate_offset_tau=args.dptd_gate_offset_tau,
+        dptd_gate_box_iou_tau=args.dptd_gate_box_iou_tau,
+        dptd_gate_temperature=args.dptd_gate_temperature,
+        dptd_gate_min_appearance=args.dptd_gate_min_appearance,
+        dptd_gate_debug=args.dptd_gate_debug,
+        use_dptd_semantic_update_suppression=args.use_dptd_semantic_update_suppression,
+        dptd_semantic_update_suppression_thresh=args.dptd_semantic_update_suppression_thresh,
     )
     return model, criterion
