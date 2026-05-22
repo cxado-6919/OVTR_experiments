@@ -55,6 +55,46 @@ def _split_mot_batch(data_dict):
     return sample_dicts
 
 
+
+def _tensor_norm_or_zero(tensors):
+    total = 0.0
+    has_value = False
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        has_value = True
+        total += float(tensor.detach().float().norm().item()) ** 2
+    return math.sqrt(total) if has_value else 0.0
+
+
+def _collect_ov_dptd_train_stats(model):
+    model_ref = model.module if hasattr(model, "module") else model
+    if not getattr(model_ref, "use_ov_dptd", False):
+        return {}
+    decoder = getattr(getattr(model_ref, "transformer", None), "decoder", None)
+    if decoder is None:
+        return {}
+
+    stats = {}
+    alpha = getattr(decoder, "ov_dptd_gate_alpha", None)
+    if isinstance(alpha, torch.Tensor):
+        stats["ov_dptd_gate_alpha"] = float(alpha.detach().float().mean().item())
+        stats["ov_dptd_gate_alpha_grad_norm"] = _tensor_norm_or_zero([alpha.grad])
+
+    id_proj = list(getattr(decoder, "ov_dptd_ofa_id_proj", []))
+    if id_proj:
+        stats["ov_dptd_id_proj_weight_norm"] = _tensor_norm_or_zero([proj.weight for proj in id_proj])
+        stats["ov_dptd_id_proj_grad_norm"] = _tensor_norm_or_zero([proj.weight.grad for proj in id_proj])
+
+    debug_stats = getattr(model_ref, "ov_dptd_debug_stats", {})
+    if isinstance(debug_stats, dict):
+        for key in ("dptd_gate_raw_valid_mean", "dptd_gate_valid_mean"):
+            if key in debug_stats:
+                value = debug_stats[key]
+                if isinstance(value, (int, float, bool)):
+                    stats[key] = float(value)
+    return stats
+
 def visualize(track_instances, filename):
     for i, _track_instance in enumerate(track_instances):
         prob = _track_instance.pred_logits.sigmoid()
@@ -175,11 +215,14 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
             grad_total_norm = utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+        ov_dptd_train_stats = _collect_ov_dptd_train_stats(model)
         optimizer.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
+        if ov_dptd_train_stats:
+            metric_logger.update(**ov_dptd_train_stats)
 
         # gather the stats from all processes
         if writer is not None:

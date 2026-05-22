@@ -81,6 +81,8 @@ class Transformer(nn.Module):
         dptd_gate_min_appearance=0.1,
         dptd_gate_debug=False,
         dptd_semantic_update_suppression_thresh=0.3,
+        ov_dptd_semantic_gate_id_proj_init="small_random",
+        ov_dptd_semantic_gate_id_proj_init_std=1e-3,
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -168,6 +170,8 @@ class Transformer(nn.Module):
             dptd_gate_min_appearance=dptd_gate_min_appearance,
             dptd_gate_debug=dptd_gate_debug,
             dptd_semantic_update_suppression_thresh=dptd_semantic_update_suppression_thresh,
+            ov_dptd_semantic_gate_id_proj_init=ov_dptd_semantic_gate_id_proj_init,
+            ov_dptd_semantic_gate_id_proj_init_std=ov_dptd_semantic_gate_id_proj_init_std,
         )
 
         self.d_model = d_model
@@ -647,6 +651,8 @@ class TransformerDecoder(nn.Module):
         dptd_gate_min_appearance=0.1,
         dptd_gate_debug=False,
         dptd_semantic_update_suppression_thresh=0.3,
+        ov_dptd_semantic_gate_id_proj_init="small_random",
+        ov_dptd_semantic_gate_id_proj_init_std=1e-3,
     ):
         super().__init__()
         if num_layers > 0:
@@ -710,6 +716,8 @@ class TransformerDecoder(nn.Module):
         self.dptd_gate_min_appearance = dptd_gate_min_appearance
         self.dptd_gate_debug = dptd_gate_debug
         self.dptd_semantic_update_suppression_thresh = dptd_semantic_update_suppression_thresh
+        self.ov_dptd_semantic_gate_id_proj_init = ov_dptd_semantic_gate_id_proj_init
+        self.ov_dptd_semantic_gate_id_proj_init_std = float(ov_dptd_semantic_gate_id_proj_init_std)
         self.ov_dptd_gate_alpha = nn.Parameter(torch.tensor(0.0)) if self.use_ov_dptd else None
         if self.use_ov_dptd:
             if self.ov_dptd_fusion not in ("linear_sum", "semantic_gate"):
@@ -722,6 +730,10 @@ class TransformerDecoder(nn.Module):
                 raise NotImplementedError("OV-DPTD v4 only supports dptd_gate_mode='heuristic'.")
             if self.ov_dptd_id_path_text != "none":
                 raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+            if self.ov_dptd_semantic_gate_id_proj_init not in ("small_random", "zero"):
+                raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
+            if self.ov_dptd_fusion == "semantic_gate" and self.ov_dptd_semantic_gate_id_proj_init == "small_random" and self.ov_dptd_semantic_gate_id_proj_init_std <= 0.0:
+                raise RuntimeError("ov_dptd_semantic_gate_id_proj_init_std must be > 0 for small_random init.")
             self.ov_dptd_ofa_ada_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_ofa_id_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
             self.ov_dptd_ofa_out_proj = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(num_layers)])
@@ -746,16 +758,38 @@ class TransformerDecoder(nn.Module):
         nn.init.constant_(linear.weight, 0.0)
         nn.init.constant_(linear.bias, 0.0)
 
+    @staticmethod
+    def _reset_linear_small_random(linear, std):
+        nn.init.normal_(linear.weight, mean=0.0, std=float(std))
+        nn.init.constant_(linear.bias, 0.0)
+
     def reset_ov_dptd_fusion_parameters(self):
         if not self.use_ov_dptd:
             return
+        if self.ov_dptd_gate_alpha is not None:
+            with torch.no_grad():
+                self.ov_dptd_gate_alpha.fill_(0.0)
         for layer_id in range(self.num_layers):
             self._reset_linear_identity(self.ov_dptd_ofa_ada_proj[layer_id])
-            self._reset_linear_zero(self.ov_dptd_ofa_id_proj[layer_id])
+            if self.ov_dptd_fusion == "semantic_gate" and self.ov_dptd_semantic_gate_id_proj_init == "small_random":
+                self._reset_linear_small_random(
+                    self.ov_dptd_ofa_id_proj[layer_id],
+                    self.ov_dptd_semantic_gate_id_proj_init_std,
+                )
+            else:
+                self._reset_linear_zero(self.ov_dptd_ofa_id_proj[layer_id])
             self._reset_linear_identity(self.ov_dptd_ofa_out_proj[layer_id])
             self._reset_linear_identity(self.ov_dptd_cti_ada_proj[layer_id])
             self._reset_linear_zero(self.ov_dptd_cti_id_proj[layer_id])
             self._reset_linear_identity(self.ov_dptd_cti_out_proj[layer_id])
+
+    def ov_dptd_id_proj_weight_norm(self):
+        if not self.use_ov_dptd or len(self.ov_dptd_ofa_id_proj) == 0:
+            return 0.0
+        total = 0.0
+        for proj in self.ov_dptd_ofa_id_proj:
+            total += float(proj.weight.detach().float().norm().item()) ** 2
+        return math.sqrt(total)
 
     def _fuse_ov_dptd_ofa(self, layer_id, ada_ofa, id_ofa):
         return self.ov_dptd_ofa_out_proj[layer_id](
@@ -797,6 +831,9 @@ class TransformerDecoder(nn.Module):
             "box_consistency_mean": 1.0,
             "dptd_gate_box_conf_deferred": True,
             "dptd_gate_box_conf_included": False,
+            "ov_dptd_gate_alpha": 0.0,
+            "ov_dptd_id_proj_weight_norm": 0.0,
+            "ov_dptd_id_proj_init_mode": "none",
         }
 
 
@@ -980,6 +1017,10 @@ class TransformerDecoder(nn.Module):
         pre_outputs_classes = []
         historical_offsets = self._normalize_ov_dptd_offsets(dptd_sampling_offsets, tgt)
         dptd_debug = self._new_ov_dptd_debug(self.ov_dptd_store_debug)
+        if dptd_debug is not None:
+            dptd_debug["ov_dptd_gate_alpha"] = float(self.ov_dptd_gate_alpha.detach().item()) if self.ov_dptd_gate_alpha is not None else 0.0
+            dptd_debug["ov_dptd_id_proj_weight_norm"] = self.ov_dptd_id_proj_weight_norm()
+            dptd_debug["ov_dptd_id_proj_init_mode"] = self.ov_dptd_semantic_gate_id_proj_init if self.ov_dptd_fusion == "semantic_gate" else "zero"
         last_ad_sampling_offsets = None
         last_gate_values = None
         last_gate_raw_values = None
@@ -1705,4 +1746,6 @@ def build_transformer(args):
         dptd_gate_min_appearance=getattr(args, "dptd_gate_min_appearance", 0.1),
         dptd_gate_debug=getattr(args, "dptd_gate_debug", False),
         dptd_semantic_update_suppression_thresh=getattr(args, "dptd_semantic_update_suppression_thresh", 0.3),
+        ov_dptd_semantic_gate_id_proj_init=getattr(args, "ov_dptd_semantic_gate_id_proj_init", "small_random"),
+        ov_dptd_semantic_gate_id_proj_init_std=getattr(args, "ov_dptd_semantic_gate_id_proj_init_std", 1e-3),
     )

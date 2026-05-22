@@ -85,6 +85,9 @@ OV_DPTD_OPTION_DEFAULTS = {
     'dptd_gate_debug': False,
     'use_dptd_semantic_update_suppression': False,
     'dptd_semantic_update_suppression_thresh': 0.3,
+    'ov_dptd_semantic_gate_id_proj_init': 'small_random',
+    'ov_dptd_semantic_gate_id_proj_init_std': 1e-3,
+    'ov_dptd_reinit_dead_semantic_gate_id_proj': False,
 }
 
 DPTD_MEMORY_FIELDS = (
@@ -157,6 +160,14 @@ def _validate_dptd_gate_options(container):
         raise RuntimeError('DPTD semantic gate requires use_dptd_semantic_memory=True.')
     if getattr(container, 'ov_dptd_fusion', 'linear_sum') not in ('linear_sum', 'semantic_gate'):
         raise NotImplementedError("OV-DPTD semantic gate supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
+    init_mode = getattr(container, 'ov_dptd_semantic_gate_id_proj_init', 'small_random')
+    if init_mode not in ('small_random', 'zero'):
+        raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
+    init_std = float(getattr(container, 'ov_dptd_semantic_gate_id_proj_init_std', 1e-3))
+    if init_mode == 'small_random' and init_std <= 0.0:
+        raise RuntimeError('ov_dptd_semantic_gate_id_proj_init_std must be > 0 for small_random init.')
+    if init_std < 0.0:
+        raise RuntimeError('ov_dptd_semantic_gate_id_proj_init_std must be >= 0.')
     for name in [
         'dptd_gate_min_score',
         'dptd_gate_max_entropy',
@@ -218,6 +229,14 @@ def resolve_ov_dptd_options(args, cfg):
         raise NotImplementedError("OV-DPTD supports ov_dptd_fusion in {'linear_sum', 'semantic_gate'}.")
     if getattr(args, 'ov_dptd_id_path_text', 'none') != 'none':
         raise NotImplementedError("OV-DPTD v1 only supports ov_dptd_id_path_text='none'.")
+    init_mode = getattr(args, 'ov_dptd_semantic_gate_id_proj_init', 'small_random')
+    if init_mode not in ('small_random', 'zero'):
+        raise RuntimeError("ov_dptd_semantic_gate_id_proj_init must be one of {'small_random', 'zero'}.")
+    init_std = float(getattr(args, 'ov_dptd_semantic_gate_id_proj_init_std', 1e-3))
+    if init_mode == 'small_random' and init_std <= 0.0:
+        raise RuntimeError('ov_dptd_semantic_gate_id_proj_init_std must be > 0 for small_random init.')
+    if init_std < 0.0:
+        raise RuntimeError('ov_dptd_semantic_gate_id_proj_init_std must be >= 0.')
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
@@ -967,6 +986,11 @@ class OVTR(nn.Module):
             'box_consistency_mean': 1.0,
             'dptd_gate_box_conf_deferred': True,
             'dptd_gate_box_conf_included': False,
+            'ov_dptd_gate_alpha': 0.0,
+            'ov_dptd_gate_alpha_grad_norm': 0.0,
+            'ov_dptd_id_proj_weight_norm': 0.0,
+            'ov_dptd_id_proj_grad_norm': 0.0,
+            'ov_dptd_id_proj_init_mode': 'none',
         } if self.use_ov_dptd and (
             self.ov_dptd_store_debug
             or self.use_dptd_update_suppression
@@ -1039,6 +1063,9 @@ class OVTR(nn.Module):
             'box_consistency_mean',
             'dptd_gate_box_conf_deferred',
             'dptd_gate_box_conf_included',
+            'ov_dptd_gate_alpha',
+            'ov_dptd_id_proj_weight_norm',
+            'ov_dptd_id_proj_init_mode',
         ]:
             if key in debug:
                 self.ov_dptd_debug_stats[key] = debug[key]

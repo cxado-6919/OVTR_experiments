@@ -1,4 +1,6 @@
+import io
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from detectron2.structures import Instances  # noqa: E402
 from models.ovtr import DPTD_CURRENT_MEMORY_FIELDS, DPTD_TEMP_FIELDS, OVTR, RuntimeTrackerBase, resolve_ov_dptd_options  # noqa: E402
 from models.transformer import DeformableTransformerDecoderLayer, TransformerDecoder  # noqa: E402
-from util.tool import is_ov_dptd_checkpoint_key  # noqa: E402
+from util.tool import is_ov_dptd_checkpoint_key, maybe_warn_or_reinit_dead_ov_dptd_semantic_gate  # noqa: E402
 
 
 def _make_decoder(use_ov_dptd=False, num_layers=2, d_model=256, nheads=4, nlevels=2, npoints=2, num_det=3, **decoder_kwargs):
@@ -188,6 +190,9 @@ def _args_cfg(**overrides):
         dptd_gate_debug=False,
         use_dptd_semantic_update_suppression=False,
         dptd_semantic_update_suppression_thresh=0.3,
+        ov_dptd_semantic_gate_id_proj_init="small_random",
+        ov_dptd_semantic_gate_id_proj_init_std=1e-3,
+        ov_dptd_reinit_dead_semantic_gate_id_proj=False,
         use_checkpoint_track=False,
         use_transformer_ckpt=False,
     )
@@ -219,6 +224,8 @@ def test_dptd_guards():
     _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_fusion="semantic_gate")))
     _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, dptd_gate_mode="mlp")))
     _assert_raises(NotImplementedError, lambda: resolve_ov_dptd_options(*_args_cfg(ov_dptd_fuse_cti=True)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="small_random", ov_dptd_semantic_gate_id_proj_init_std=0.0)))
+    _assert_raises(RuntimeError, lambda: resolve_ov_dptd_options(*_args_cfg(use_dptd_semantic_gate=True, use_dptd_semantic_memory=True, ov_dptd_semantic_gate_id_proj_init="bad")))
 
     fake_model = OVTR.__new__(OVTR)
     fake_model.training = True
@@ -743,6 +750,104 @@ def test_dptd_trainability_and_optimizer_membership():
                 assert id(param) in optimizer_param_ids, name
 
 
+
+def _semantic_gate_loss_step(decoder, optimizer):
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3, semantic_sign=-1.0),
+    )
+    loss = (out[1][..., 3:, :] - 1.0).pow(2).mean()
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    return loss
+
+
+def test_dptd_semantic_gate_init_not_dead_and_second_step_grad():
+    torch.manual_seed(1)
+    decoder = _make_decoder(use_ov_dptd=True, use_dptd_semantic_gate=True, ov_dptd_fusion="semantic_gate")
+    decoder.train()
+    alpha = decoder.ov_dptd_gate_alpha
+    id_proj = decoder.ov_dptd_ofa_id_proj[0]
+    assert torch.allclose(alpha.detach(), torch.tensor(0.0))
+    assert float(id_proj.weight.detach().norm()) > 0.0
+    assert float(id_proj.bias.detach().norm()) == 0.0
+
+    optimizer = torch.optim.AdamW([p for p in decoder.parameters() if p.requires_grad], lr=1e-2)
+    before = float(alpha.detach())
+    _semantic_gate_loss_step(decoder, optimizer)
+    first_alpha_grad = float(alpha.grad.detach().abs().item())
+    after = float(alpha.detach())
+    assert first_alpha_grad > 0.0
+    assert abs(after - before) > 0.0
+
+    optimizer.zero_grad(set_to_none=True)
+    out = _run_decoder(
+        decoder,
+        num_queries=5,
+        num_det=3,
+        historical_offsets=torch.zeros(5, 4, 2, 2, 2),
+        return_dptd_info=True,
+        dptd_gate_state=_gate_state(num_queries=5, num_det=3, semantic_sign=-1.0),
+    )
+    loss = (out[1][..., 3:, :] + 0.5).pow(2).mean()
+    loss.backward()
+    assert id_proj.weight.grad is not None
+    assert float(id_proj.weight.grad.detach().norm()) > 0.0
+
+
+def test_dptd_semantic_gate_initial_forward_equivalence():
+    decoder = _make_decoder(use_ov_dptd=True, use_dptd_semantic_gate=True, ov_dptd_fusion="semantic_gate")
+    assert float(decoder.ov_dptd_gate_alpha.detach()) == 0.0
+    ada = torch.randn(5, 1, 256)
+    ident = torch.randn(5, 1, 256)
+    gate = torch.ones(1, 5)
+    gate[:, 3:] = 0.1
+    fused = decoder._fuse_ov_dptd_ofa_semantic_gate(0, ada, ident, gate)
+    assert torch.allclose(fused, ada, atol=1e-6)
+
+
+def test_dptd_linear_sum_init_unchanged():
+    decoder = _make_decoder(use_ov_dptd=True, ov_dptd_fusion="linear_sum")
+    for proj in decoder.ov_dptd_ofa_id_proj:
+        assert float(proj.weight.detach().norm()) == 0.0
+        assert float(proj.bias.detach().norm()) == 0.0
+
+
+def test_dptd_dead_checkpoint_warning_and_optional_reinit():
+    dead_decoder = _make_decoder(
+        use_ov_dptd=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        ov_dptd_semantic_gate_id_proj_init="zero",
+    )
+    dead_model = SimpleNamespace(transformer=SimpleNamespace(decoder=dead_decoder))
+    capture = io.StringIO()
+    with redirect_stdout(capture):
+        dead_layers = maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(dead_model, reinit=False, init_std=1e-3)
+    assert dead_layers == [0, 1]
+    assert "dead id projection detected" in capture.getvalue()
+    assert all(float(proj.weight.detach().norm()) == 0.0 for proj in dead_decoder.ov_dptd_ofa_id_proj)
+
+    reinit_decoder = _make_decoder(
+        use_ov_dptd=True,
+        use_dptd_semantic_gate=True,
+        ov_dptd_fusion="semantic_gate",
+        ov_dptd_semantic_gate_id_proj_init="zero",
+    )
+    reinit_model = SimpleNamespace(transformer=SimpleNamespace(decoder=reinit_decoder))
+    capture = io.StringIO()
+    with redirect_stdout(capture):
+        reinit_layers = maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(reinit_model, reinit=True, init_std=1e-3)
+    assert reinit_layers == [0, 1]
+    assert "Reinitialized OV-DPTD semantic_gate id projection" in capture.getvalue()
+    assert all(float(proj.weight.detach().norm()) > 0.0 for proj in reinit_decoder.ov_dptd_ofa_id_proj)
+    assert all(float(proj.bias.detach().norm()) == 0.0 for proj in reinit_decoder.ov_dptd_ofa_id_proj)
+
 def test_dptd_checkpoint_key_classifier():
     assert is_ov_dptd_checkpoint_key("transformer.decoder.ov_dptd_gate_alpha")
     assert is_ov_dptd_checkpoint_key("module.transformer.decoder.ov_dptd_ofa_id_proj.0.weight")
@@ -769,6 +874,10 @@ def main():
     test_dptd_gate_attach_detaches_frame_state()
     test_dptd_duplicate_obj_idx_guard()
     test_dptd_trainability_and_optimizer_membership()
+    test_dptd_semantic_gate_init_not_dead_and_second_step_grad()
+    test_dptd_semantic_gate_initial_forward_equivalence()
+    test_dptd_linear_sum_init_unchanged()
+    test_dptd_dead_checkpoint_warning_and_optional_reinit()
     test_dptd_checkpoint_key_classifier()
     print("DPTD smoke passed")
 

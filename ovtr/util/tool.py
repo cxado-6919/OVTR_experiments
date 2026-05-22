@@ -29,7 +29,44 @@ def is_ov_dptd_checkpoint_key(name):
     return any(marker in name for marker in OV_DPTD_CHECKPOINT_KEY_MARKERS)
 
 
-def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, allow_mcip_missing=False):
+
+
+def maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(
+    model,
+    reinit=False,
+    init_std=1e-3,
+):
+    module = model.module if hasattr(model, "module") else model
+    decoder = getattr(getattr(module, "transformer", None), "decoder", None)
+    if decoder is None:
+        return []
+    if not getattr(decoder, "use_ov_dptd", False) or getattr(decoder, "ov_dptd_fusion", None) != "semantic_gate":
+        return []
+    alpha = getattr(decoder, "ov_dptd_gate_alpha", None)
+    if alpha is None or float(alpha.detach().abs().max().item()) > 1e-12:
+        return []
+    if reinit and float(init_std) <= 0.0:
+        raise RuntimeError("ov_dptd_semantic_gate_id_proj_init_std must be > 0 for dead semantic_gate reinit.")
+
+    dead_layers = []
+    for layer_id, proj in enumerate(getattr(decoder, "ov_dptd_ofa_id_proj", [])):
+        weight_norm = float(proj.weight.detach().float().norm().item())
+        if weight_norm <= 1e-12:
+            dead_layers.append(layer_id)
+            print(
+                "Warning: OV-DPTD semantic_gate dead id projection detected "
+                f"at decoder layer {layer_id}; alpha=0 and ov_dptd_ofa_id_proj.weight norm=0."
+            )
+            if reinit:
+                torch.nn.init.normal_(proj.weight, mean=0.0, std=float(init_std))
+                torch.nn.init.zeros_(proj.bias)
+                print(
+                    "Reinitialized OV-DPTD semantic_gate id projection "
+                    f"at decoder layer {layer_id} with std={float(init_std)}."
+                )
+    return dead_layers
+
+def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None, allow_mcip_missing=False, ov_dptd_reinit_dead_semantic_gate_id_proj=False, ov_dptd_semantic_gate_id_proj_init_std=1e-3):
     start_epoch = 0
     checkpoint = torch.load(
         model_path,
@@ -78,6 +115,11 @@ def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step
         print('Allowed missing M-CIP Keys: {}'.format(allowed_mcip_missing))
     if allowed_ov_dptd_missing:
         print('Allowed missing OV-DPTD Keys: {}'.format(allowed_ov_dptd_missing))
+    maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(
+        model,
+        reinit=ov_dptd_reinit_dead_semantic_gate_id_proj,
+        init_std=ov_dptd_semantic_gate_id_proj_init_std,
+    )
     print("|| Weights have been checked completely ||")
     # resume optimizer parameters
     if optimizer is not None and resume:

@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
-from util.tool import is_mcip_checkpoint_key, is_ov_dptd_checkpoint_key, load_model
+from util.tool import is_mcip_checkpoint_key, is_ov_dptd_checkpoint_key, load_model, maybe_warn_or_reinit_dead_ov_dptd_semantic_gate
 from util.quantization import (
     add_quant_args,
     build_quant_manifest,
@@ -473,6 +473,8 @@ def main(args):
             model_without_ddp,
             args.pretrained,
             allow_mcip_missing=getattr(args, "mcip_enable", False),
+            ov_dptd_reinit_dead_semantic_gate_id_proj=getattr(args, "ov_dptd_reinit_dead_semantic_gate_id_proj", False),
+            ov_dptd_semantic_gate_id_proj_init_std=getattr(args, "ov_dptd_semantic_gate_id_proj_init_std", 1e-3),
         )
         ddp_debug("after pretrained load")
 
@@ -503,6 +505,11 @@ def main(args):
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
+        maybe_warn_or_reinit_dead_ov_dptd_semantic_gate(
+            model_without_ddp,
+            reinit=getattr(args, "ov_dptd_reinit_dead_semantic_gate_id_proj", False),
+            init_std=getattr(args, "ov_dptd_semantic_gate_id_proj_init_std", 1e-3),
+        )
         if optimizer is not None and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)

@@ -80,6 +80,9 @@ dptd_gate_min_appearance = 0.1
 dptd_gate_debug = False
 use_dptd_semantic_update_suppression = False
 dptd_semantic_update_suppression_thresh = 0.3
+ov_dptd_semantic_gate_id_proj_init = "small_random"
+ov_dptd_semantic_gate_id_proj_init_std = 1e-3
+ov_dptd_reinit_dead_semantic_gate_id_proj = False
 
 # scaling
 prior_prob = 0.005
