@@ -45,3 +45,6 @@ ovtr/results/ovtr/results_ptq_lite/teta_results/
 *.mp4
 log.txt
 quant_manifest.json
+# Native extension build artifacts
+**/models/ops/build/
+**/models/ops/_C*.so*
