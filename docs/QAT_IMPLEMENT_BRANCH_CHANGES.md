@@ -100,6 +100,8 @@ Deploy 변경:
 
 - `exp_a`
 - `exp_a1`
+- `exp_a1_backbone`
+- `exp_a1_backbone_input_proj`
 - `exp_a2`
 - `exp_a3`
 - `exp_a3_head`
@@ -110,6 +112,8 @@ Deploy 변경:
 Partition 의미:
 
 - `exp_a1`: backbone, `input_proj`, `patch2query`.
+- `exp_a1_backbone`: backbone만 포함합니다.
+- `exp_a1_backbone_input_proj`: backbone과 `input_proj`를 포함하고 `patch2query`는 제외합니다.
 - `exp_a2`: transformer encoder aggregation과 encoder output head. 단, fusion layer는 제외합니다.
 - `exp_a3`: decoder와 `tgt_embed`. 단, decoder output head는 제외합니다.
 - `exp_a3_head`: decoder, `tgt_embed`, output-head component.

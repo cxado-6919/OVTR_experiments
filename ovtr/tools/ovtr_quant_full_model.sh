@@ -13,7 +13,7 @@ QUANT_RANGE_METHOD="${QUANT_RANGE_METHOD:-}"
 QUANT_WEIGHT_BITS="${QUANT_WEIGHT_BITS:-4}"
 QUANT_ACTIVATION_BITS="${QUANT_ACTIVATION_BITS:-4}"
 QUANT_ATTENTION_BITS="${QUANT_ATTENTION_BITS:-8}"
-# Supported partitions: exp_a, exp_a1, exp_a2, exp_a3, exp_a3_head, exp_b, exp_a1_to_b, exp_a3_b
+# Supported partitions: exp_a, exp_a1, exp_a1_backbone, exp_a1_backbone_input_proj, exp_a2, exp_a3, exp_a3_head, exp_b, exp_a1_to_b, exp_a3_b
 QUANT_PARTITION="${QUANT_PARTITION:-exp_a}"
 MASTER_PORT="${MASTER_PORT:-9987}"
 OUTPUT="${OUTPUT:-./results_quant}"

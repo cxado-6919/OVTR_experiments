@@ -1236,6 +1236,8 @@ def _is_quant_module(module: nn.Module) -> bool:
 SUPPORTED_QUANT_PARTITIONS = (
     "exp_a",
     "exp_a1",
+    "exp_a1_backbone",
+    "exp_a1_backbone_input_proj",
     "exp_a2",
     "exp_a3",
     "exp_a3_head",
@@ -1255,6 +1257,14 @@ def _is_exp_a1_trainable_param(name: str) -> bool:
         or name.startswith("input_proj")
         or name.startswith("patch2query")
     )
+
+
+def _is_exp_a1_backbone_trainable_param(name: str) -> bool:
+    return name.startswith("backbone")
+
+
+def _is_exp_a1_backbone_input_proj_trainable_param(name: str) -> bool:
+    return name.startswith("backbone") or name.startswith("input_proj")
 
 
 def _is_exp_a2_trainable_param(name: str) -> bool:
@@ -1540,8 +1550,22 @@ class OVTRQuantController:
         if not _is_quant_module(module):
             return False
 
-        if self.partition in {"exp_a", "exp_a1", "exp_a1_to_b"}:
-            if name.startswith("backbone") or name.startswith("input_proj") or name.startswith("patch2query"):
+        if self.partition in {
+            "exp_a",
+            "exp_a1",
+            "exp_a1_backbone",
+            "exp_a1_backbone_input_proj",
+            "exp_a1_to_b",
+        }:
+            if name.startswith("backbone"):
+                return True
+            if self.partition == "exp_a1_backbone":
+                return False
+            if name.startswith("input_proj"):
+                return True
+            if self.partition == "exp_a1_backbone_input_proj":
+                return False
+            if name.startswith("patch2query"):
                 return True
             if self.partition == "exp_a1":
                 return False
@@ -2725,6 +2749,10 @@ def is_partition_trainable_param(name: str, partition: str) -> bool:
         return _is_exp_a_trainable_param(name)
     if partition == "exp_a1":
         return _is_exp_a1_trainable_param(name)
+    if partition == "exp_a1_backbone":
+        return _is_exp_a1_backbone_trainable_param(name)
+    if partition == "exp_a1_backbone_input_proj":
+        return _is_exp_a1_backbone_input_proj_trainable_param(name)
     if partition == "exp_a2":
         return _is_exp_a2_trainable_param(name)
     if partition == "exp_a3":

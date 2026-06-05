@@ -186,6 +186,16 @@ def test_combined_partition_coverage():
         "transformer.tgt_embed",
         "track_embed",
     }
+    exp_a1_backbone_modules = {"backbone"}
+    exp_a1_backbone_input_proj_modules = {"backbone", "input_proj"}
+    exp_a1_modules = {"backbone", "input_proj", "patch2query"}
+
+    assert _partition_quant_module_names("exp_a1_backbone") == exp_a1_backbone_modules
+    assert _partition_trainable_param_names("exp_a1_backbone") == _param_names_for_modules(exp_a1_backbone_modules)
+    assert _partition_quant_module_names("exp_a1_backbone_input_proj") == exp_a1_backbone_input_proj_modules
+    assert _partition_trainable_param_names("exp_a1_backbone_input_proj") == _param_names_for_modules(exp_a1_backbone_input_proj_modules)
+    assert _partition_quant_module_names("exp_a1") == exp_a1_modules
+    assert _partition_trainable_param_names("exp_a1") == _param_names_for_modules(exp_a1_modules)
 
     assert _partition_quant_module_names("exp_a1_to_b") == a1_to_b_modules
     assert _partition_trainable_param_names("exp_a1_to_b") == _param_names_for_modules(a1_to_b_modules)
