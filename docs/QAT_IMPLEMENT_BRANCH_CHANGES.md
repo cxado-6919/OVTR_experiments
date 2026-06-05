@@ -77,7 +77,7 @@ Standard quantization preparation이 추가하는 기능:
 Calibration 변경:
 
 - `cfg.data.calib` 기반 전용 quant calibration loader를 추가했습니다.
-- Pseudo-sequence calibration 제어 옵션을 추가했습니다:
+- Pseudo-sequence calibration 제어 옵션을 추가했습니다. 현재 기본 calibration path는 static-frame이며 pseudo-sequence calibration은 비활성화되어 있습니다:
   - `--quant_calib_sequence_length`
   - `--quant_calib_max_translate`
   - `--quant_calib_max_rotate`

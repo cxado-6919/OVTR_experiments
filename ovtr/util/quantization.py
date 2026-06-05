@@ -155,6 +155,7 @@ def add_quant_args(parser) -> None:
     parser.add_argument(
         "--quant_disable_pseudo_sequence_calib",
         action="store_true",
+        default=True,
         help="disable pseudo-sequence calibration and use the legacy static-frame calibration path",
     )
     parser.add_argument(
@@ -369,6 +370,8 @@ def resolve_quant_args(args) -> None:
         args.quant_adaround_samples = 128
     if not hasattr(args, "quant_bias_correction"):
         args.quant_bias_correction = "auto"
+    if not hasattr(args, "quant_disable_pseudo_sequence_calib"):
+        args.quant_disable_pseudo_sequence_calib = True
 
 
 @torch.no_grad()

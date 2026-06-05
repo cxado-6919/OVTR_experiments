@@ -123,7 +123,6 @@ BATCH_SIZE=1 \
 QAT_ALLOW_BATCH=0 \
 QUANT_PIPELINE=legacy \
 CALIB_SAMPLES=32 \
-QUANT_DISABLE_PSEUDO_SEQUENCE_CALIB=1 \
 ./tools/ovtr_quant_full_model.sh \
   --no_aux_loss \
   --max_len 100 \
