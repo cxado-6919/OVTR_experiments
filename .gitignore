@@ -48,3 +48,4 @@ quant_manifest.json
 # Native extension build artifacts
 **/models/ops/build/
 **/models/ops/_C*.so*
+*.pdf
