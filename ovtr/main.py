@@ -29,6 +29,8 @@ from util.quantization import (
     prepare_quant_model_for_calibration,
     setup_quant_controller,
     write_quant_manifest,
+    CR_QAT_STAGE1_PARTITION,
+    CR_QAT_STAGE2_PARTITION,
 )
 import util.misc as utils
 import datasets.samplers as samplers
@@ -205,6 +207,21 @@ def main(args):
     utils.init_distributed_mode(args)
     if getattr(args, "quant_deploy", "none") == "int_msda":
         raise RuntimeError("--quant_deploy int_msda is eval/inference only; do not use it with main.py training.")
+    if getattr(args, "cr_qat", False):
+        if args.quant_mode != "qat":
+            raise RuntimeError("--cr_qat requires --quant_mode qat.")
+        if args.quant_partition != CR_QAT_STAGE2_PARTITION:
+            print(
+                f"[CR-QAT] Overriding quant_partition={args.quant_partition} "
+                f"with final partition {CR_QAT_STAGE2_PARTITION}",
+                flush=True,
+            )
+        args.quant_partition = CR_QAT_STAGE2_PARTITION
+        args.cr_qat_stage1_partition = CR_QAT_STAGE1_PARTITION
+        args.cr_qat_stage2_partition = CR_QAT_STAGE2_PARTITION
+        args.cr_qat_current_stage = 1
+        args.cr_qat_current_global_step = 0
+        args.cr_qat_recalibration_samples = 0
     print("git:\n  {}\n".format(utils.get_sha()))
 
     if args.frozen_weights is not None:
@@ -215,6 +232,9 @@ def main(args):
         device = torch.device(f"cuda:{args.gpu}")
     else:
         device = torch.device(args.device)
+    if getattr(args, "cr_qat", False) and args.distributed:
+        if os.environ.get("OVTR_FORCE_DDP", "0") == "1" or not should_use_manual_grad_sync(args):
+            raise RuntimeError("--cr_qat distributed training requires the manual gradient sync path; unset OVTR_FORCE_DDP.")
 
     def ddp_debug(msg):
         print(
@@ -300,6 +320,41 @@ def main(args):
     
     output_dir = Path(args.output_dir)
 
+    if getattr(args, "cr_qat", False):
+        steps_per_epoch = len(data_loader_train)
+        total_cr_qat_steps = max(1, max(args.epochs, 1) * max(steps_per_epoch, 1))
+        args.cr_qat_switch_step = max(1, total_cr_qat_steps // 3)
+        print(
+            f"[CR-QAT] schedule: stage1={CR_QAT_STAGE1_PARTITION} for "
+            f"{args.cr_qat_switch_step}/{total_cr_qat_steps} steps, "
+            f"stage2={CR_QAT_STAGE2_PARTITION} afterwards",
+            flush=True,
+        )
+
+    def quant_param_in_partition(name, partition):
+        controller = getattr(model_without_ddp, "_ovtr_quant_controller", None)
+        if controller is None:
+            return is_quant_trainable_param(name)
+        return controller.is_quant_param_in_partition(name, partition)
+
+    def qat_param_in_optimizer(name, param):
+        if not getattr(args, "cr_qat", False):
+            return param.requires_grad
+        if is_quant_trainable_param(name):
+            return quant_param_in_partition(name, args.quant_partition)
+        return is_partition_trainable_param(name, args.quant_partition)
+
+    def apply_qat_trainable_partition(partition):
+        for _, para in model_without_ddp.named_parameters():
+            para.requires_grad_(False)
+        for name, para in model_without_ddp.named_parameters():
+            trainable = is_partition_trainable_param(name, partition)
+            if is_quant_trainable_param(name):
+                trainable = quant_param_in_partition(name, partition)
+            if trainable:
+                para.requires_grad_(True)
+        args.cr_qat_current_partition = partition if getattr(args, "cr_qat", False) else None
+
     def build_default_param_dicts():
         return [
             {
@@ -336,7 +391,7 @@ def main(args):
                 "params": [
                     p
                     for n, p in model_without_ddp.named_parameters()
-                    if is_quant_trainable_param(n) and p.requires_grad
+                    if is_quant_trainable_param(n) and qat_param_in_optimizer(n, p)
                 ],
                 "lr": args.lr * 0.1,
                 "weight_decay": 0.0,
@@ -348,7 +403,7 @@ def main(args):
                     if not is_quant_trainable_param(n)
                     and not match_name_keywords(n, args.lr_backbone_names)
                     and not match_name_keywords(n, args.lr_linear_proj_names)
-                    and p.requires_grad
+                    and qat_param_in_optimizer(n, p)
                 ],
                 "lr": args.lr,
             },
@@ -358,7 +413,7 @@ def main(args):
                     for n, p in model_without_ddp.named_parameters()
                     if not is_quant_trainable_param(n)
                     and match_name_keywords(n, args.lr_backbone_names)
-                    and p.requires_grad
+                    and qat_param_in_optimizer(n, p)
                 ],
                 "lr": args.lr_backbone,
             },
@@ -368,7 +423,7 @@ def main(args):
                     for n, p in model_without_ddp.named_parameters()
                     if not is_quant_trainable_param(n)
                     and match_name_keywords(n, args.lr_linear_proj_names)
-                    and p.requires_grad
+                    and qat_param_in_optimizer(n, p)
                 ],
                 "lr": args.lr * args.lr_linear_proj_mult,
             },
@@ -376,14 +431,12 @@ def main(args):
 
     freeze_ori = []
     if args.quant_mode == "qat":
-        for _, para in model.named_parameters():
-            para.requires_grad_(False)
-        for name, para in model.named_parameters():
-            if (
-                is_partition_trainable_param(name, args.quant_partition)
-                or is_quant_trainable_param(name)
-            ):
-                para.requires_grad_(True)
+        active_qat_partition = CR_QAT_STAGE1_PARTITION if getattr(args, "cr_qat", False) else args.quant_partition
+        if quant_controller is not None:
+            quant_controller.set_active_qat_partition(active_qat_partition)
+            if getattr(args, "cr_qat", False):
+                quant_controller.configure_calibration_partitions(observer_partition=active_qat_partition)
+        apply_qat_trainable_partition(active_qat_partition)
         param_dicts = [group for group in build_qat_param_dicts() if len(group["params"]) > 0]
     else:
         param_dicts = build_default_param_dicts()
@@ -502,6 +555,98 @@ def main(args):
             payload['lr_scheduler'] = lr_scheduler.state_dict()
         utils.save_on_master(payload, checkpoint_path)
 
+    data_loader_calib = None
+
+    class CRQATStageScheduler:
+        def __init__(self, calibration_loader=None):
+            self.stage1_partition = CR_QAT_STAGE1_PARTITION
+            self.stage2_partition = CR_QAT_STAGE2_PARTITION
+            self.switch_step = int(getattr(args, "cr_qat_switch_step", 1))
+            self.current_stage = 1
+            self.current_partition = self.stage1_partition
+            self.last_global_step = int(getattr(args, "cr_qat_current_global_step", 0))
+            self.recalibration_samples = int(getattr(args, "cr_qat_recalibration_samples", 0) or 0)
+            self.transition_calibrated = False
+            self.calibration_loader = calibration_loader
+            self._sync_args()
+
+        def _sync_args(self):
+            args.cr_qat_current_stage = self.current_stage
+            args.cr_qat_current_partition = self.current_partition
+            args.cr_qat_current_global_step = self.last_global_step
+            args.cr_qat_recalibration_samples = self.recalibration_samples
+
+        def _ensure_calibration_loader(self):
+            if self.calibration_loader is None:
+                self.calibration_loader = build_quant_calibration_loader(args, cfg)
+            return self.calibration_loader
+
+        def _activate_stage1(self):
+            quant_controller.set_active_qat_partition(self.stage1_partition)
+            quant_controller.clear_calibration_partitions()
+            quant_controller.enable_qat()
+            apply_qat_trainable_partition(self.stage1_partition)
+            self.current_stage = 1
+            self.current_partition = self.stage1_partition
+            self._sync_args()
+
+        def _activate_stage2(self, global_step: int):
+            if not self.transition_calibrated:
+                if utils.is_main_process():
+                    print(
+                        f"[CR-QAT] Switching to stage 2 at global_step={global_step}; "
+                        f"recalibrating new {self.stage2_partition} modules",
+                        flush=True,
+                    )
+                quant_controller.configure_calibration_partitions(
+                    observer_partition=self.stage2_partition,
+                    quantized_partition=self.stage1_partition,
+                    exclude_partition=self.stage1_partition,
+                )
+                self.recalibration_samples = calibrate_quant_controller_on_val_loader(
+                    model_without_ddp,
+                    self._ensure_calibration_loader(),
+                    device,
+                    args.quant_calib_samples,
+                    args=args,
+                )
+                self.transition_calibrated = True
+            quant_controller.set_active_qat_partition(self.stage2_partition)
+            quant_controller.clear_calibration_partitions()
+            quant_controller.enable_qat()
+            apply_qat_trainable_partition(self.stage2_partition)
+            self.current_stage = 2
+            self.current_partition = self.stage2_partition
+            self._sync_args()
+            if utils.is_main_process():
+                print(
+                    f"[CR-QAT] Active stage 2 partition={self.stage2_partition}; "
+                    f"transition recalibration samples={self.recalibration_samples}",
+                    flush=True,
+                )
+
+        def before_step(self, global_step: int):
+            self.last_global_step = int(global_step)
+            if global_step >= self.switch_step:
+                if self.current_stage != 2:
+                    self._activate_stage2(global_step)
+                else:
+                    self._sync_args()
+                return
+            if self.current_stage != 1:
+                self._activate_stage1()
+            else:
+                self._sync_args()
+
+        def state_dict(self):
+            self._sync_args()
+            return {
+                "cr_qat_stage": self.current_stage,
+                "cr_qat_global_step": self.last_global_step,
+                "cr_qat_switch_step": self.switch_step,
+                "cr_qat_recalibration_samples": self.recalibration_samples,
+            }
+
     quant_state_loaded = False
     if quant_controller is not None:
         quant_state_loaded = enable_loaded_quantization(model_without_ddp, require_state=False)
@@ -550,6 +695,10 @@ def main(args):
 
     if quant_controller is not None:
         write_quant_manifest(model_without_ddp, args)
+
+    cr_qat_stage_scheduler = None
+    if getattr(args, "cr_qat", False) and quant_controller is not None:
+        cr_qat_stage_scheduler = CRQATStageScheduler(data_loader_calib)
 
     if args.distributed:
         args.manual_grad_sync = should_use_manual_grad_sync(args)
@@ -616,6 +765,8 @@ def main(args):
                 writer=writer,
                 clip_gradients=args.clip_gradients,
                 manual_grad_sync=args.manual_grad_sync,
+                stage_scheduler=cr_qat_stage_scheduler,
+                global_step_start=epoch * len(data_loader_train),
             )
             if lr_scheduler is not None and (args.quant_mode != "qat" or args.quant_use_scheduler):
                 lr_scheduler.step()

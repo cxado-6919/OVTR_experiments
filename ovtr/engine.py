@@ -85,7 +85,8 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
                     writer=None, amp: bool = False, clip_gradients: bool = False,
-                    manual_grad_sync: bool = False):
+                    manual_grad_sync: bool = False, stage_scheduler=None,
+                    global_step_start: int = 0):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -98,6 +99,11 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
     step = 0
 
     for data_dict in metric_logger.log_every(data_loader, print_freq, header):
+        global_step = global_step_start + step
+        if stage_scheduler is not None:
+            stage_scheduler.before_step(global_step)
+            model.train()
+            criterion.train()
         filename = data_dict.pop('filename') # for visualization
         data_dict = data_dict_to_cuda(data_dict, device)
         weight_dict = criterion.weight_dict
@@ -211,4 +217,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         step += 1
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if stage_scheduler is not None:
+        stats.update(stage_scheduler.state_dict())
+    return stats

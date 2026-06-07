@@ -195,6 +195,15 @@ def add_quant_args(parser) -> None:
             "the config supports it; ignored when batch_size <= 1"
         ),
     )
+    parser.add_argument(
+        "--cr_qat",
+        action="store_true",
+        help="enable two-stage CR-QAT curriculum: exp_a1 for the first third, then exp_a1_to_b",
+    )
+
+
+CR_QAT_STAGE1_PARTITION = "exp_a1"
+CR_QAT_STAGE2_PARTITION = "exp_a1_to_b"
 
 
 def _first_or_default(value, default):
@@ -352,6 +361,8 @@ def resolve_quant_args(args) -> None:
     if args is None:
         return
     pipeline = getattr(args, "quant_pipeline", "standard")
+    if getattr(args, "cr_qat", False):
+        args.quant_partition = CR_QAT_STAGE2_PARTITION
     if getattr(args, "quant_range_method", None) is None:
         args.quant_range_method = "mse" if pipeline == "standard" else "minmax"
     if getattr(args, "quant_bn_folding", None) is None:
@@ -359,7 +370,7 @@ def resolve_quant_args(args) -> None:
     if getattr(args, "quant_cle", None) is None:
         args.quant_cle = pipeline == "standard"
     if getattr(args, "quant_adaround", None) is None:
-        args.quant_adaround = pipeline == "standard"
+        args.quant_adaround = False if getattr(args, "cr_qat", False) else pipeline == "standard"
     if not hasattr(args, "quant_mse_candidates"):
         args.quant_mse_candidates = 80
     if not hasattr(args, "quant_mse_bins"):
@@ -566,6 +577,20 @@ def build_quant_manifest(model: torch.nn.Module, args) -> dict:
         },
         "quant_module_names": list(getattr(controller, "quant_module_names", [])) if controller is not None else [],
         "attention_modules": _quant_module_name_list(getattr(controller, "attention_modules", [])) if controller is not None else [],
+        "active_partition": getattr(controller, "active_partition", None) if controller is not None else None,
+        "active_quant_module_names": (
+            sorted(controller.module_names_for_partition(getattr(controller, "active_partition", getattr(args, "quant_partition", "exp_a"))))
+            if controller is not None else []
+        ),
+        "cr_qat_enabled": bool(getattr(args, "cr_qat", False)),
+        "cr_qat_stage_partitions": [
+            getattr(args, "cr_qat_stage1_partition", CR_QAT_STAGE1_PARTITION),
+            getattr(args, "cr_qat_stage2_partition", CR_QAT_STAGE2_PARTITION),
+        ] if getattr(args, "cr_qat", False) else [],
+        "cr_qat_switch_step": getattr(args, "cr_qat_switch_step", None),
+        "cr_qat_current_stage": getattr(args, "cr_qat_current_stage", None),
+        "cr_qat_current_global_step": getattr(args, "cr_qat_current_global_step", None),
+        "cr_qat_recalibration_samples": getattr(args, "cr_qat_recalibration_samples", None),
         "original_trainable_params": original_trainable,
         "quant_trainable_params": quant_trainable,
         "quant_enabled": bool(getattr(controller, "quant_enabled", False)) if controller is not None else False,

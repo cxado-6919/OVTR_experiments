@@ -1523,6 +1523,10 @@ class OVTRQuantController:
         self.calibration_enabled = False
         self.observer_enabled = False
         self.runtime_state = "disabled"
+        self.active_partition = partition
+        self.calibration_observer_partition = None
+        self.calibration_quantized_partition = None
+        self.calibration_exclude_partition = None
         self.trainable_param_names = self._collect_trainable_param_names()
         self._attach()
 
@@ -1546,11 +1550,11 @@ class OVTRQuantController:
             return 0.0
         return base_lr * 0.1
 
-    def _matches_partition_module(self, name: str, module: nn.Module) -> bool:
+    def _matches_named_partition_module(self, name: str, module: nn.Module, partition: str) -> bool:
         if not _is_quant_module(module):
             return False
 
-        if self.partition in {
+        if partition in {
             "exp_a",
             "exp_a1",
             "exp_a1_backbone",
@@ -1559,28 +1563,28 @@ class OVTRQuantController:
         }:
             if name.startswith("backbone"):
                 return True
-            if self.partition == "exp_a1_backbone":
+            if partition == "exp_a1_backbone":
                 return False
             if name.startswith("input_proj"):
                 return True
-            if self.partition == "exp_a1_backbone_input_proj":
+            if partition == "exp_a1_backbone_input_proj":
                 return False
             if name.startswith("patch2query"):
                 return True
-            if self.partition == "exp_a1":
+            if partition == "exp_a1":
                 return False
 
-        if self.partition in {"exp_a", "exp_a2", "exp_a1_to_b"}:
+        if partition in {"exp_a", "exp_a2", "exp_a1_to_b"}:
             if (
                 name.startswith("transformer.encoder")
                 and "fusion_layers" not in name
             ) or name.startswith("transformer.enc_output") or name.startswith("transformer.enc_out_bbox_embed"):
                 return True
-            if self.partition == "exp_a2":
+            if partition == "exp_a2":
                 return False
 
-        if self.partition in {"exp_a", "exp_a3", "exp_a3_head", "exp_a1_to_b", "exp_a3_b"}:
-            if self.partition in {"exp_a3", "exp_a1_to_b", "exp_a3_b"} and _is_exp_a3_output_head_module(name):
+        if partition in {"exp_a", "exp_a3", "exp_a3_head", "exp_a1_to_b", "exp_a3_b"}:
+            if partition in {"exp_a3", "exp_a1_to_b", "exp_a3_b"} and _is_exp_a3_output_head_module(name):
                 return False
             if (
                 name.startswith("transformer.decoder")
@@ -1588,16 +1592,74 @@ class OVTRQuantController:
                 or name.startswith("feature_align")
             ):
                 return True
-            if self.partition in {"exp_a3", "exp_a3_head"}:
+            if partition in {"exp_a3", "exp_a3_head"}:
                 return False
 
-        if self.partition == "exp_a":
+        if partition == "exp_a":
             return False
 
-        if self.partition in {"exp_b", "exp_a1_to_b", "exp_a3_b"}:
+        if partition in {"exp_b", "exp_a1_to_b", "exp_a3_b"}:
             return name.startswith("track_embed")
 
         return False
+
+    def _matches_partition_module(self, name: str, module: nn.Module) -> bool:
+        return self._matches_named_partition_module(name, module, self.partition)
+
+    def _module_matches_partition(self, module: nn.Module, partition: Optional[str]) -> bool:
+        if partition is None:
+            return True
+        name = getattr(module, "_ovtr_quant_name", "")
+        return self._matches_named_partition_module(name, module, partition)
+
+    def _module_matches_filter(
+        self,
+        module: nn.Module,
+        partition: Optional[str],
+        exclude_partition: Optional[str] = None,
+    ) -> bool:
+        if not self._module_matches_partition(module, partition):
+            return False
+        if exclude_partition is not None and self._module_matches_partition(module, exclude_partition):
+            return False
+        return True
+
+    def module_names_for_partition(self, partition: str) -> Set[str]:
+        return {
+            getattr(module, "_ovtr_quant_name", "")
+            for module in self._iter_recordable_quant_modules()
+            if self._module_matches_partition(module, partition)
+        }
+
+    def is_quant_param_in_partition(self, name: str, partition: str) -> bool:
+        if not is_quant_trainable_param(name):
+            return False
+        owner = name.split("._ovtr_quant_", 1)[0]
+        return owner in self.module_names_for_partition(partition)
+
+    def set_active_qat_partition(self, partition: str) -> None:
+        if partition not in SUPPORTED_QUANT_PARTITIONS:
+            raise ValueError(f"Unsupported active QAT partition: {partition}")
+        self.active_partition = partition
+
+    def configure_calibration_partitions(
+        self,
+        *,
+        observer_partition: Optional[str] = None,
+        quantized_partition: Optional[str] = None,
+        exclude_partition: Optional[str] = None,
+    ) -> None:
+        for partition in (observer_partition, quantized_partition, exclude_partition):
+            if partition is not None and partition not in SUPPORTED_QUANT_PARTITIONS:
+                raise ValueError(f"Unsupported calibration partition: {partition}")
+        self.calibration_observer_partition = observer_partition
+        self.calibration_quantized_partition = quantized_partition
+        self.calibration_exclude_partition = exclude_partition
+
+    def clear_calibration_partitions(self) -> None:
+        self.calibration_observer_partition = None
+        self.calibration_quantized_partition = None
+        self.calibration_exclude_partition = None
 
     def _should_patch_module(self, name: str, module: nn.Module) -> bool:
         if not self._matches_partition_module(name, module):
@@ -2014,8 +2076,14 @@ class OVTRQuantController:
             if hasattr(module, "_ovtr_quant_boundary_recorder"):
                 module._ovtr_quant_boundary_recorder = None
 
-    def reset_calibration(self) -> None:
+    def reset_calibration(
+        self,
+        partition: Optional[str] = None,
+        exclude_partition: Optional[str] = None,
+    ) -> None:
         for module in self.quant_modules:
+            if not self._module_matches_filter(module, partition, exclude_partition):
+                continue
             if isinstance(module, nn.Embedding):
                 if self.mode == "ptq":
                     module._ovtr_quant_output_observer.reset()
@@ -2047,6 +2115,8 @@ class OVTRQuantController:
                 module._ovtr_quant_input_quantizer.reset_observer()
                 module._ovtr_quant_output_quantizer.reset_observer()
         for module in self.attention_modules:
+            if not self._module_matches_filter(module, partition, exclude_partition):
+                continue
             if self.mode == "ptq":
                 module._ovtr_quant_attention_observer.reset()
                 module._ovtr_quant_aggregation_output_observer.reset()
@@ -2452,10 +2522,15 @@ class OVTRQuantController:
             )
 
     def enable_calibration(self, reset: bool = True) -> None:
+        observer_partition = self.calibration_observer_partition
+        if observer_partition is None and self.mode == "qat":
+            observer_partition = self.active_partition
+        quantized_partition = self.calibration_quantized_partition
+        exclude_partition = self.calibration_exclude_partition
         if reset:
-            self.reset_calibration()
+            self.reset_calibration(observer_partition, exclude_partition)
         self.initialize_weight_quantizers()
-        self.quant_enabled = False
+        self.quant_enabled = quantized_partition is not None
         self.runtime_state = "calibration"
         if self.mode == "ptq":
             self.calibration_enabled = True
@@ -2472,18 +2547,23 @@ class OVTRQuantController:
                 module._ovtr_quant_aggregation_calibration_enabled = True
             return
 
+        self.calibration_enabled = False
         self.observer_enabled = True
         for module in self.quant_modules:
-            module._ovtr_quant_quant_enabled = False
-            module._ovtr_quant_observer_enabled = True
+            quant_enabled = quantized_partition is not None and self._module_matches_partition(module, quantized_partition)
+            observer_enabled = self._module_matches_filter(module, observer_partition, exclude_partition)
+            module._ovtr_quant_quant_enabled = quant_enabled
+            module._ovtr_quant_observer_enabled = observer_enabled
             if isinstance(module, nn.MultiheadAttention):
-                module._ovtr_quant_attention_quant_enabled = False
-                module._ovtr_quant_attention_observer_enabled = True
+                module._ovtr_quant_attention_quant_enabled = quant_enabled
+                module._ovtr_quant_attention_observer_enabled = observer_enabled
         for module in self.attention_modules:
-            module._ovtr_quant_attention_quant_enabled = False
-            module._ovtr_quant_attention_observer_enabled = True
-            module._ovtr_quant_aggregation_quant_enabled = False
-            module._ovtr_quant_aggregation_observer_enabled = True
+            quant_enabled = quantized_partition is not None and self._module_matches_partition(module, quantized_partition)
+            observer_enabled = self._module_matches_filter(module, observer_partition, exclude_partition)
+            module._ovtr_quant_attention_quant_enabled = quant_enabled
+            module._ovtr_quant_attention_observer_enabled = observer_enabled
+            module._ovtr_quant_aggregation_quant_enabled = quant_enabled
+            module._ovtr_quant_aggregation_observer_enabled = observer_enabled
 
     def enable_quantization(self) -> None:
         if self.mode != "ptq":
@@ -2509,17 +2589,21 @@ class OVTRQuantController:
         self.initialize_qat_from_calibration()
         self.quant_enabled = True
         self.observer_enabled = False
+        self.calibration_enabled = False
         self.runtime_state = "qat"
+        active_partition = self.active_partition or self.partition
         for module in self.quant_modules:
-            module._ovtr_quant_quant_enabled = True
+            quant_enabled = self._module_matches_partition(module, active_partition)
+            module._ovtr_quant_quant_enabled = quant_enabled
             module._ovtr_quant_observer_enabled = False
             if isinstance(module, nn.MultiheadAttention):
-                module._ovtr_quant_attention_quant_enabled = True
+                module._ovtr_quant_attention_quant_enabled = quant_enabled
                 module._ovtr_quant_attention_observer_enabled = False
         for module in self.attention_modules:
-            module._ovtr_quant_attention_quant_enabled = True
+            quant_enabled = self._module_matches_partition(module, active_partition)
+            module._ovtr_quant_attention_quant_enabled = quant_enabled
             module._ovtr_quant_attention_observer_enabled = False
-            module._ovtr_quant_aggregation_quant_enabled = True
+            module._ovtr_quant_aggregation_quant_enabled = quant_enabled
             module._ovtr_quant_aggregation_observer_enabled = False
 
     def disable(self) -> None:
@@ -2597,6 +2681,7 @@ class OVTRQuantController:
     def summary(self) -> str:
         return (
             f"OVTRQuantController(mode={self.mode}, partition={self.partition}, "
+            f"active_partition={self.active_partition}, "
             f"weight_bits={self.weight_bits}, activation_bits={self.activation_bits}, "
             f"attention_bits={self.attention_bits}, quant_modules={len(self.quant_modules)}, "
             f"attention_modules={len(self.attention_modules)}, state={self.runtime_state})"

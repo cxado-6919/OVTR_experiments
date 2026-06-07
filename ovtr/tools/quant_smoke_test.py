@@ -20,7 +20,11 @@ from models.quant_utils import (  # noqa: E402
     unpack_int4,
     unpack_uint4,
 )
-from util.quantization import _fold_frozen_batch_norms  # noqa: E402
+from util.quantization import (  # noqa: E402
+    CR_QAT_STAGE1_PARTITION,
+    CR_QAT_STAGE2_PARTITION,
+    _fold_frozen_batch_norms,
+)
 from util.quantization import _finalize_bias_correction_stats, _register_bias_correction_hooks  # noqa: E402
 
 
@@ -81,6 +85,38 @@ def _partition_trainable_param_names(partition):
 
 def _param_names_for_modules(module_names):
     return {f"{name}.{suffix}" for name in module_names for suffix in ("weight", "bias")}
+
+
+def _named_quant_modules(controller):
+    return {getattr(module, "_ovtr_quant_name", ""): module for module in controller.quant_modules}
+
+
+def _observer_enabled(module):
+    return bool(getattr(module, "_ovtr_quant_observer_enabled", False))
+
+
+def _quant_enabled(module):
+    return bool(getattr(module, "_ovtr_quant_quant_enabled", False))
+
+
+def _run_linear_partition_modules(model, module_names):
+    x = torch.randn(3, 4)
+    modules = dict(model.named_modules())
+    for name in sorted(module_names):
+        module = modules[name]
+        if isinstance(module, nn.Linear):
+            module(x)
+
+
+def _apply_stage_trainability(model, controller, partition):
+    for _, param in model.named_parameters():
+        param.requires_grad_(False)
+    for name, param in model.named_parameters():
+        trainable = is_partition_trainable_param(name, partition)
+        if is_quant_trainable_param(name):
+            trainable = controller.is_quant_param_in_partition(name, partition)
+        if trainable:
+            param.requires_grad_(True)
 
 
 def test_bn_folding():
@@ -215,6 +251,106 @@ def test_combined_partition_coverage():
     assert "track_embed" not in exp_a_modules
 
 
+def test_cr_qat_partition_subset():
+    stage1_modules = _partition_quant_module_names(CR_QAT_STAGE1_PARTITION)
+    stage2_modules = _partition_quant_module_names(CR_QAT_STAGE2_PARTITION)
+    assert stage1_modules < stage2_modules
+    assert _partition_trainable_param_names(CR_QAT_STAGE1_PARTITION) < _partition_trainable_param_names(CR_QAT_STAGE2_PARTITION)
+
+
+def test_cr_qat_stage1_gates_final_controller():
+    model = ToyPartitionModel()
+    controller = maybe_prepare_ovtr_quant_controller(
+        model,
+        mode="qat",
+        partition=CR_QAT_STAGE2_PARTITION,
+        range_method="minmax",
+    )
+    controller.set_active_qat_partition(CR_QAT_STAGE1_PARTITION)
+    controller.configure_calibration_partitions(observer_partition=CR_QAT_STAGE1_PARTITION)
+    controller.enable_calibration(reset=True)
+
+    stage1_modules = controller.module_names_for_partition(CR_QAT_STAGE1_PARTITION)
+    stage2_modules = controller.module_names_for_partition(CR_QAT_STAGE2_PARTITION)
+    named_modules = _named_quant_modules(controller)
+    assert stage1_modules < stage2_modules
+    for name, module in named_modules.items():
+        assert _quant_enabled(module) is False
+        assert _observer_enabled(module) == (name in stage1_modules)
+
+    _run_linear_partition_modules(model, stage1_modules)
+    controller.finalize_calibration()
+    controller.enable_qat()
+    for name, module in named_modules.items():
+        assert _quant_enabled(module) == (name in stage1_modules)
+        assert _observer_enabled(module) is False
+
+
+def test_cr_qat_transition_recalibrates_new_modules():
+    model = ToyPartitionModel()
+    controller = maybe_prepare_ovtr_quant_controller(
+        model,
+        mode="qat",
+        partition=CR_QAT_STAGE2_PARTITION,
+        range_method="minmax",
+    )
+    stage1_modules = controller.module_names_for_partition(CR_QAT_STAGE1_PARTITION)
+    stage2_modules = controller.module_names_for_partition(CR_QAT_STAGE2_PARTITION)
+    new_stage2_modules = stage2_modules - stage1_modules
+
+    controller.set_active_qat_partition(CR_QAT_STAGE1_PARTITION)
+    controller.configure_calibration_partitions(observer_partition=CR_QAT_STAGE1_PARTITION)
+    controller.enable_calibration(reset=True)
+    _run_linear_partition_modules(model, stage1_modules)
+    controller.finalize_calibration()
+    controller.enable_qat()
+
+    controller.configure_calibration_partitions(
+        observer_partition=CR_QAT_STAGE2_PARTITION,
+        quantized_partition=CR_QAT_STAGE1_PARTITION,
+        exclude_partition=CR_QAT_STAGE1_PARTITION,
+    )
+    controller.enable_calibration(reset=True)
+    named_modules = _named_quant_modules(controller)
+    for name, module in named_modules.items():
+        assert _quant_enabled(module) == (name in stage1_modules)
+        assert _observer_enabled(module) == (name in new_stage2_modules)
+
+    _run_linear_partition_modules(model, new_stage2_modules)
+    controller.finalize_calibration()
+    controller.set_active_qat_partition(CR_QAT_STAGE2_PARTITION)
+    controller.clear_calibration_partitions()
+    controller.enable_qat()
+
+    for name in new_stage2_modules:
+        module = named_modules[name]
+        if isinstance(module, nn.Linear):
+            assert module._ovtr_quant_input_quantizer.initialized.item()
+            assert module._ovtr_quant_output_quantizer.initialized.item()
+    for name, module in named_modules.items():
+        assert _quant_enabled(module) == (name in stage2_modules)
+
+
+def test_cr_qat_stage_trainable_selection():
+    model = ToyPartitionModel()
+    controller = maybe_prepare_ovtr_quant_controller(
+        model,
+        mode="qat",
+        partition=CR_QAT_STAGE2_PARTITION,
+        range_method="minmax",
+    )
+    _apply_stage_trainability(model, controller, CR_QAT_STAGE1_PARTITION)
+    stage1_trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+    assert _partition_trainable_param_names(CR_QAT_STAGE1_PARTITION).issubset(stage1_trainable)
+    assert not any(name.startswith("transformer.encoder") for name in stage1_trainable if "_ovtr_quant_" not in name)
+
+    _apply_stage_trainability(model, controller, CR_QAT_STAGE2_PARTITION)
+    stage2_trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+    assert stage1_trainable < stage2_trainable
+    assert _partition_trainable_param_names(CR_QAT_STAGE2_PARTITION).issubset(stage2_trainable)
+    assert any(name.startswith("track_embed") for name in stage2_trainable)
+
+
 def test_lowbit_pack_layout_and_reconstruction():
     uint4 = torch.tensor([0, 15, 2], dtype=torch.uint8)
     packed_uint4 = pack_uint4(uint4)
@@ -260,6 +396,10 @@ def main():
     test_bias_correction_stats_path()
     test_qat_quant_params()
     test_combined_partition_coverage()
+    test_cr_qat_partition_subset()
+    test_cr_qat_stage1_gates_final_controller()
+    test_cr_qat_transition_recalibrates_new_modules()
+    test_cr_qat_stage_trainable_selection()
     test_lowbit_pack_layout_and_reconstruction()
     test_uint4_zero_point_correction_formula()
     print("quant smoke passed")
