@@ -20,6 +20,15 @@ from torch.utils.data import DataLoader
 
 from util.events import EventStorage, TensorboardXWriter
 from util.tool import load_model
+from util.distillation import (
+    BackboneFeatureDistiller,
+    CR_QAT_BACKBONE_FD_LOSS_KEY,
+    CR_QAT_BACKBONE_FD_LOSS_TYPE,
+    CR_QAT_BACKBONE_FD_TARGET,
+    CR_QAT_TRKD_ANCHOR,
+    CR_QAT_TRKD_ASSIGNMENT,
+    CR_QAT_TRKD_LOSS_KEY,
+)
 from util.quantization import (
     add_quant_args,
     build_quant_manifest,
@@ -28,6 +37,7 @@ from util.quantization import (
     enable_loaded_quantization,
     prepare_quant_model_for_calibration,
     setup_quant_controller,
+    temporarily_disable_trkd_trace,
     write_quant_manifest,
     CR_QAT_STAGE1_PARTITION,
     CR_QAT_STAGE2_PARTITION,
@@ -80,7 +90,7 @@ def get_args_parser():
                         help='gradient clipping max norm')
     parser.add_argument('--clip_gradients', action='store_true')
     parser.add_argument('--clip_gradients_type', default='full_model', type=str)
-    
+
     parser.add_argument("--save_period", default=1, type=int)
     parser.add_argument('--sgd', action='store_true')
 
@@ -138,7 +148,7 @@ def get_args_parser():
     # parser.add_argument('--eval', action='store_true')
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--cache_mode', default=False, action='store_true', 
+    parser.add_argument('--cache_mode', default=False, action='store_true',
                         help='whether to cache images on memory')
 
     # end-to-end mot settings.
@@ -222,6 +232,23 @@ def main(args):
         args.cr_qat_current_stage = 1
         args.cr_qat_current_global_step = 0
         args.cr_qat_recalibration_samples = 0
+    if getattr(args, "cr_qat_trkd", False):
+        if not getattr(args, "cr_qat", False):
+            raise RuntimeError("--cr_qat_trkd requires --cr_qat.")
+        args.cr_qat_feature_distill = True
+        args.cr_qat_trkd_anchor = CR_QAT_TRKD_ANCHOR
+        args.cr_qat_trkd_assignment = CR_QAT_TRKD_ASSIGNMENT
+    if getattr(args, "cr_qat_feature_distill", False):
+        if not getattr(args, "cr_qat", False):
+            raise RuntimeError("--cr_qat_feature_distill requires --cr_qat.")
+        teacher_path = getattr(args, "cr_qat_teacher_pretrained", None) or args.pretrained
+        if teacher_path is None:
+            raise RuntimeError("--cr_qat_feature_distill requires --pretrained or --cr_qat_teacher_pretrained.")
+        args.cr_qat_teacher_pretrained_resolved = teacher_path
+        args.cr_qat_feature_distill_target = CR_QAT_BACKBONE_FD_TARGET
+        args.cr_qat_feature_distill_loss = CR_QAT_BACKBONE_FD_LOSS_TYPE
+    else:
+        args.cr_qat_teacher_pretrained_resolved = None
     print("git:\n  {}\n".format(utils.get_sha()))
 
     if args.frozen_weights is not None:
@@ -287,6 +314,11 @@ def main(args):
     ddp_debug(f"after model.to({device})")
 
     model_without_ddp = model
+    feature_distiller = None
+    if getattr(args, "cr_qat_feature_distill", False):
+        criterion.weight_dict[CR_QAT_BACKBONE_FD_LOSS_KEY] = args.cr_qat_feature_distill_weight
+    if getattr(args, "cr_qat_trkd", False):
+        criterion.weight_dict[CR_QAT_TRKD_LOSS_KEY] = args.cr_qat_trkd_weight
     quant_controller = setup_quant_controller(model_without_ddp, args)
 
     dataset_train = build_dataset(image_set='train', args=args, cfg=cfg.data.train)
@@ -301,7 +333,7 @@ def main(args):
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
-    
+
     datasets2collate_fn = {
         'lvis_generated_img_seqs': utils.mot_collate_fn
     }
@@ -317,7 +349,7 @@ def main(args):
                 out = True
                 break
         return out
-    
+
     output_dir = Path(args.output_dir)
 
     if getattr(args, "cr_qat", False):
@@ -337,20 +369,26 @@ def main(args):
             return is_quant_trainable_param(name)
         return controller.is_quant_param_in_partition(name, partition)
 
+    def is_full_model_qat_partition(partition):
+        return partition == CR_QAT_STAGE2_PARTITION
+
     def qat_param_in_optimizer(name, param):
         if not getattr(args, "cr_qat", False):
             return param.requires_grad
         if is_quant_trainable_param(name):
             return quant_param_in_partition(name, args.quant_partition)
-        return is_partition_trainable_param(name, args.quant_partition)
+        return True
 
     def apply_qat_trainable_partition(partition):
         for _, para in model_without_ddp.named_parameters():
             para.requires_grad_(False)
         for name, para in model_without_ddp.named_parameters():
-            trainable = is_partition_trainable_param(name, partition)
             if is_quant_trainable_param(name):
                 trainable = quant_param_in_partition(name, partition)
+            elif is_full_model_qat_partition(partition):
+                trainable = True
+            else:
+                trainable = is_partition_trainable_param(name, partition)
             if trainable:
                 para.requires_grad_(True)
         args.cr_qat_current_partition = partition if getattr(args, "cr_qat", False) else None
@@ -540,6 +578,7 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         ddp_debug("after resume load")
 
+
     def save_calibrated_checkpoint(filename: str) -> None:
         if not args.output_dir:
             return
@@ -603,13 +642,14 @@ def main(args):
                     quantized_partition=self.stage1_partition,
                     exclude_partition=self.stage1_partition,
                 )
-                self.recalibration_samples = calibrate_quant_controller_on_val_loader(
-                    model_without_ddp,
-                    self._ensure_calibration_loader(),
-                    device,
-                    args.quant_calib_samples,
-                    args=args,
-                )
+                with temporarily_disable_trkd_trace(model_without_ddp):
+                    self.recalibration_samples = calibrate_quant_controller_on_val_loader(
+                        model_without_ddp,
+                        self._ensure_calibration_loader(),
+                        device,
+                        args.quant_calib_samples,
+                        args=args,
+                    )
                 self.transition_calibrated = True
             quant_controller.set_active_qat_partition(self.stage2_partition)
             quant_controller.clear_calibration_partitions()
@@ -693,6 +733,40 @@ def main(args):
             print("[Quant] Exiting after QAT initialization as requested.", flush=True)
             return
 
+
+    if getattr(args, "cr_qat_feature_distill", False):
+        model_without_ddp.return_backbone_distill_features = True
+        if getattr(args, "cr_qat_trkd", False):
+            model_without_ddp.return_trkd_trace = True
+        teacher_path = args.cr_qat_teacher_pretrained_resolved
+        ddp_debug(f"before CR-QAT teacher build: {teacher_path}")
+        teacher_model, _teacher_criterion = build_model(args, cfg)
+        del _teacher_criterion
+        teacher_model.to(device)
+        load_model(teacher_model, teacher_path)
+        teacher_model.eval()
+        teacher_model.return_backbone_distill_features = False
+        for teacher_param in teacher_model.parameters():
+            teacher_param.requires_grad_(False)
+        feature_distiller = BackboneFeatureDistiller(
+            teacher_model,
+            enable_trkd=bool(getattr(args, "cr_qat_trkd", False)),
+            stage_getter=lambda: getattr(args, "cr_qat_current_stage", 1),
+        )
+        print(
+            f"[CR-QAT] Backbone feature distillation enabled: "
+            f"teacher={teacher_path}, target={CR_QAT_BACKBONE_FD_TARGET}, "
+            f"weight={args.cr_qat_feature_distill_weight}",
+            flush=True,
+        )
+        if getattr(args, "cr_qat_trkd", False):
+            print(
+                f"[CR-QAT] Stage-2 TRKD enabled: anchor={CR_QAT_TRKD_ANCHOR}, "
+                f"assignment={CR_QAT_TRKD_ASSIGNMENT}, weight={args.cr_qat_trkd_weight}",
+                flush=True,
+            )
+        ddp_debug("after CR-QAT teacher build")
+
     if quant_controller is not None:
         write_quant_manifest(model_without_ddp, args)
 
@@ -767,6 +841,7 @@ def main(args):
                 manual_grad_sync=args.manual_grad_sync,
                 stage_scheduler=cr_qat_stage_scheduler,
                 global_step_start=epoch * len(data_loader_train),
+                feature_distiller=feature_distiller,
             )
             if lr_scheduler is not None and (args.quant_mode != "qat" or args.quant_use_scheduler):
                 lr_scheduler.step()
@@ -791,7 +866,7 @@ def main(args):
                 if args.output_dir and utils.is_main_process():
                     with (output_dir / "log.txt").open("a") as f:
                         f.write(json.dumps(log_stats) + "\n")
-                        
+
             dataset_train.step_epoch()
 
     total_time = time.time() - start_time
@@ -804,5 +879,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)  
+    main(args)
 

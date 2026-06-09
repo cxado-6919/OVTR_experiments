@@ -86,7 +86,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                     device: torch.device, epoch: int, max_norm: float = 0,
                     writer=None, amp: bool = False, clip_gradients: bool = False,
                     manual_grad_sync: bool = False, stage_scheduler=None,
-                    global_step_start: int = 0):
+                    global_step_start: int = 0, feature_distiller=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -125,7 +125,17 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
             track_instances = outputs.pop('track_instances')
             # visualize(track_instances, filename)
 
+            distill_losses = {}
+            if feature_distiller is not None:
+                distill_result = feature_distiller(outputs, sample_data_dict)
+                if isinstance(distill_result, dict):
+                    distill_losses.update(distill_result)
+                elif distill_result is not None:
+                    distill_losses['loss_cr_qat_backbone_fd'] = distill_result
+                _debug_cuda_sync(device, f"after CR-QAT distillation ({micro_batch_idx + 1}/{micro_batch_count})")
+
             loss_dict_i = criterion(outputs)
+            loss_dict_i.update(distill_losses)
             _debug_cuda_sync(device, f"after criterion forward ({micro_batch_idx + 1}/{micro_batch_count})")
             losses = sum(loss_dict_i[k] * weight_dict[k] for k in loss_dict_i.keys() if k in weight_dict)
 

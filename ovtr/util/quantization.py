@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,12 @@ from torch.utils.data import DataLoader
 from datasets import build_dataset
 from datasets.data_prefetcher import data_dict_to_cuda
 from models.quant_utils import SUPPORTED_QUANT_PARTITIONS, maybe_prepare_ovtr_quant_controller
+from util.distillation import (
+    CR_QAT_BACKBONE_FD_LOSS_TYPE,
+    CR_QAT_BACKBONE_FD_TARGET,
+    CR_QAT_TRKD_ANCHOR,
+    CR_QAT_TRKD_ASSIGNMENT,
+)
 import util.misc as utils
 
 
@@ -199,6 +206,33 @@ def add_quant_args(parser) -> None:
         "--cr_qat",
         action="store_true",
         help="enable two-stage CR-QAT curriculum: exp_a1 for the first third, then exp_a1_to_b",
+    )
+    parser.add_argument(
+        "--cr_qat_feature_distill",
+        action="store_true",
+        help="enable CR-QAT teacher-student projected backbone feature distillation",
+    )
+    parser.add_argument(
+        "--cr_qat_teacher_pretrained",
+        default=None,
+        help="optional FP32 teacher checkpoint; defaults to --pretrained when feature distillation is enabled",
+    )
+    parser.add_argument(
+        "--cr_qat_feature_distill_weight",
+        default=6.0,
+        type=float,
+        help="loss weight for CR-QAT projected backbone feature distillation",
+    )
+    parser.add_argument(
+        "--cr_qat_trkd",
+        action="store_true",
+        help="enable stage-2 CR-QAT text-centric relational KD; implies --cr_qat_feature_distill",
+    )
+    parser.add_argument(
+        "--cr_qat_trkd_weight",
+        default=6.0,
+        type=float,
+        help="loss weight for stage-2 CR-QAT TRKD",
     )
 
 
@@ -507,6 +541,26 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
+@contextmanager
+def temporarily_disable_trkd_trace(model: torch.nn.Module):
+    model_ref = unwrap_model(model)
+    previous = getattr(model_ref, "return_trkd_trace", False)
+    should_restore = bool(previous)
+    if should_restore:
+        model_ref.return_trkd_trace = False
+        sync_trace = getattr(model_ref, "_sync_trkd_trace_capture", None)
+        if callable(sync_trace):
+            sync_trace()
+    try:
+        yield
+    finally:
+        if should_restore:
+            model_ref.return_trkd_trace = previous
+            sync_trace = getattr(model_ref, "_sync_trkd_trace_capture", None)
+            if callable(sync_trace):
+                sync_trace()
+
+
 def setup_quant_controller(model: torch.nn.Module, args) -> Optional[object]:
     if getattr(args, "quant_mode", "none") == "none":
         return None
@@ -591,6 +645,37 @@ def build_quant_manifest(model: torch.nn.Module, args) -> dict:
         "cr_qat_current_stage": getattr(args, "cr_qat_current_stage", None),
         "cr_qat_current_global_step": getattr(args, "cr_qat_current_global_step", None),
         "cr_qat_recalibration_samples": getattr(args, "cr_qat_recalibration_samples", None),
+        "cr_qat_feature_distill_enabled": bool(getattr(args, "cr_qat_feature_distill", False)),
+        "cr_qat_teacher_pretrained": getattr(
+            args,
+            "cr_qat_teacher_pretrained_resolved",
+            getattr(args, "cr_qat_teacher_pretrained", None),
+        ),
+        "cr_qat_feature_distill_target": (
+            getattr(args, "cr_qat_feature_distill_target", CR_QAT_BACKBONE_FD_TARGET)
+            if getattr(args, "cr_qat_feature_distill", False) else None
+        ),
+        "cr_qat_feature_distill_loss": (
+            getattr(args, "cr_qat_feature_distill_loss", CR_QAT_BACKBONE_FD_LOSS_TYPE)
+            if getattr(args, "cr_qat_feature_distill", False) else None
+        ),
+        "cr_qat_feature_distill_weight": (
+            getattr(args, "cr_qat_feature_distill_weight", None)
+            if getattr(args, "cr_qat_feature_distill", False) else None
+        ),
+        "cr_qat_trkd_enabled": bool(getattr(args, "cr_qat_trkd", False)),
+        "cr_qat_trkd_weight": (
+            getattr(args, "cr_qat_trkd_weight", None)
+            if getattr(args, "cr_qat_trkd", False) else None
+        ),
+        "cr_qat_trkd_anchor": (
+            getattr(args, "cr_qat_trkd_anchor", CR_QAT_TRKD_ANCHOR)
+            if getattr(args, "cr_qat_trkd", False) else None
+        ),
+        "cr_qat_trkd_assignment": (
+            getattr(args, "cr_qat_trkd_assignment", CR_QAT_TRKD_ASSIGNMENT)
+            if getattr(args, "cr_qat_trkd", False) else None
+        ),
         "original_trainable_params": original_trainable,
         "quant_trainable_params": quant_trainable,
         "quant_enabled": bool(getattr(controller, "quant_enabled", False)) if controller is not None else False,

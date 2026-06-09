@@ -1332,8 +1332,21 @@ def _is_exp_a3_b_trainable_param(name: str) -> bool:
     return _is_exp_a3_trainable_param(name) or _is_exp_b_trainable_param(name)
 
 
+def _module_name_matches(name: str, prefix: str) -> bool:
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def _is_first_layer_module(name: str) -> bool:
+    first_layer_prefixes = (
+        "backbone.0.body.conv1",
+        "backbone.0.patch_embed.proj",
+        "backbone.0.body.patch_embed.proj",
+    )
+    return any(_module_name_matches(name, prefix) for prefix in first_layer_prefixes)
+
+
 def _is_quant_excluded_module(name: str) -> bool:
-    return False
+    return _is_first_layer_module(name) or _is_exp_a3_output_head_module(name)
 
 
 def _is_quant_excluded_param(name: str) -> bool:

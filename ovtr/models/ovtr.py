@@ -26,6 +26,12 @@ from .segmentation import sigmoid_focal_loss
 from .quant_utils import maybe_get_quantized_embedding_weight
 
 from util.clip_utils import load_embeddings
+from util.distillation import (
+    BACKBONE_DISTILL_FEATURE_KEY,
+    TRKD_TRACE_KEY,
+    make_projected_src_feature_frame,
+    make_trkd_trace,
+)
 from .utils import MLP, protect_det_preds, protect_track_preds, preprocess_for_masks
 from util.list_LVIS import Frequency_list_total_1, Frequency_list_70, novel_class
 
@@ -150,6 +156,8 @@ class OVFrameMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        self.capture_trkd_trace = False
+        self.trkd_trace = []
         self.random_drop = random_drop
 
         self.num_queries = num_queries
@@ -164,6 +172,7 @@ class OVFrameMatcher(SetCriterion):
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
+        self.trkd_trace = []
 
     def initialize_batch(self, gt_instances_batch: List[List[Instances]]):
         self.gt_instances = None
@@ -173,6 +182,7 @@ class OVFrameMatcher(SetCriterion):
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
+        self.trkd_trace = []
 
     def _step(self, sample_idx=None):
         if sample_idx is None:
@@ -192,6 +202,50 @@ class OVFrameMatcher(SetCriterion):
                 self.losses_dict[loss_key] = self.losses_dict[loss_key] + value
             else:
                 self.losses_dict[loss_key] = value
+
+    def _capture_trkd_trace(self, outputs, gt_instances_i, matched_indices, frame_idx, sample_idx):
+        if not self.capture_trkd_trace:
+            return
+        src_idx, tgt_idx = matched_indices
+        valid = tgt_idx != -1
+        if valid.numel() == 0 or not bool(valid.any()):
+            return
+        src_idx = src_idx[valid]
+        tgt_idx = tgt_idx[valid]
+        labels = gt_instances_i.labels[tgt_idx]
+        obj_ids = gt_instances_i.obj_ids[tgt_idx]
+        valid_obj = obj_ids >= 0
+        if valid_obj.numel() == 0 or not bool(valid_obj.any()):
+            return
+        src_idx = src_idx[valid_obj]
+        labels = labels[valid_obj]
+        obj_ids = obj_ids[valid_obj]
+        select_id = outputs['select_id']
+        image_feat = outputs['image_feat']
+        anchor_indices = []
+        keep = []
+        for idx, label in enumerate(labels):
+            label_match = (select_id == label).nonzero(as_tuple=False)
+            if label_match.numel() == 0:
+                continue
+            anchor_indices.append(label_match[0, 0])
+            keep.append(idx)
+        if not keep:
+            return
+        keep = torch.as_tensor(keep, dtype=torch.long, device=labels.device)
+        anchor_indices = torch.stack(anchor_indices).to(device=image_feat.device)
+        embeddings = outputs['pred_embed'][0, src_idx[keep]]
+        anchors = image_feat[anchor_indices]
+        self.trkd_trace.append(
+            make_trkd_trace(
+                frame_idx,
+                sample_idx,
+                labels[keep],
+                obj_ids[keep],
+                embeddings,
+                anchors,
+            )
+        )
 
     def get_num_boxes(self, num_samples):
         num_boxes = torch.as_tensor(num_samples, dtype=torch.float, device=self.sample_device)
@@ -448,6 +502,9 @@ class OVFrameMatcher(SetCriterion):
         # step7. merge the unmatched pairs and the matched pairs.
         matched_indices = torch.cat([new_matched_indices, prev_matched_indices], dim=0) 
 
+        frame_idx = self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]
+        self._capture_trkd_trace(outputs_i, gt_instances_i, (matched_indices[:, 0], matched_indices[:, 1]), frame_idx, sample_idx)
+
         # step8. calculate losses.
         self.num_samples += len(gt_instances_i) + num_disappear_track
         self.sample_device = device
@@ -458,7 +515,7 @@ class OVFrameMatcher(SetCriterion):
                                            gt_instances=[gt_instances_i],
                                            indices=[(matched_indices[:, 0], matched_indices[:, 1])],
                                            num_boxes=1)
-            self._accumulate_losses(f'frame_{self._current_frame_idx if sample_idx is None else self._current_frame_idx_batch[sample_idx]}_', new_track_loss)
+            self._accumulate_losses(f'frame_{frame_idx}_', new_track_loss)
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -754,8 +811,25 @@ class OVTR(nn.Module):
                 pos.append(pos_l)
         return srcs, masks, pos
 
+    def _is_training_or_trkd_trace(self):
+        return self.training or bool(getattr(self, "return_trkd_trace", False))
+
+    def _sync_trkd_trace_capture(self):
+        self.criterion.capture_trkd_trace = bool(getattr(self, "return_trkd_trace", False))
+
+    def extract_projected_backbone_features(self, data):
+        frames_by_time, _, _ = self._transpose_batch_inputs(data)
+        feature_frames = []
+        for frame_batch in frames_by_time:
+            for frame in frame_batch:
+                frame.requires_grad = False
+            samples = nested_tensor_from_tensor_list(frame_batch)
+            srcs, masks, _ = self._extract_backbone_features(samples)
+            feature_frames.append(make_projected_src_feature_frame(srcs, masks))
+        return feature_frames
+
     def _prepare_text_conditioning(self, targets, extra_labels, is_first, cls_num, batch_size):
-        if self.training:
+        if self._is_training_or_trkd_trace():
             labels_list = torch.cat([targets.labels])
             select_id, extra_labels = self.get_select_id(cls_num, labels_list, extra_labels, is_first)
         else:
@@ -878,6 +952,9 @@ class OVTR(nn.Module):
             'pred_boxes': [],
             'track_instances': []
         }
+        capture_distill_features = bool(getattr(self, "return_backbone_distill_features", False))
+        if capture_distill_features:
+            outputs[BACKBONE_DISTILL_FEATURE_KEY] = []
         track_instances_batch = [self._generate_empty_tracks() for _ in range(batch_size)]
         extra_labels_batch = [None] * batch_size
 
@@ -889,6 +966,8 @@ class OVTR(nn.Module):
 
             samples = nested_tensor_from_tensor_list(frame_batch)
             srcs, masks, pos = self._extract_backbone_features(samples)
+            if capture_distill_features:
+                outputs[BACKBONE_DISTILL_FEATURE_KEY].append(make_projected_src_feature_frame(srcs))
             encoder_cache = self.transformer.encode_image(srcs, masks, pos)
             next_extra_labels_batch = []
 
@@ -921,13 +1000,15 @@ class OVTR(nn.Module):
             extra_labels_batch = next_extra_labels_batch
 
         outputs['losses_dict'] = self.criterion.losses_dict
+        if self.criterion.capture_trkd_trace:
+            outputs[TRKD_TRACE_KEY] = self.criterion.trkd_trace
         return outputs
     
     def _forward_single_image(self, samples, track_instances: Instances, targets=None, extra_labels=None ,is_first=True, cls_num=0):
         srcs, masks, pos = self._extract_backbone_features(samples)
 
         # Get the selected category id
-        if self.training:
+        if self._is_training_or_trkd_trace():
             labels_list = torch.cat([targets.labels])
             select_id, extra_labels = self.get_select_id(cls_num, labels_list, extra_labels, is_first)
         else:
@@ -982,6 +1063,8 @@ class OVTR(nn.Module):
             "image_feat": image_feat_ori,
             "extra_labels": extra_labels,
             }
+        if getattr(self, "return_backbone_distill_features", False):
+            out[BACKBONE_DISTILL_FEATURE_KEY] = make_projected_src_feature_frame(srcs)
             
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_embed)
@@ -1005,7 +1088,7 @@ class OVTR(nn.Module):
         track_instances.output_embedding_img = frame_res['hs_ofa'][0]
         track_instances.query_pos = frame_res["query_pos_track"][0]
 
-        if self.training:
+        if self._is_training_or_trkd_trace():
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res, is_first, sample_idx=sample_idx)
@@ -1072,16 +1155,18 @@ class OVTR(nn.Module):
         return ret
 
     def forward(self, data):
+        self._sync_trkd_trace_capture()
+        trace_mode = bool(getattr(self, "return_trkd_trace", False))
         frames_by_time, targets_by_time, batch_size = self._transpose_batch_inputs(data)
         if (
-            self.training
+            (self.training or trace_mode)
             and batch_size > 1
             and not self.use_checkpoint
             and not self.transformer.encoder.fusion_layers
         ):
             return self._forward_hybrid_batched(frames_by_time, targets_by_time)
 
-        if self.training:
+        if self.training or trace_mode:
             self.criterion.initialize(data['gt_instances'])
         frames = data['imgs']
         cls_num = max([len(torch.unique(gt_instance.labels)) for gt_instance in data['gt_instances']])
@@ -1090,6 +1175,9 @@ class OVTR(nn.Module):
             'pred_boxes': [],
             'track_instances': []
         }
+        capture_distill_features = bool(getattr(self, "return_backbone_distill_features", False))
+        if capture_distill_features:
+            outputs[BACKBONE_DISTILL_FEATURE_KEY] = []
         track_instances = self._generate_empty_tracks()
 
         keys = list(track_instances._fields.keys())
@@ -1117,6 +1205,7 @@ class OVTR(nn.Module):
                         frame_res['query_pos_track'],
                         frame_res['hs_cti'],
                         frame_res['hs_ofa'],
+                        *(frame_res[BACKBONE_DISTILL_FEATURE_KEY]["srcs"] if capture_distill_features else ()),
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_embed'] for aux in frame_res['aux_outputs']],
@@ -1137,25 +1226,36 @@ class OVTR(nn.Module):
                     'query_pos_track': tmp[7],
                     'hs_cti': tmp[8],
                     'hs_ofa': tmp[9],
-                    'aux_outputs': [{
-                        'pred_logits': tmp[10+i],
-                        'pred_boxes': tmp[10+5+i],
-                        'pred_embed': tmp[10+10+i],
-                        'select_id': tmp[10+15+i],
-                        'image_feat': tmp[10+20+i],
-                    } for i in range(len(self.computed_aux)-1)],
                 }
+                offset = 10
+                if capture_distill_features:
+                    frame_res[BACKBONE_DISTILL_FEATURE_KEY] = make_projected_src_feature_frame(
+                        tmp[offset:offset + self.num_feature_levels]
+                    )
+                    offset += self.num_feature_levels
+                num_aux = len(self.computed_aux) - 1
+                frame_res['aux_outputs'] = [{
+                    'pred_logits': tmp[offset + i],
+                    'pred_boxes': tmp[offset + num_aux + i],
+                    'pred_embed': tmp[offset + 2 * num_aux + i],
+                    'select_id': tmp[offset + 3 * num_aux + i],
+                    'image_feat': tmp[offset + 4 * num_aux + i],
+                } for i in range(num_aux)]
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances, targets, extra_labels, is_first, cls_num)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last, is_first=is_first)
 
             track_instances = frame_res['track_instances']
+            if capture_distill_features:
+                outputs[BACKBONE_DISTILL_FEATURE_KEY].append(frame_res[BACKBONE_DISTILL_FEATURE_KEY])
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
             outputs['track_instances'].append(frame_res['track_instances_pre'])
 
         outputs['losses_dict'] = self.criterion.losses_dict
+        if self.criterion.capture_trkd_trace:
+            outputs[TRKD_TRACE_KEY] = self.criterion.trkd_trace
         return outputs
 
 
