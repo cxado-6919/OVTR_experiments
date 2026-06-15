@@ -146,6 +146,89 @@ QUANT_BOUNDARY_ERROR_COLUMNS = [
     "cosine_distance",
 ]
 
+ALIGNMENT_GROUP_COLUMNS = [
+    "sample_index",
+    "image_id",
+    "filename",
+    "class_id",
+    "class_name",
+    "model",
+    "num_regions",
+    "region_text_mae",
+    "region_region_mae",
+    "region_region_pearson",
+    "mean_confidence",
+    "mean_region_text",
+]
+
+ALIGNMENT_SUMMARY_COLUMNS = [
+    "model",
+    "aggregation",
+    "num_groups",
+    "total_regions",
+    "region_text_mae",
+    "region_region_mae",
+    "region_region_pearson",
+    "mean_confidence",
+    "mean_region_text",
+]
+
+ALIGNMENT_CLASS_SUMMARY_COLUMNS = [
+    "rank",
+    "class_id",
+    "class_name",
+    "instance_count",
+    "image_count",
+    "first_index",
+    "processed_groups",
+    "positive_groups",
+    "skipped_no_match",
+    "model",
+    "aggregation",
+    "num_groups",
+    "total_regions",
+    "region_text_mae",
+    "region_region_mae",
+    "region_region_pearson",
+    "mean_confidence",
+    "mean_region_text",
+]
+
+ALIGNMENT_MODEL_MACRO_COLUMNS = [
+    "model",
+    "num_classes",
+    "total_groups",
+    "total_regions",
+    "region_text_mae",
+    "region_region_mae",
+    "region_region_pearson",
+    "mean_confidence",
+    "mean_region_text",
+]
+
+ALIGNMENT_SELECTED_CLASS_COLUMNS = [
+    "rank",
+    "class_id",
+    "class_name",
+    "instance_count",
+    "image_count",
+    "first_index",
+]
+
+CLASS_SCORE_COLUMNS = [
+    "model",
+    "class_id",
+    "class_name",
+    "mean_cosine_score",
+    "is_target",
+    "is_background",
+    "mean_observed_confidence",
+    "mean_target_prob_fg_softmax",
+    "mean_target_prob_all_softmax",
+    "mean_target_rank",
+    "mean_target_rank_normalized",
+]
+
 EMPTY_TRACK_RESULT = np.zeros((0, 5), dtype=np.float32)
 EMPTY_SCORED_TRACK_RESULT = np.zeros((0, 6), dtype=np.float32)
 
@@ -183,6 +266,22 @@ class ReferenceTrace:
 
 
 @dataclass
+class EmbeddingFrameTrace:
+    run_mode: str
+    file_path: str
+    frame_id: int
+    sequence_key: str
+    score_threshold: float
+    query_indices: torch.Tensor
+    obj_ids: torch.Tensor
+    cls_idxes: torch.Tensor
+    scores: torch.Tensor
+    disappear_time: torch.Tensor
+    boxes: torch.Tensor
+    pred_embed: torch.Tensor
+
+
+@dataclass
 class RunResult:
     run_mode: str
     track_results: List[List[np.ndarray]]
@@ -195,6 +294,8 @@ class RunResult:
     state_io_rows: List[dict] = field(default_factory=list)
     recurrent_query_rows: List[dict] = field(default_factory=list)
     quant_boundary_rows: List[dict] = field(default_factory=list)
+    embedding_frames: Dict[Tuple[str, int], EmbeddingFrameTrace] = field(default_factory=dict)
+    embedding_class_anchors: Optional[torch.Tensor] = None
 
     @property
     def avg_latency_ms(self) -> float:
@@ -401,6 +502,35 @@ def track_results_from_instances(dt_instances: Instances, num_classes: int) -> L
             continue
         out.append(np.concatenate([obj_ids[keep, None], boxes[keep]], axis=1).astype(np.float32))
     return out
+
+
+def make_embedding_frame_trace(
+    *,
+    run_mode: str,
+    file_path: str,
+    frame_id: int,
+    score_threshold: float,
+    raw_trace: Optional[dict],
+) -> Optional[EmbeddingFrameTrace]:
+    if raw_trace is None:
+        return None
+    required = ("query_indices", "obj_ids", "cls_idxes", "scores", "disappear_time", "boxes", "pred_embed")
+    if any(name not in raw_trace for name in required):
+        return None
+    return EmbeddingFrameTrace(
+        run_mode=run_mode,
+        file_path=file_path,
+        frame_id=int(frame_id),
+        sequence_key=sequence_key_from_file_path(file_path),
+        score_threshold=float(score_threshold),
+        query_indices=raw_trace["query_indices"].detach().cpu().long(),
+        obj_ids=raw_trace["obj_ids"].detach().cpu().long(),
+        cls_idxes=raw_trace["cls_idxes"].detach().cpu().long(),
+        scores=raw_trace["scores"].detach().cpu().float(),
+        disappear_time=raw_trace["disappear_time"].detach().cpu().long(),
+        boxes=raw_trace["boxes"].detach().cpu().float(),
+        pred_embed=raw_trace["pred_embed"].detach().cpu().float(),
+    )
 
 
 def track_results_with_dummy_scores(track_results: Sequence[List[np.ndarray]]) -> List[List[np.ndarray]]:
@@ -1141,6 +1271,1256 @@ def write_plots(output_dir: Path, metrics_summary: dict, plot_max_age: int) -> N
     _plot_metric_bars(metrics_summary, output_dir / "teacher_forced_vs_free_metrics.png")
 
 
+
+
+@dataclass
+class AlignmentOutput:
+    embeddings: torch.Tensor
+    region_text: torch.Tensor
+    confidence: torch.Tensor
+    relation: torch.Tensor
+
+    @property
+    def mean_confidence(self) -> float:
+        if self.confidence.numel() == 0:
+            return float("nan")
+        return float(self.confidence.mean().item())
+
+    @property
+    def mean_region_text(self) -> float:
+        if self.region_text.numel() == 0:
+            return float("nan")
+        return float(self.region_text.mean().item())
+
+
+@dataclass
+class EmbeddingGroupExample:
+    sample_index: int
+    image_id: object
+    filename: str
+    class_id: int
+    class_name: str
+    image: np.ndarray
+    rois: torch.Tensor
+    outputs: Dict[str, AlignmentOutput]
+
+    @property
+    def num_regions(self) -> int:
+        return int(self.rois.shape[0])
+
+
+def _class_name(class_id: int, class_names: Optional[Sequence[str]]) -> str:
+    if class_names is not None and 0 <= int(class_id) < len(class_names):
+        return str(class_names[int(class_id)])
+    return f"class_{int(class_id)}"
+
+
+def _sanitize_name(value: str) -> str:
+    out = []
+    for char in str(value):
+        if char.isalnum() or char in {"-", "_", "."}:
+            out.append(char)
+        else:
+            out.append("_")
+    return "".join(out).strip("_")[:80] or "class"
+
+
+def _finite_mean(values: Sequence[float]) -> float:
+    finite = [float(v) for v in values if math.isfinite(float(v))]
+    if not finite:
+        return float("nan")
+    return float(np.mean(finite))
+
+
+def _weighted_mean(values: Sequence[float], weights: Sequence[float]) -> float:
+    pairs = [
+        (float(v), float(w))
+        for v, w in zip(values, weights)
+        if math.isfinite(float(v)) and float(w) > 0
+    ]
+    if not pairs:
+        return float("nan")
+    total_weight = sum(weight for _, weight in pairs)
+    return float(sum(value * weight for value, weight in pairs) / total_weight)
+
+
+def _off_diagonal_values(matrix: torch.Tensor) -> torch.Tensor:
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"Expected a square relation matrix, got {tuple(matrix.shape)}")
+    if matrix.shape[0] < 2:
+        return matrix.new_empty((0,))
+    mask = ~torch.eye(matrix.shape[0], dtype=torch.bool, device=matrix.device)
+    return matrix[mask]
+
+
+def pearson_correlation(reference: torch.Tensor, candidate: torch.Tensor) -> float:
+    if reference.shape != candidate.shape:
+        raise ValueError(
+            "Pearson inputs must have the same shape: "
+            f"{tuple(reference.shape)} vs {tuple(candidate.shape)}"
+        )
+    if reference.numel() == 0:
+        return float("nan")
+
+    reference = reference.float().reshape(-1)
+    candidate = candidate.float().reshape(-1)
+    if torch.allclose(reference, candidate, atol=1e-7, rtol=1e-6):
+        return 1.0
+
+    ref_centered = reference - reference.mean()
+    cand_centered = candidate - candidate.mean()
+    denom = torch.linalg.vector_norm(ref_centered) * torch.linalg.vector_norm(cand_centered)
+    if denom.item() == 0:
+        return float("nan")
+    return float(torch.dot(ref_centered, cand_centered).div(denom).item())
+
+
+def compute_alignment_output(
+    region_embeddings: torch.Tensor,
+    text_features: torch.Tensor,
+    class_id: int,
+    *,
+    temperature: float = 0.007,
+    bg_embedding: Optional[torch.Tensor] = None,
+) -> AlignmentOutput:
+    if region_embeddings.ndim != 2:
+        raise ValueError(f"region_embeddings must be 2D, got {tuple(region_embeddings.shape)}")
+    if text_features.ndim != 2:
+        raise ValueError(f"text_features must be 2D, got {tuple(text_features.shape)}")
+    if region_embeddings.shape[1] != text_features.shape[1]:
+        raise ValueError(
+            "Region embedding dimension must match text feature dimension: "
+            f"{region_embeddings.shape[1]} vs {text_features.shape[1]}"
+        )
+    if class_id < 0 or class_id >= text_features.shape[0]:
+        raise ValueError(
+            f"class_id {class_id} is outside text feature range [0, {text_features.shape[0]})"
+        )
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
+    embeddings = F.normalize(region_embeddings.float(), p=2, dim=1)
+    base_text = F.normalize(
+        text_features.to(device=embeddings.device, dtype=embeddings.dtype),
+        p=2,
+        dim=1,
+    )
+    class_text = base_text[class_id]
+    region_text = embeddings @ class_text
+    relation = embeddings @ embeddings.t()
+
+    all_text = base_text
+    if bg_embedding is not None:
+        bg_embedding = bg_embedding.to(device=embeddings.device, dtype=embeddings.dtype)
+        if bg_embedding.ndim == 1:
+            bg_embedding = bg_embedding.unsqueeze(0)
+        if bg_embedding.ndim != 2 or bg_embedding.shape[1] != embeddings.shape[1]:
+            raise ValueError(
+                "bg_embedding must be compatible with region embeddings: "
+                f"{tuple(bg_embedding.shape)} vs {tuple(embeddings.shape)}"
+            )
+        all_text = torch.cat([all_text, F.normalize(bg_embedding, p=2, dim=1)], dim=0)
+
+    logits = (embeddings @ all_text.t()) / float(temperature)
+    confidence = logits.softmax(dim=1)[:, class_id]
+    return AlignmentOutput(
+        embeddings=embeddings.detach().cpu(),
+        region_text=region_text.detach().cpu(),
+        confidence=confidence.detach().cpu(),
+        relation=relation.detach().cpu(),
+    )
+
+
+def compute_distortion_metrics(reference: AlignmentOutput, candidate: AlignmentOutput) -> Dict[str, float]:
+    if reference.region_text.shape != candidate.region_text.shape:
+        raise ValueError(
+            "region_text shapes must match: "
+            f"{tuple(reference.region_text.shape)} vs {tuple(candidate.region_text.shape)}"
+        )
+    if reference.relation.shape != candidate.relation.shape:
+        raise ValueError(
+            "relation matrix shapes must match: "
+            f"{tuple(reference.relation.shape)} vs {tuple(candidate.relation.shape)}"
+        )
+
+    if reference.region_text.numel() == 0:
+        region_text_mae = float("nan")
+    else:
+        region_text_mae = float(
+            torch.mean(torch.abs(candidate.region_text - reference.region_text)).item()
+        )
+
+    ref_relation = _off_diagonal_values(reference.relation)
+    cand_relation = _off_diagonal_values(candidate.relation)
+    if ref_relation.numel() == 0:
+        region_region_mae = float("nan")
+        region_region_pearson = float("nan")
+    else:
+        region_region_mae = float(torch.mean(torch.abs(cand_relation - ref_relation)).item())
+        region_region_pearson = pearson_correlation(ref_relation, cand_relation)
+
+    return {
+        "region_text_mae": region_text_mae,
+        "region_region_mae": region_region_mae,
+        "region_region_pearson": region_region_pearson,
+    }
+
+
+def _target_alignment(frame: EmbeddingFrameTrace, anchors: torch.Tensor, class_id: int) -> torch.Tensor:
+    if frame.pred_embed.numel() == 0 or class_id < 0 or class_id >= anchors.shape[0]:
+        return torch.empty((0,), dtype=torch.float32)
+    emb = F.normalize(frame.pred_embed.float(), p=2, dim=1)
+    anchor = F.normalize(anchors[class_id].float().view(1, -1), p=2, dim=1)
+    return (emb @ anchor.t()).squeeze(1).cpu()
+
+
+def _positive_group_candidates(fp32_result: RunResult) -> Tuple[Dict[int, dict], Dict[int, List[dict]]]:
+    anchors = fp32_result.embedding_class_anchors
+    class_stats: Dict[int, dict] = {}
+    groups_by_class: Dict[int, List[dict]] = {}
+    if anchors is None:
+        return class_stats, groups_by_class
+
+    for sample_index, (frame_key, frame) in enumerate(fp32_result.embedding_frames.items()):
+        if frame.pred_embed.numel() == 0:
+            continue
+        valid = (frame.scores >= frame.score_threshold) & (frame.disappear_time == 0) & (frame.cls_idxes >= 0)
+        if valid.numel() == 0 or not bool(valid.any()):
+            continue
+        for class_id_tensor in torch.unique(frame.cls_idxes[valid]):
+            class_id = int(class_id_tensor.item())
+            if class_id < 0 or class_id >= anchors.shape[0]:
+                continue
+            mask = valid & (frame.cls_idxes == class_id)
+            indices = torch.nonzero(mask, as_tuple=False).flatten().cpu()
+            if indices.numel() == 0:
+                continue
+            alignments = _target_alignment(frame, anchors, class_id).index_select(0, indices)
+            mean_alignment = float(alignments.mean().item()) if alignments.numel() else float("nan")
+            stat = class_stats.setdefault(
+                class_id,
+                {
+                    "instance_count": 0,
+                    "image_count": 0,
+                    "first_index": sample_index,
+                    "alignment_sum": 0.0,
+                },
+            )
+            stat["instance_count"] += int(indices.numel())
+            stat["image_count"] += 1
+            stat["first_index"] = min(int(stat["first_index"]), sample_index)
+            stat["alignment_sum"] += float(alignments.sum().item()) if alignments.numel() else 0.0
+            groups_by_class.setdefault(class_id, []).append(
+                {
+                    "sample_index": sample_index,
+                    "frame_key": frame_key,
+                    "indices": indices,
+                    "count": int(indices.numel()),
+                    "mean_alignment": mean_alignment,
+                }
+            )
+    return class_stats, groups_by_class
+
+
+def _select_embedding_targets(
+    class_stats: Dict[int, dict],
+    class_names: Optional[Sequence[str]],
+    num_classes: int,
+) -> List[dict]:
+    targets = []
+    for class_id, stat in class_stats.items():
+        instance_count = int(stat.get("instance_count", 0))
+        image_count = int(stat.get("image_count", 0))
+        first_index = int(stat.get("first_index", 0))
+        targets.append(
+            {
+                "class_id": int(class_id),
+                "class_name": _class_name(class_id, class_names),
+                "instance_count": instance_count,
+                "image_count": image_count,
+                "first_index": first_index,
+            }
+        )
+    targets.sort(
+        key=lambda item: (
+            -item["instance_count"],
+            -item["image_count"],
+            item["first_index"],
+            item["class_name"],
+        )
+    )
+    selected = targets[: max(0, int(num_classes))]
+    for rank, target in enumerate(selected, start=1):
+        target["rank"] = rank
+    return selected
+
+
+def _frame_index_by_keys(frame: Optional[EmbeddingFrameTrace]) -> Dict[Tuple[str, int], int]:
+    if frame is None:
+        return {}
+    out: Dict[Tuple[str, int], int] = {}
+    for idx in range(int(frame.query_indices.numel())):
+        obj_id = int(frame.obj_ids[idx].item())
+        query_idx = int(frame.query_indices[idx].item())
+        if obj_id >= 0:
+            out.setdefault(("obj", obj_id), idx)
+        out.setdefault(("query", query_idx), idx)
+    return out
+
+
+def _positive_match_keys(frame: EmbeddingFrameTrace, indices: torch.Tensor) -> List[Tuple[Tuple[str, int], Tuple[str, int]]]:
+    keys = []
+    for idx_tensor in indices:
+        idx = int(idx_tensor.item())
+        obj_id = int(frame.obj_ids[idx].item())
+        query_idx = int(frame.query_indices[idx].item())
+        query_key = ("query", query_idx)
+        primary = ("obj", obj_id) if obj_id >= 0 else query_key
+        keys.append((primary, query_key))
+    return keys
+
+
+def _lookup_match_index(by_key: Dict[Tuple[str, int], int], keys: Tuple[Tuple[str, int], Tuple[str, int]]) -> Optional[int]:
+    primary, query_key = keys
+    found = by_key.get(primary)
+    if found is not None:
+        return found
+    if primary != query_key:
+        return by_key.get(query_key)
+    return None
+
+
+def _indices_for_match_keys(
+    frame: Optional[EmbeddingFrameTrace],
+    keys: Sequence[Tuple[Tuple[str, int], Tuple[str, int]]],
+) -> List[Optional[int]]:
+    by_key = _frame_index_by_keys(frame)
+    return [_lookup_match_index(by_key, key_pair) for key_pair in keys]
+
+
+def _gather_rows(tensor: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
+    if not indices:
+        shape = (0,) + tuple(tensor.shape[1:])
+        return torch.empty(shape, dtype=tensor.dtype)
+    index_tensor = torch.as_tensor(indices, dtype=torch.long)
+    return tensor.index_select(0, index_tensor).detach().cpu()
+
+
+def _embedding_rois_from_boxes(boxes: torch.Tensor) -> torch.Tensor:
+    boxes = boxes.detach().cpu().float()
+    batch = torch.zeros((boxes.shape[0], 1), dtype=boxes.dtype)
+    return torch.cat([batch, boxes], dim=1)
+
+
+def _load_embedding_image(image_root: Optional[str], file_path: str, boxes: torch.Tensor) -> Tuple[np.ndarray, Optional[str]]:
+    candidates = []
+    path = Path(file_path)
+    if path.is_absolute():
+        candidates.append(path)
+    if image_root:
+        candidates.append(Path(image_root) / file_path)
+    candidates.append(path)
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                image = plt.imread(candidate)
+                if image.ndim == 2:
+                    image = np.repeat(image[..., None], 3, axis=2)
+                if image.shape[-1] > 3:
+                    image = image[..., :3]
+                if image.dtype != np.uint8:
+                    image = np.clip(image * 255.0 if image.max() <= 1.0 else image, 0, 255).astype(np.uint8)
+                return image, str(candidate)
+            except Exception:
+                continue
+    if boxes.numel() > 0:
+        max_xy = boxes[:, 2:4].max(dim=0).values
+        height = max(256, int(math.ceil(float(max_xy[1].item()))) + 16)
+        width = max(256, int(math.ceil(float(max_xy[0].item()))) + 16)
+    else:
+        height, width = 800, 1333
+    return np.full((height, width, 3), 245, dtype=np.uint8), None
+
+
+def _heat_overlay(image: np.ndarray, rois: np.ndarray, values: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    heat = np.zeros((height, width), dtype=np.float32)
+    count = np.zeros((height, width), dtype=np.float32)
+    for roi, value in zip(rois, values):
+        x1, y1, x2, y2 = roi[1:5]
+        x1 = int(np.clip(np.floor(x1), 0, max(width - 1, 0)))
+        x2 = int(np.clip(np.ceil(x2), 0, width))
+        y1 = int(np.clip(np.floor(y1), 0, max(height - 1, 0)))
+        y2 = int(np.clip(np.ceil(y2), 0, height))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        heat[y1:y2, x1:x2] += float(value)
+        count[y1:y2, x1:x2] += 1.0
+    valid = count > 0
+    heat[valid] /= count[valid]
+    heat[~valid] = np.nan
+    return heat
+
+
+def _plot_alignment_scatter(path: Path, summary_rows: Sequence[Dict[str, object]], *, title: str) -> None:
+    rows = [row for row in summary_rows if row.get("aggregation") == "macro" and str(row.get("model")) != "fp32"]
+    fig, ax = plt.subplots(figsize=(6.4, 5.2), dpi=170)
+    ax.axhline(0, color="0.85", linewidth=1)
+    ax.axvline(0, color="0.85", linewidth=1)
+    colors = {"qat": "#ff7f0e", "cr_qat": "#2ca02c", "CR-QAT": "#2ca02c", "QAT": "#ff7f0e"}
+    for model_name in sorted({str(row.get("model")) for row in rows}):
+        model_rows = [row for row in rows if str(row.get("model")) == model_name]
+        points = []
+        for row in model_rows:
+            x = float(row.get("region_region_mae", float("nan")))
+            y = float(row.get("region_text_mae", float("nan")))
+            if math.isfinite(x) and math.isfinite(y):
+                points.append((x, y))
+        if not points:
+            continue
+        ax.scatter(
+            [x for x, _ in points],
+            [y for _, y in points],
+            s=26 if len(points) > 1 else 62,
+            alpha=0.6,
+            label=model_name,
+            color=colors.get(model_name),
+        )
+    ax.set_xlabel("MAE of inter-region relation vs FP32")
+    ax.set_ylabel("MAE of region-text alignment vs FP32")
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", linewidth=0.6)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _plot_example(path: Path, example: EmbeddingGroupExample, model_names: Sequence[str]) -> None:
+    rois = example.rois.detach().cpu().numpy()
+    outputs = [example.outputs[name] for name in model_names]
+    confidences = [out.confidence.numpy() for out in outputs]
+    relations = [out.relation.numpy() for out in outputs]
+    heat_values = np.concatenate([vals for vals in confidences if vals.size > 0]) if confidences else np.array([])
+    heat_vmax = float(np.nanmax(heat_values)) if heat_values.size and np.isfinite(heat_values).any() else 1.0
+    if heat_vmax <= 0:
+        heat_vmax = 1.0
+
+    finite_rel = np.concatenate([rel.reshape(-1) for rel in relations if rel.size > 0]) if relations else np.array([])
+    finite_rel = finite_rel[np.isfinite(finite_rel)]
+    rel_vmin = float(np.nanmin(finite_rel)) if finite_rel.size else -1.0
+    rel_vmax = float(np.nanmax(finite_rel)) if finite_rel.size else 1.0
+    if math.isclose(rel_vmin, rel_vmax):
+        rel_vmin = rel_vmax - 1e-3
+
+    fig, axes = plt.subplots(2, len(model_names), figsize=(3.2 * len(model_names), 5.9), dpi=160)
+    if len(model_names) == 1:
+        axes = np.array(axes).reshape(2, 1)
+
+    reference = example.outputs[model_names[0]]
+    im = None
+    for col, model_name in enumerate(model_names):
+        output = example.outputs[model_name]
+        heat = _heat_overlay(example.image, rois, output.confidence.numpy())
+        ax = axes[0, col]
+        ax.imshow(example.image)
+        ax.imshow(heat, cmap="turbo", alpha=0.55, vmin=0.0, vmax=heat_vmax)
+        for roi in rois:
+            x1, y1, x2, y2 = roi[1:5]
+            ax.add_patch(
+                plt.Rectangle(
+                    (x1, y1),
+                    max(0.0, x2 - x1),
+                    max(0.0, y2 - y1),
+                    fill=False,
+                    edgecolor="white",
+                    linewidth=0.6,
+                    alpha=0.85,
+                )
+            )
+        ax.set_title(f"{model_name}\nPbar={output.mean_confidence:.3f}", fontsize=10)
+        ax.axis("off")
+
+        ax = axes[1, col]
+        im = ax.imshow(output.relation.numpy(), cmap="RdBu_r", vmin=rel_vmin, vmax=rel_vmax)
+        if model_name == model_names[0]:
+            subtitle = "reference"
+        else:
+            r = compute_distortion_metrics(reference, output)["region_region_pearson"]
+            subtitle = f"r={r:.3f}" if math.isfinite(float(r)) else "r=nan"
+        ax.set_title(subtitle, fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(
+        f"{example.class_name} | image_id={example.image_id} | N={example.num_regions}",
+        fontsize=12,
+    )
+    if im is not None:
+        fig.colorbar(im, ax=axes[1, :].ravel().tolist(), fraction=0.025, pad=0.02)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _write_example_npz(path: Path, example: EmbeddingGroupExample, model_names: Sequence[str]) -> None:
+    payload = {
+        "sample_index": np.array(example.sample_index),
+        "image_id": np.array(str(example.image_id)),
+        "filename": np.array(example.filename),
+        "class_id": np.array(example.class_id),
+        "class_name": np.array(example.class_name),
+        "rois": example.rois.detach().cpu().numpy(),
+        "model_names": np.array(model_names),
+    }
+    for model_name in model_names:
+        key = _sanitize_name(model_name)
+        output = example.outputs[model_name]
+        payload[f"{key}__embeddings"] = output.embeddings.numpy()
+        payload[f"{key}__region_text"] = output.region_text.numpy()
+        payload[f"{key}__confidence"] = output.confidence.numpy()
+        payload[f"{key}__relation"] = output.relation.numpy()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **payload)
+
+
+
+def _normalize_anchor_matrix(anchors: torch.Tensor) -> torch.Tensor:
+    if not isinstance(anchors, torch.Tensor) or anchors.ndim != 2:
+        raise ValueError(f"class anchors must be a 2D tensor, got {type(anchors)}")
+    anchors = anchors.detach().cpu().float()
+    if anchors.shape[0] < anchors.shape[1]:
+        anchors = anchors.t().contiguous()
+    return F.normalize(anchors, p=2, dim=1)
+
+
+def _foreground_class_count(anchors: torch.Tensor, class_names: Optional[Sequence[str]]) -> int:
+    if class_names is None:
+        return int(anchors.shape[0])
+    return min(int(anchors.shape[0]), len(class_names))
+
+
+def _score_class_name(class_id: int, class_names: Optional[Sequence[str]]) -> str:
+    if class_id < 0:
+        return "background"
+    if class_names is not None and class_id < len(class_names):
+        return str(class_names[class_id])
+    return f"class_{class_id}"
+
+
+def _model_color(model_name: str) -> Optional[str]:
+    colors = {
+        "fp32": "#1f77b4",
+        "FP32": "#1f77b4",
+        "qat": "#ff7f0e",
+        "QAT": "#ff7f0e",
+        "cr_qat": "#2ca02c",
+        "CR-QAT": "#2ca02c",
+        "cr-qat": "#2ca02c",
+    }
+    return colors.get(str(model_name))
+
+
+def _compute_class_score_payload(
+    *,
+    class_id: int,
+    class_name: str,
+    image_id: object,
+    num_regions: int,
+    outputs: Dict[str, AlignmentOutput],
+    model_names: Sequence[str],
+    class_names: Optional[Sequence[str]],
+    class_anchors_by_model: Dict[str, torch.Tensor],
+    score_topk: int,
+    score_max_bars: int,
+    score_temperature: float,
+) -> Dict[str, object]:
+    if score_temperature <= 0:
+        raise ValueError(f"score_temperature must be positive, got {score_temperature}")
+
+    fallback_anchors = class_anchors_by_model.get("fp32")
+    selected_ids = [int(class_id)]
+    per_model: Dict[str, Dict[str, object]] = {}
+    background_available = False
+    background_index_by_model: Dict[str, Optional[int]] = {}
+
+    for model_name in model_names:
+        if model_name not in outputs:
+            continue
+        anchors = class_anchors_by_model.get(model_name, fallback_anchors)
+        if anchors is None:
+            continue
+        anchors = _normalize_anchor_matrix(anchors)
+        foreground_count = _foreground_class_count(anchors, class_names)
+        if class_id < 0 or class_id >= foreground_count:
+            continue
+
+        embeddings = F.normalize(outputs[model_name].embeddings.float(), p=2, dim=1)
+        scores = embeddings @ anchors.t()
+        foreground_scores = scores[:, :foreground_count]
+        mean_foreground_scores = foreground_scores.mean(dim=0).detach().cpu().numpy()
+        target_scores = foreground_scores[:, class_id]
+        target_rank = (foreground_scores > target_scores[:, None]).sum(dim=1).float() + 1.0
+        target_prob_fg = torch.softmax(foreground_scores / float(score_temperature), dim=1)[:, class_id]
+        target_prob_all = torch.softmax(scores / float(score_temperature), dim=1)[:, class_id]
+        background_index = foreground_count if anchors.shape[0] > foreground_count else None
+        background_score = None
+        if background_index is not None:
+            background_available = True
+            background_score = float(scores[:, background_index].mean().item())
+        background_index_by_model[model_name] = background_index
+
+        k = min(max(int(score_topk), 0), foreground_count)
+        if k > 0:
+            for idx in torch.topk(foreground_scores.mean(dim=0), k=k).indices.tolist():
+                idx = int(idx)
+                if idx not in selected_ids:
+                    selected_ids.append(idx)
+
+        per_model[model_name] = {
+            "mean_foreground_scores": mean_foreground_scores,
+            "background_score": background_score,
+            "mean_observed_confidence": outputs[model_name].mean_confidence,
+            "mean_target_prob_fg_softmax": float(target_prob_fg.mean().item()),
+            "mean_target_prob_all_softmax": float(target_prob_all.mean().item()),
+            "mean_target_rank": float(target_rank.mean().item()),
+            "mean_target_rank_normalized": float(target_rank.mean().item() / max(float(foreground_count), 1.0)),
+            "foreground_count": foreground_count,
+        }
+
+    if not per_model:
+        raise ValueError("No class score payload could be computed; missing outputs or class anchors.")
+
+    max_bars = max(int(score_max_bars), 1)
+    if len(selected_ids) > max_bars:
+        rest = selected_ids[1:]
+        rest.sort(
+            key=lambda idx: max(
+                float(payload["mean_foreground_scores"][idx])
+                for payload in per_model.values()
+                if idx < len(payload["mean_foreground_scores"])
+            ),
+            reverse=True,
+        )
+        selected_ids = [int(class_id)] + rest[: max_bars - 1]
+
+    labels = []
+    for idx in selected_ids:
+        label = _score_class_name(idx, class_names)
+        if idx == class_id:
+            label = f"{label} (target)"
+        labels.append(label)
+    if background_available:
+        labels.append("background")
+
+    return {
+        "class_id": int(class_id),
+        "class_name": class_name,
+        "image_id": image_id,
+        "num_regions": int(num_regions),
+        "model_names": [name for name in model_names if name in per_model],
+        "selected_ids": selected_ids,
+        "labels": labels,
+        "per_model": per_model,
+        "background_available": background_available,
+        "background_index_by_model": background_index_by_model,
+    }
+
+
+def _write_class_score_csv(path: Path, payload: Dict[str, object], class_names: Optional[Sequence[str]]) -> None:
+    rows = []
+    selected_ids = payload["selected_ids"]
+    for model_name in payload["model_names"]:
+        model_payload = payload["per_model"][model_name]
+        for idx in selected_ids:
+            rows.append(
+                {
+                    "model": model_name,
+                    "class_id": int(idx),
+                    "class_name": _score_class_name(int(idx), class_names),
+                    "mean_cosine_score": float(model_payload["mean_foreground_scores"][idx]),
+                    "is_target": int(int(idx) == int(payload["class_id"])),
+                    "is_background": 0,
+                    "mean_observed_confidence": float(model_payload["mean_observed_confidence"]),
+                    "mean_target_prob_fg_softmax": float(model_payload["mean_target_prob_fg_softmax"]),
+                    "mean_target_prob_all_softmax": float(model_payload["mean_target_prob_all_softmax"]),
+                    "mean_target_rank": float(model_payload["mean_target_rank"]),
+                    "mean_target_rank_normalized": float(model_payload["mean_target_rank_normalized"]),
+                }
+            )
+        if payload["background_available"] and model_payload.get("background_score") is not None:
+            rows.append(
+                {
+                    "model": model_name,
+                    "class_id": -1,
+                    "class_name": "background",
+                    "mean_cosine_score": float(model_payload["background_score"]),
+                    "is_target": 0,
+                    "is_background": 1,
+                    "mean_observed_confidence": float(model_payload["mean_observed_confidence"]),
+                    "mean_target_prob_fg_softmax": float(model_payload["mean_target_prob_fg_softmax"]),
+                    "mean_target_prob_all_softmax": float(model_payload["mean_target_prob_all_softmax"]),
+                    "mean_target_rank": float(model_payload["mean_target_rank"]),
+                    "mean_target_rank_normalized": float(model_payload["mean_target_rank_normalized"]),
+                }
+            )
+    _save_csv(rows, path, columns=CLASS_SCORE_COLUMNS)
+
+
+def _plot_class_score_png(path: Path, payload: Dict[str, object]) -> None:
+    labels = payload["labels"]
+    model_names = payload["model_names"]
+    selected_ids = payload["selected_ids"]
+    x = np.arange(len(labels))
+    width = min(0.8 / max(len(model_names), 1), 0.25)
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(max(11, 0.92 * len(labels)), 8),
+        dpi=170,
+        gridspec_kw={"height_ratios": [3.2, 1.2]},
+    )
+    ax = axes[0]
+    for j, model_name in enumerate(model_names):
+        model_payload = payload["per_model"][model_name]
+        values = [float(model_payload["mean_foreground_scores"][idx]) for idx in selected_ids]
+        if payload["background_available"]:
+            background_score = model_payload.get("background_score")
+            values.append(float(background_score) if background_score is not None else float("nan"))
+        offset = (j - (len(model_names) - 1) / 2.0) * width
+        ax.bar(
+            x + offset,
+            values,
+            width=width,
+            label=model_name,
+            color=_model_color(model_name),
+            alpha=0.9,
+        )
+
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylabel("Mean cosine score over selected positive queries")
+    ax.set_title(
+        "Class score comparison | "
+        f"{payload['class_name']} | image_id={payload['image_id']} | N={payload['num_regions']}"
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
+    ax.legend(loc="upper right")
+    note = "Background bar is omitted because OVTR has no learned background class anchor."
+    if payload["background_available"]:
+        note = "Background bar is shown because class anchors include an extra background row."
+    ax.text(0.01, 0.02, note, transform=ax.transAxes, fontsize=8.5, color="dimgray")
+
+    ax2 = axes[1]
+    metric_labels = ["observed P\n(target)", "target P\n(fg softmax)", "target rank\n(norm.)"]
+    mx = np.arange(len(metric_labels))
+    for j, model_name in enumerate(model_names):
+        model_payload = payload["per_model"][model_name]
+        values = [
+            float(model_payload["mean_observed_confidence"]),
+            float(model_payload["mean_target_prob_fg_softmax"]),
+            float(model_payload["mean_target_rank_normalized"]),
+        ]
+        offset = (j - (len(model_names) - 1) / 2.0) * width
+        ax2.bar(
+            mx + offset,
+            values,
+            width=width,
+            label=model_name,
+            color=_model_color(model_name),
+            alpha=0.9,
+        )
+    ax2.set_xticks(mx)
+    ax2.set_xticklabels(metric_labels)
+    ax2.set_ylabel("Value")
+    ax2.set_ylim(0, 1.02)
+    ax2.grid(axis="y", linestyle=":", alpha=0.45)
+    ax2.text(
+        2,
+        0.95,
+        "rank normalized by #foreground classes\n(lower is better)",
+        ha="center",
+        va="top",
+        fontsize=8.5,
+        color="dimgray",
+    )
+
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def write_embedding_class_score_artifacts(
+    png_path: Path,
+    csv_path: Path,
+    *,
+    class_id: int,
+    class_name: str,
+    image_id: object,
+    num_regions: int,
+    outputs: Dict[str, AlignmentOutput],
+    model_names: Sequence[str],
+    class_names: Optional[Sequence[str]],
+    class_anchors_by_model: Dict[str, torch.Tensor],
+    score_topk: int,
+    score_max_bars: int,
+    score_temperature: float,
+) -> None:
+    payload = _compute_class_score_payload(
+        class_id=class_id,
+        class_name=class_name,
+        image_id=image_id,
+        num_regions=num_regions,
+        outputs=outputs,
+        model_names=model_names,
+        class_names=class_names,
+        class_anchors_by_model=class_anchors_by_model,
+        score_topk=score_topk,
+        score_max_bars=score_max_bars,
+        score_temperature=score_temperature,
+    )
+    _plot_class_score_png(png_path, payload)
+    _write_class_score_csv(csv_path, payload, class_names)
+
+
+def _npz_scalar_text(value: np.ndarray) -> str:
+    item = value.item() if getattr(value, "shape", ()) == () else value
+    return str(item)
+
+
+def write_embedding_class_score_artifacts_from_npz(
+    npz_path: Path,
+    class_anchors: torch.Tensor,
+    *,
+    class_names: Optional[Sequence[str]],
+    score_topk: int = 10,
+    score_max_bars: int = 12,
+    score_temperature: float = 0.007,
+    overwrite: bool = False,
+) -> bool:
+    npz_path = Path(npz_path)
+    png_path = npz_path.with_name(f"{npz_path.stem}_class_scores.png")
+    csv_path = npz_path.with_name(f"{npz_path.stem}_class_scores.csv")
+    if not overwrite and png_path.exists() and csv_path.exists():
+        return False
+
+    data = np.load(npz_path)
+    model_names = [str(name) for name in data["model_names"].tolist()]
+    outputs: Dict[str, AlignmentOutput] = {}
+    for model_name in model_names:
+        key = _sanitize_name(model_name)
+        outputs[model_name] = AlignmentOutput(
+            embeddings=torch.from_numpy(data[f"{key}__embeddings"]).float(),
+            region_text=torch.from_numpy(data[f"{key}__region_text"]).float(),
+            confidence=torch.from_numpy(data[f"{key}__confidence"]).float(),
+            relation=torch.from_numpy(data[f"{key}__relation"]).float(),
+        )
+    class_anchors_by_model = {model_name: class_anchors for model_name in model_names}
+    write_embedding_class_score_artifacts(
+        png_path,
+        csv_path,
+        class_id=int(data["class_id"]),
+        class_name=_npz_scalar_text(data["class_name"]),
+        image_id=_npz_scalar_text(data["image_id"]),
+        num_regions=int(data["rois"].shape[0]),
+        outputs=outputs,
+        model_names=model_names,
+        class_names=class_names,
+        class_anchors_by_model=class_anchors_by_model,
+        score_topk=score_topk,
+        score_max_bars=score_max_bars,
+        score_temperature=score_temperature,
+    )
+    return True
+
+
+def _maybe_add_example(
+    examples: List[EmbeddingGroupExample],
+    candidate: EmbeddingGroupExample,
+    *,
+    max_examples: int,
+    min_regions: int,
+) -> None:
+    if candidate.num_regions < min_regions:
+        return
+    examples.append(candidate)
+    examples.sort(key=lambda item: item.num_regions, reverse=True)
+    del examples[max(0, int(max_examples)):]
+
+
+def _format_metric_row(
+    sample_index: int,
+    filename: str,
+    class_id: int,
+    class_name: str,
+    model_name: str,
+    output: AlignmentOutput,
+    metrics: Dict[str, float],
+) -> Dict[str, object]:
+    return {
+        "sample_index": sample_index,
+        "image_id": filename,
+        "filename": filename,
+        "class_id": class_id,
+        "class_name": class_name,
+        "model": model_name,
+        "num_regions": int(output.region_text.numel()),
+        "region_text_mae": metrics["region_text_mae"],
+        "region_region_mae": metrics["region_region_mae"],
+        "region_region_pearson": metrics["region_region_pearson"],
+        "mean_confidence": output.mean_confidence,
+        "mean_region_text": output.mean_region_text,
+    }
+
+
+def _summary_rows(metric_rows: List[Dict[str, object]], model_names: Sequence[str]) -> List[Dict[str, object]]:
+    rows = []
+    for model_name in model_names:
+        model_rows = [row for row in metric_rows if row["model"] == model_name]
+        if not model_rows:
+            continue
+        weights = [float(row["num_regions"]) for row in model_rows]
+        total_regions = int(sum(weights))
+        for aggregation in ("macro", "region_weighted"):
+            if aggregation == "region_weighted":
+                reducer = _weighted_mean
+            else:
+                reducer = lambda values, _: _finite_mean(values)
+            rows.append(
+                {
+                    "model": model_name,
+                    "aggregation": aggregation,
+                    "num_groups": len(model_rows),
+                    "total_regions": total_regions,
+                    "region_text_mae": reducer([row["region_text_mae"] for row in model_rows], weights),
+                    "region_region_mae": reducer([row["region_region_mae"] for row in model_rows], weights),
+                    "region_region_pearson": reducer([row["region_region_pearson"] for row in model_rows], weights),
+                    "mean_confidence": reducer([row["mean_confidence"] for row in model_rows], weights),
+                    "mean_region_text": reducer([row["mean_region_text"] for row in model_rows], weights),
+                }
+            )
+    return rows
+
+
+def _aggregate_model_rows(class_summary_rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    rows = [row for row in class_summary_rows if row.get("aggregation") == "macro"]
+    final_rows = []
+    for model_name in sorted({str(row["model"]) for row in rows}):
+        model_rows = [row for row in rows if str(row["model"]) == model_name]
+        final_rows.append(
+            {
+                "model": model_name,
+                "num_classes": len(model_rows),
+                "total_groups": int(sum(int(row["num_groups"]) for row in model_rows)),
+                "total_regions": int(sum(int(row["total_regions"]) for row in model_rows)),
+                "region_text_mae": _finite_mean([row["region_text_mae"] for row in model_rows]),
+                "region_region_mae": _finite_mean([row["region_region_mae"] for row in model_rows]),
+                "region_region_pearson": _finite_mean([row["region_region_pearson"] for row in model_rows]),
+                "mean_confidence": _finite_mean([row["mean_confidence"] for row in model_rows]),
+                "mean_region_text": _finite_mean([row["mean_region_text"] for row in model_rows]),
+            }
+        )
+    return final_rows
+
+
+def _analyze_embedding_target(
+    target: dict,
+    *,
+    viz_dir: Path,
+    fp32_result: RunResult,
+    compare_results: Dict[str, RunResult],
+    class_names: Optional[Sequence[str]],
+    image_root: Optional[str],
+    groups: Sequence[dict],
+    model_names: Sequence[str],
+    max_groups_per_class: int,
+    max_examples_per_class: int,
+    min_regions: int,
+    max_regions_per_group: int,
+    score_topk: int,
+    score_max_bars: int,
+    score_temperature: float,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    class_id = int(target["class_id"])
+    class_name = str(target["class_name"])
+    class_out_dir = viz_dir / _sanitize_name(class_name)
+    examples_dir = class_out_dir / "examples"
+    class_out_dir.mkdir(parents=True, exist_ok=True)
+    examples_dir.mkdir(parents=True, exist_ok=True)
+
+    sorted_groups = sorted(
+        groups,
+        key=lambda item: (-int(item["count"]), -float(item["mean_alignment"]), int(item["sample_index"])),
+    )[: max(0, int(max_groups_per_class))]
+    class_anchors_by_model: Dict[str, torch.Tensor] = {"fp32": fp32_result.embedding_class_anchors}
+    for label, result in compare_results.items():
+        class_anchors_by_model[label] = (
+            result.embedding_class_anchors
+            if result.embedding_class_anchors is not None
+            else fp32_result.embedding_class_anchors
+        )
+    metric_rows: List[Dict[str, object]] = []
+    examples: List[EmbeddingGroupExample] = []
+    skipped_no_match = 0
+    positive_groups = 0
+
+    for group in sorted_groups:
+        frame_key = group["frame_key"]
+        fp_frame = fp32_result.embedding_frames.get(frame_key)
+        if fp_frame is None:
+            skipped_no_match += 1
+            continue
+        candidate_indices = group["indices"]
+        if candidate_indices.numel() > max_regions_per_group:
+            scores = fp_frame.scores.index_select(0, candidate_indices)
+            order = torch.argsort(scores, descending=True)[:max_regions_per_group]
+            candidate_indices = candidate_indices.index_select(0, order)
+        match_keys = _positive_match_keys(fp_frame, candidate_indices)
+        compare_index_lists = {
+            label: _indices_for_match_keys(result.embedding_frames.get(frame_key), match_keys)
+            for label, result in compare_results.items()
+        }
+        keep_positions = []
+        for pos in range(len(match_keys)):
+            if all(index_list[pos] is not None for index_list in compare_index_lists.values()):
+                keep_positions.append(pos)
+        if not keep_positions:
+            skipped_no_match += 1
+            continue
+
+        fp_keep_indices = [int(candidate_indices[pos].item()) for pos in keep_positions]
+        fp_embeddings = _gather_rows(fp_frame.pred_embed, fp_keep_indices)
+        fp_boxes = _gather_rows(fp_frame.boxes, fp_keep_indices)
+        fp_anchors = fp32_result.embedding_class_anchors
+        if fp_anchors is None or class_id >= fp_anchors.shape[0]:
+            skipped_no_match += 1
+            continue
+
+        outputs: Dict[str, AlignmentOutput] = {
+            "fp32": compute_alignment_output(
+                fp_embeddings,
+                fp_anchors,
+                class_id,
+                temperature=score_temperature,
+            )
+        }
+        valid_group = True
+        for label, result in compare_results.items():
+            frame = result.embedding_frames.get(frame_key)
+            index_list = compare_index_lists[label]
+            matched_indices = [int(index_list[pos]) for pos in keep_positions if index_list[pos] is not None]
+            if frame is None or len(matched_indices) != len(keep_positions):
+                valid_group = False
+                break
+            anchors = result.embedding_class_anchors if result.embedding_class_anchors is not None else fp_anchors
+            if anchors is None or class_id >= anchors.shape[0]:
+                valid_group = False
+                break
+            embeddings = _gather_rows(frame.pred_embed, matched_indices)
+            outputs[label] = compute_alignment_output(
+                embeddings,
+                anchors,
+                class_id,
+                temperature=score_temperature,
+            )
+        if not valid_group:
+            skipped_no_match += 1
+            continue
+
+        reference_output = outputs["fp32"]
+        for model_name in model_names:
+            output = outputs[model_name]
+            metrics = compute_distortion_metrics(reference_output, output)
+            metric_rows.append(
+                _format_metric_row(
+                    int(group["sample_index"]),
+                    fp_frame.file_path,
+                    class_id,
+                    class_name,
+                    model_name,
+                    output,
+                    metrics,
+                )
+            )
+
+        image, _ = _load_embedding_image(image_root, fp_frame.file_path, fp_boxes)
+        _maybe_add_example(
+            examples,
+            EmbeddingGroupExample(
+                sample_index=int(group["sample_index"]),
+                image_id=fp_frame.file_path,
+                filename=fp_frame.file_path,
+                class_id=class_id,
+                class_name=class_name,
+                image=image,
+                rois=_embedding_rois_from_boxes(fp_boxes),
+                outputs=outputs,
+            ),
+            max_examples=max_examples_per_class,
+            min_regions=min_regions,
+        )
+        positive_groups += 1
+
+    summary_rows = _summary_rows(metric_rows, model_names)
+    _save_csv(metric_rows, class_out_dir / "metrics_per_group.csv", columns=ALIGNMENT_GROUP_COLUMNS)
+    _save_csv(summary_rows, class_out_dir / "metrics_summary.csv", columns=ALIGNMENT_SUMMARY_COLUMNS)
+    _plot_alignment_scatter(class_out_dir / "distortion_scatter.png", summary_rows, title=f"Detection alignment distortion: {class_name}")
+    for idx, example in enumerate(examples):
+        stem = f"{idx:03d}_{_sanitize_name(example.class_name)}_{example.sample_index}"
+        _plot_example(examples_dir / f"{stem}.png", example, model_names)
+        npz_path = examples_dir / f"{stem}.npz"
+        _write_example_npz(npz_path, example, model_names)
+        write_embedding_class_score_artifacts(
+            examples_dir / f"{stem}_class_scores.png",
+            examples_dir / f"{stem}_class_scores.csv",
+            class_id=example.class_id,
+            class_name=example.class_name,
+            image_id=example.image_id,
+            num_regions=example.num_regions,
+            outputs=example.outputs,
+            model_names=model_names,
+            class_names=class_names,
+            class_anchors_by_model=class_anchors_by_model,
+            score_topk=score_topk,
+            score_max_bars=score_max_bars,
+            score_temperature=score_temperature,
+        )
+
+    enriched_rows = []
+    for row in summary_rows:
+        enriched = {
+            "rank": target["rank"],
+            "class_id": class_id,
+            "class_name": class_name,
+            "instance_count": target["instance_count"],
+            "image_count": target["image_count"],
+            "first_index": target["first_index"],
+            "processed_groups": len(sorted_groups),
+            "positive_groups": positive_groups,
+            "skipped_no_match": skipped_no_match,
+        }
+        enriched.update(row)
+        enriched_rows.append(enriched)
+
+    class_summary = {
+        "class_id": class_id,
+        "class_name": class_name,
+        "processed_groups": len(sorted_groups),
+        "positive_groups": positive_groups,
+        "skipped_no_match": skipped_no_match,
+        "metric_rows": len(metric_rows),
+        "examples": len(examples),
+    }
+    return enriched_rows, class_summary
+
+
+def write_embedding_visualizations(
+    *,
+    output_dir: Path,
+    fp32_result: RunResult,
+    compare_results: Dict[str, RunResult],
+    class_names: Optional[Sequence[str]],
+    image_root: Optional[str],
+    num_classes: int,
+    score_topk: int,
+    score_max_bars: int,
+    max_regions_per_group: int,
+    max_groups_per_class: int = 20,
+    max_examples_per_class: int = 2,
+    min_regions: int = 2,
+    score_temperature: float = 0.007,
+) -> dict:
+    viz_dir = output_dir / "embedding_viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = viz_dir / "alignment_summary.json"
+
+    if fp32_result.embedding_class_anchors is None or not fp32_result.embedding_frames:
+        for csv_name, columns in (
+            ("selected_classes.csv", ALIGNMENT_SELECTED_CLASS_COLUMNS),
+            ("metrics_summary_by_class.csv", ALIGNMENT_CLASS_SUMMARY_COLUMNS),
+            ("metrics_model_macro_mean.csv", ALIGNMENT_MODEL_MACRO_COLUMNS),
+        ):
+            _save_csv([], viz_dir / csv_name, columns=columns)
+        summary = {"status": "empty", "reason": "missing fp32 embedding traces"}
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+        return summary
+
+    compare_results = dict(compare_results)
+    class_stats, groups_by_class = _positive_group_candidates(fp32_result)
+    targets = _select_embedding_targets(class_stats, class_names, num_classes)
+    _save_csv(targets, viz_dir / "selected_classes.csv", columns=ALIGNMENT_SELECTED_CLASS_COLUMNS)
+
+    model_names = ["fp32"] + list(compare_results.keys())
+    all_class_summary_rows: List[Dict[str, object]] = []
+    class_summaries = []
+    for target in targets:
+        class_rows, class_summary = _analyze_embedding_target(
+            target,
+            viz_dir=viz_dir,
+            fp32_result=fp32_result,
+            compare_results=compare_results,
+            class_names=class_names,
+            image_root=image_root,
+            groups=groups_by_class.get(int(target["class_id"]), []),
+            model_names=model_names,
+            max_groups_per_class=max_groups_per_class,
+            max_examples_per_class=max_examples_per_class,
+            min_regions=min_regions,
+            max_regions_per_group=max_regions_per_group,
+            score_topk=score_topk,
+            score_max_bars=score_max_bars,
+            score_temperature=score_temperature,
+        )
+        all_class_summary_rows.extend(class_rows)
+        class_summaries.append(class_summary)
+
+    _save_csv(
+        all_class_summary_rows,
+        viz_dir / "metrics_summary_by_class.csv",
+        columns=ALIGNMENT_CLASS_SUMMARY_COLUMNS,
+    )
+    model_macro_rows = _aggregate_model_rows(all_class_summary_rows)
+    _save_csv(
+        model_macro_rows,
+        viz_dir / "metrics_model_macro_mean.csv",
+        columns=ALIGNMENT_MODEL_MACRO_COLUMNS,
+    )
+    _plot_alignment_scatter(
+        viz_dir / "distortion_scatter_100classes.png",
+        all_class_summary_rows,
+        title="Detection alignment distortion by class",
+    )
+
+    generated_classes = sum(1 for item in class_summaries if int(item.get("positive_groups", 0)) > 0)
+    summary = {
+        "status": "ok",
+        "style": "ovtrack_alignment_distortion",
+        "requested_classes": int(num_classes),
+        "generated_classes": generated_classes,
+        "available_positive_classes": len(class_stats),
+        "compare_labels": list(compare_results.keys()),
+        "score_temperature": float(score_temperature),
+        "score_topk": int(score_topk),
+        "score_max_bars": int(score_max_bars),
+        "class_score_background": "omitted_unless_anchor_count_exceeds_class_count",
+        "max_groups_per_class": int(max_groups_per_class),
+        "max_examples_per_class": int(max_examples_per_class),
+        "min_regions": int(min_regions),
+        "max_regions_per_group": int(max_regions_per_group),
+        "classes": class_summaries,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(_json_safe(summary), handle, indent=2, sort_keys=True)
+    return summary
+
+
 def sync_timing_device(device: torch.device) -> None:
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
@@ -1155,13 +2535,30 @@ def run_inference_frame(
     file_path: str,
     num_classes: int,
     args,
-) -> Tuple[Instances, List[np.ndarray], float, float]:
+    run_mode: str = "",
+    collect_embedding_trace: bool = False,
+) -> Tuple[Instances, List[np.ndarray], float, float, Optional[EmbeddingFrameTrace]]:
     frame_id = int(info[0])
     score_threshold, _ = set_tracking_thresholds(model, file_path, args)
-    res = model.inference_single_image(data, track_instances, frame_id=frame_id, ori_img_size=info[1])
+    res = model.inference_single_image(
+        data,
+        track_instances,
+        frame_id=frame_id,
+        ori_img_size=info[1],
+        return_embedding_trace=collect_embedding_trace,
+    )
     next_track_instances = res["track_instances"]
     dt_instances = next_track_instances.to(torch.device("cpu"))
     dt_instances = filter_dt_by_score(dt_instances, score_threshold)
     dt_instances = filter_dt_by_area(dt_instances, args.area_threshold)
     track_results = track_results_from_instances(dt_instances, num_classes)
-    return next_track_instances, track_results, score_threshold, float(model.track_base.max_obj_id)
+    embedding_trace = None
+    if collect_embedding_trace:
+        embedding_trace = make_embedding_frame_trace(
+            run_mode=run_mode,
+            file_path=file_path,
+            frame_id=frame_id,
+            score_threshold=score_threshold,
+            raw_trace=res.get("embedding_trace"),
+        )
+    return next_track_instances, track_results, score_threshold, float(model.track_base.max_obj_id), embedding_trace

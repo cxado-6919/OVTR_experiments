@@ -100,7 +100,7 @@ python tools/smoke_test.py
 - attention module의 최소 forward pass
 - CUDA를 사용할 수 있을 때 선택적 CUDA-path attention 실행
 
-## QAT 메모리 참고 사항
+## QAT 학습 실행 예시
 
 Full-partition QAT는 원본 OVTR fine-tuning path보다 GPU memory를 상당히 더 요구할 수 있습니다. 특히 `exp_a1_to_b`는 선택된 floating-point model weight와 learned quantization parameter를 함께 학습하므로 원래 QAT semantics를 유지합니다. 따라서 주요 memory pressure는 quantization parameter 자체보다 activation 저장량과 optimizer state에서 발생합니다.
 
@@ -111,7 +111,7 @@ Full-partition QAT는 원본 OVTR fine-tuning path보다 GPU memory를 상당히
 - reference point update, bbox head, class logit, aux-output collection은 checkpoint boundary 밖에 유지됩니다.
 - eval과 calibration은 direct forward path를 유지하므로 observer/calibration side effect가 checkpoint replay로 다시 계산되지 않습니다.
 
-권장 low-memory QAT baseline:
+`exp_a1_to_b` partition으로 lite 모델을 QAT fine-tuning하는 기본 실행 예시는 다음과 같습니다.
 
 ```bash
 cd ovtr
@@ -119,23 +119,22 @@ cd ovtr
 MODEL_VARIANT=lite \
 QUANT_MODE=qat \
 QUANT_PARTITION=exp_a1_to_b \
+QAT_EPOCHS=1 \
+QAT_LR=4e-5 \
+QAT_LR_BACKBONE=4e-6 \
 BATCH_SIZE=1 \
 QAT_ALLOW_BATCH=0 \
-QUANT_PIPELINE=legacy \
-CALIB_SAMPLES=32 \
-./tools/ovtr_quant_full_model.sh \
-  --no_aux_loss \
-  --max_len 100 \
-  --quant_mse_bins 0 \
-  --quant_mse_candidates 1
+OUTPUT=./results_quant_cr_qat_lite_exp_a1_to_b \
+CUDA_DEVICES=0,1,2,3 \
+NPROC_GPU=1 \
+./tools/ovtr_quant_full_model.sh
 ```
 
 참고:
 
-- Memory를 줄이려면 `QAT_ALLOW_BATCH=0`을 유지하십시오. Batched QAT는 QAT-only checkpoint forcing path를 비활성화합니다.
-- `--max_len`을 낮추면 각 frame에서 사용하는 sampled text/image class embedding 수가 줄어듭니다. 하지만 backbone feature memory나 object query 수는 줄어들지 않습니다.
-- `--no_aux_loss`는 decoder auxiliary-output memory를 줄입니다. OOM triage에는 유용한 경우가 많지만, training loss configuration을 변경합니다.
-- Decoder checkpointing 이후에도 QAT가 계속 OOM이면 다음 non-semantic memory reduction 후보는 더 강한 frame-wise checkpointing 또는 sharded optimizer state입니다.
+- `ovtr/tools/ovtr_quant_full_model.sh`는 `QUANT_MODE=qat`일 때 `./main.py`를 호출해 QAT fine-tuning을 수행합니다.
+- `NPROC_GPU=1`은 visible GPU 목록 중 단일 process만 사용합니다. `CUDA_DEVICES=0,1,2,3` 전체에 process를 띄우려면 `NPROC_GPU=4`로 설정하십시오.
+- 기본 calibration sample 수는 script 기본값인 `CALIB_SAMPLES=512`를 사용합니다.
 
 ## 예시 Entry Point
 

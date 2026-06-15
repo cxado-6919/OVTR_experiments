@@ -1077,7 +1077,30 @@ class OVTR(nn.Module):
         out['hs_cti'] = hs_cti[-1]
         return out
      
-    def _post_process_single_image(self, frame_res, track_instances, is_last, is_repeat=None, is_first=False, target_size=None, sample_idx=None):
+    def _build_embedding_analysis_trace(self, frame_res, track_instances, target_size):
+        if not track_instances.has('analysis_query_idx'):
+            return None
+
+        query_idx = track_instances.analysis_query_idx.long()
+        pred_embed = frame_res['pred_embed'][0].index_select(0, query_idx)
+
+        boxes = box_ops.box_cxcywh_to_xyxy(track_instances.pred_boxes).clamp(0, 1)
+        if target_size is not None:
+            img_h, img_w = target_size
+            scale_fct = torch.Tensor([img_w, img_h, img_w, img_h]).to(boxes)
+            boxes = boxes * scale_fct[None, :]
+
+        return {
+            'query_indices': query_idx.detach().cpu(),
+            'obj_ids': track_instances.obj_idxes.detach().cpu(),
+            'cls_idxes': track_instances.cls_idxes.detach().cpu(),
+            'scores': track_instances.scores.detach().cpu(),
+            'disappear_time': track_instances.disappear_time.detach().cpu(),
+            'boxes': boxes.detach().cpu(),
+            'pred_embed': pred_embed.detach().cpu(),
+        }
+
+    def _post_process_single_image(self, frame_res, track_instances, is_last, is_repeat=None, is_first=False, target_size=None, sample_idx=None, return_embedding_trace=False):
         with torch.no_grad():
             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
 
@@ -1093,6 +1116,13 @@ class OVTR(nn.Module):
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res, is_first, sample_idx=sample_idx)
         else:
+            if return_embedding_trace:
+                track_instances.analysis_query_idx = torch.arange(
+                    len(track_instances),
+                    dtype=torch.long,
+                    device=track_instances.pred_logits.device,
+                )
+            _track_discard = torch.zeros((0,), dtype=torch.long, device=track_instances.pred_logits.device)
             if self.train_with_artificial_img_seqs:
                 track_instances, _track_discard = protect_track_preds(track_instances, num_queries=self.num_queries, miss_tolerance=self.track_base.miss_tolerance, ious_thresh=self.ious_thresh) 
             track_instances = self.post_process_pre(track_instances, frame_res['select_id'], is_first)
@@ -1100,6 +1130,14 @@ class OVTR(nn.Module):
             if is_first:
                 self.track_base.clear()
             track_instances = self.track_base.update(track_instances, _track_discard, is_repeat=is_repeat)
+            if return_embedding_trace:
+                frame_res['embedding_trace'] = self._build_embedding_analysis_trace(
+                    frame_res,
+                    track_instances,
+                    target_size,
+                )
+                if track_instances.has('analysis_query_idx'):
+                    track_instances.remove('analysis_query_idx')
 
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks(cls_pad_len=track_instances.pred_logits.shape[1])
@@ -1130,7 +1168,7 @@ class OVTR(nn.Module):
         return track_instances
 
     @torch.no_grad()
-    def inference_single_image(self, data, track_instances=None, is_repeat=False, frame_id=None, ori_img_size=None, extra_labels=None):
+    def inference_single_image(self, data, track_instances=None, is_repeat=False, frame_id=None, ori_img_size=None, extra_labels=None, return_embedding_trace=False):
         img = nested_tensor_from_tensor_list([data['imgs'][0]])
         if (track_instances is None) or (frame_id == 0):
             track_instances = self._generate_empty_tracks()
@@ -1140,11 +1178,21 @@ class OVTR(nn.Module):
             is_first = False
 
         res = self._forward_single_image(img, track_instances, None, extra_labels, is_first, cls_num=None)
-        res = self._post_process_single_image(res, track_instances, False, is_repeat=is_repeat, is_first=is_first, target_size=ori_img_size[:-1])
+        res = self._post_process_single_image(
+            res,
+            track_instances,
+            False,
+            is_repeat=is_repeat,
+            is_first=is_first,
+            target_size=ori_img_size[:-1],
+            return_embedding_trace=return_embedding_trace,
+        )
 
         track_instances = res['track_instances']
         track_instances = self.post_process(track_instances, ori_img_size[:-1])
         ret = {'track_instances': track_instances}
+        if return_embedding_trace and res.get('embedding_trace') is not None:
+            ret['embedding_trace'] = res['embedding_trace']
         if 'ref_pts' in res:
             ref_pts = res['ref_pts'] 
             img_h, img_w = ori_img_size[:-1]

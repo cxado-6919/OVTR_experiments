@@ -143,7 +143,7 @@ Decoder checkpointing 세부 사항:
 - reference point update, bbox head, class logit, aux-output collection은 checkpoint boundary 밖에 둡니다.
 - Calibration/eval path는 direct forward path를 유지하므로 observer/calibration side effect가 checkpoint recomputation으로 반복되지 않습니다.
 
-권장 low-memory QAT baseline은 `docs/BLACKWELL_SETUP.md`에 문서화되어 있습니다.
+`exp_a1_to_b` QAT fine-tuning 실행 예시는 `docs/BLACKWELL_SETUP.md`에 문서화되어 있습니다.
 
 ## 양자화 Drift 분석
 

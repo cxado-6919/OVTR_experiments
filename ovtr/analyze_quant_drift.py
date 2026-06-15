@@ -35,6 +35,7 @@ from util.quant_drift_analysis import (
     strip_feedback_only_fields,
     summarize_run_metrics,
     sync_timing_device,
+    write_embedding_visualizations,
     write_metric_csvs,
     write_metrics_summary,
     write_plots,
@@ -111,6 +112,71 @@ def add_analysis_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         help="Maximum quant boundary rows recorded per frame. 0 means no limit.",
     )
+    parser.add_argument(
+        "--analysis_embedding_viz",
+        action="store_true",
+        help="Write CR-QAT style embedding alignment visualizations.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_only",
+        action="store_true",
+        help="Only run embedding alignment visualization; skip quant drift metrics and evaluation.",
+    )
+    parser.add_argument(
+        "--analysis_compare_quant",
+        nargs="*",
+        default=[],
+        metavar="LABEL:CHECKPOINT",
+        help="Additional quantized checkpoints used for embedding visualization comparisons.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_num_classes",
+        default=100,
+        type=int,
+        help="Maximum number of classes visualized in embedding alignment analysis.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_score_topk",
+        default=10,
+        type=int,
+        help="Top foreground classes per model included in embedding class-score bar plots.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_score_max_bars",
+        default=12,
+        type=int,
+        help="Maximum foreground class-score bars, including the target class.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_max_regions_per_group",
+        default=32,
+        type=int,
+        help="Maximum FP32 positive regions retained per class/frame group.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_max_groups_per_class",
+        default=20,
+        type=int,
+        help="Maximum positive frame/class groups analyzed for each selected class.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_max_examples_per_class",
+        default=2,
+        type=int,
+        help="Maximum OVTrack-style example PNG/NPZ pairs saved for each selected class.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_min_regions",
+        default=2,
+        type=int,
+        help="Minimum regions required for saving a visual example; metrics are still written for smaller groups.",
+    )
+    parser.add_argument(
+        "--analysis_embedding_score_temperature",
+        default=0.007,
+        type=float,
+        help="Temperature for OVTrack-style class confidence softmax.",
+    )
     return parser
 
 
@@ -160,6 +226,8 @@ def normalize_analysis_args(args) -> None:
         raise ValueError("Quant drift analysis is single-process only; run with python, not torchrun.")
     if args.pretrained is None:
         raise ValueError("--pretrain/--pretrained is required for the quant drift target checkpoint.")
+    if getattr(args, "analysis_embedding_only", False):
+        args.analysis_embedding_viz = True
 
     args.distributed = False
     args.gpu = 0
@@ -474,12 +542,86 @@ def accumulate_run_result(total: RunResult, partial: RunResult) -> None:
     total.track_results.extend(partial.track_results)
     total.processed_frames += partial.processed_frames
     total.total_detect_time += partial.total_detect_time
+    total.embedding_frames.update(partial.embedding_frames)
+    if total.embedding_class_anchors is None and partial.embedding_class_anchors is not None:
+        total.embedding_class_anchors = partial.embedding_class_anchors
 
 
-def build_loaded_model(args, cfg, device: torch.device, *, checkpoint_path: str, quant_mode: str):
+def parse_compare_quant_specs(values: Sequence[str]) -> List[Tuple[str, str]]:
+    specs = []
+    seen = set()
+    for value in values or []:
+        if ":" not in value:
+            raise ValueError(f"Expected LABEL:CHECKPOINT for --analysis_compare_quant, got: {value}")
+        label, checkpoint = value.split(":", 1)
+        label = label.strip()
+        checkpoint = checkpoint.strip()
+        if not label or not checkpoint:
+            raise ValueError(f"Expected non-empty LABEL:CHECKPOINT, got: {value}")
+        if label in seen:
+            raise ValueError(f"Duplicate --analysis_compare_quant label: {label}")
+        seen.add(label)
+        specs.append((label, checkpoint))
+    return specs
+
+
+def _manifest_quant_overrides(checkpoint_path: str) -> Dict[str, object]:
+    manifest_path = Path(checkpoint_path).parent / "quant_manifest.json"
+    overrides: Dict[str, object] = {}
+    if not manifest_path.exists():
+        return overrides
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    key_map = {
+        "quant_mode": "quant_mode",
+        "partition": "quant_partition",
+        "quant_partition": "quant_partition",
+        "weight_bits": "quant_weight_bits",
+        "activation_bits": "quant_activation_bits",
+        "attention_bits": "quant_attention_bits",
+    }
+    for source_key, target_key in key_map.items():
+        if source_key in manifest and manifest[source_key] is not None:
+            overrides[target_key] = manifest[source_key]
+    return overrides
+
+
+def _embedding_class_anchors_from_model(model) -> Optional[torch.Tensor]:
+    anchors = getattr(model, "image_embeddings", None)
+    if not isinstance(anchors, torch.Tensor) or anchors.ndim != 2:
+        return None
+    anchors = anchors.detach().cpu().float()
+    if anchors.shape[0] < anchors.shape[1]:
+        anchors = anchors.t().contiguous()
+    return anchors
+
+
+def _analysis_image_root(dataset, cfg) -> Optional[str]:
+    for attr in ("img_prefix", "img_folder", "root"):
+        value = getattr(dataset, attr, None)
+        if value:
+            return str(value)
+    data_cfg = getattr(cfg, "data", None)
+    test_cfg = getattr(data_cfg, "test", None) if data_cfg is not None else None
+    value = getattr(test_cfg, "img_prefix", None) if test_cfg is not None else None
+    return str(value) if value else None
+
+
+def build_loaded_model(
+    args,
+    cfg,
+    device: torch.device,
+    *,
+    checkpoint_path: str,
+    quant_mode: str,
+    quant_overrides: Optional[Dict[str, object]] = None,
+):
     run_args = copy.deepcopy(args)
     run_args.pretrained = checkpoint_path
     run_args.quant_mode = quant_mode
+    for key, value in (quant_overrides or {}).items():
+        setattr(run_args, key, value)
+    quant_mode = run_args.quant_mode
 
     model, _ = build_model(run_args, cfg)
     quant_controller = setup_quant_controller(model, run_args)
@@ -529,11 +671,14 @@ def run_analysis_pass(
     boundary_recorder: Optional[QuantBoundaryRecorder] = None,
     progress_desc: Optional[str] = None,
     progress_leave: bool = True,
+    collect_embedding_trace: bool = False,
 ) -> RunResult:
     if hasattr(model, "clear"):
         model.clear()
 
     trace = ReferenceTrace() if run_mode == "fp32_free" else None
+    embedding_frames = {}
+    embedding_class_anchors = _embedding_class_anchors_from_model(model) if collect_embedding_trace else None
     track_results = []
     track_metric_rows = []
     frame_metric_rows = []
@@ -594,7 +739,7 @@ def run_analysis_pass(
                     boundary_recorder.set_frame(run_mode=run_mode, file_path=file_path, frame_id=frame_id)
                 sync_timing_device(device)
                 start_time = time.perf_counter()
-                next_track_instances, frame_track_results, score_threshold, max_obj_id = run_inference_frame(
+                next_track_instances, frame_track_results, score_threshold, max_obj_id, embedding_trace = run_inference_frame(
                     model=model,
                     data=sample_data_dict,
                     track_instances=track_instances,
@@ -602,7 +747,11 @@ def run_analysis_pass(
                     file_path=file_path,
                     num_classes=len(CLASSES),
                     args=args,
+                    run_mode=run_mode,
+                    collect_embedding_trace=collect_embedding_trace,
                 )
+                if embedding_trace is not None:
+                    embedding_frames[(file_path, frame_id)] = embedding_trace
                 sync_timing_device(device)
                 total_detect_time += time.perf_counter() - start_time
                 processed_frames += 1
@@ -665,6 +814,8 @@ def run_analysis_pass(
         state_io_rows=state_io_rows,
         recurrent_query_rows=recurrent_query_rows,
         quant_boundary_rows=list(boundary_recorder.rows) if boundary_recorder is not None else [],
+        embedding_frames=embedding_frames,
+        embedding_class_anchors=embedding_class_anchors,
     )
 
 
@@ -697,6 +848,102 @@ def main(args) -> None:
             print(f"[QuantDrift] Wrote sampled annotation to {sampled_ann_path}", flush=True)
     device = torch.device(args.device)
 
+    if args.analysis_embedding_only:
+        compare_specs = parse_compare_quant_specs(args.analysis_compare_quant)
+        if not compare_specs:
+            compare_specs = [("quant_free", args.pretrained)]
+        print(
+            f"[EmbeddingViz] Processing {frame_limit} frames in {len(sequence_ranges)} sequences "
+            f"from {args.config_file}",
+            flush=True,
+        )
+        print("[EmbeddingViz] Loading fp32_free model", flush=True)
+        fp32_model = build_loaded_model(
+            args,
+            cfg,
+            device,
+            checkpoint_path=args.analysis_fp32_pretrain,
+            quant_mode="none",
+        )
+        compare_models = {}
+        for label, checkpoint_path in compare_specs:
+            overrides = _manifest_quant_overrides(checkpoint_path)
+            compare_quant_mode = str(overrides.get("quant_mode", args.quant_mode))
+            if overrides:
+                print(f"[EmbeddingViz] Applying quant manifest overrides for '{label}': {overrides}", flush=True)
+            print(f"[EmbeddingViz] Loading comparison model '{label}' from {checkpoint_path}", flush=True)
+            compare_models[label] = build_loaded_model(
+                args,
+                cfg,
+                device,
+                checkpoint_path=checkpoint_path,
+                quant_mode=compare_quant_mode,
+                quant_overrides=overrides,
+            )
+
+        fp32_result = empty_run_result("fp32_free")
+        embedding_compare_results = {label: empty_run_result(label) for label in compare_models}
+        for sequence_idx, (start, end) in enumerate(tqdm(sequence_ranges, desc="embedding sequences"), start=1):
+            sequence_loader = build_sequence_loader(dataset_val, start, end, args)
+            sequence_desc = f"seq {sequence_idx}/{len(sequence_ranges)} [{start}:{end}]"
+            fp32_sequence_result = run_analysis_pass(
+                run_mode="fp32_free",
+                model=fp32_model,
+                data_loader=sequence_loader,
+                device=device,
+                args=args,
+                progress_desc=f"fp32_free {sequence_desc}",
+                progress_leave=False,
+                collect_embedding_trace=True,
+            )
+            accumulate_run_result(fp32_result, fp32_sequence_result)
+            compare_sequence_results = {}
+            for label, compare_model in compare_models.items():
+                compare_sequence_results[label] = run_analysis_pass(
+                    run_mode=label,
+                    model=compare_model,
+                    data_loader=sequence_loader,
+                    device=device,
+                    args=args,
+                    progress_desc=f"{label} {sequence_desc}",
+                    progress_leave=False,
+                    collect_embedding_trace=True,
+                )
+            for label, compare_sequence_result in compare_sequence_results.items():
+                accumulate_run_result(embedding_compare_results[label], compare_sequence_result)
+            del sequence_loader, fp32_sequence_result, compare_sequence_results
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        embedding_summary = write_embedding_visualizations(
+            output_dir=output_dir,
+            fp32_result=fp32_result,
+            compare_results=embedding_compare_results,
+            class_names=CLASSES,
+            image_root=_analysis_image_root(dataset_val, cfg),
+            num_classes=args.analysis_embedding_num_classes,
+            score_topk=args.analysis_embedding_score_topk,
+            score_max_bars=args.analysis_embedding_score_max_bars,
+            max_regions_per_group=args.analysis_embedding_max_regions_per_group,
+            max_groups_per_class=args.analysis_embedding_max_groups_per_class,
+            max_examples_per_class=args.analysis_embedding_max_examples_per_class,
+            min_regions=args.analysis_embedding_min_regions,
+            score_temperature=args.analysis_embedding_score_temperature,
+        )
+        print(
+            f"[EmbeddingViz] Wrote embedding visualizations for "
+            f"{embedding_summary.get('generated_classes', 0)} classes to {output_dir / 'embedding_viz'}",
+            flush=True,
+        )
+        del fp32_model
+        for compare_model in compare_models.values():
+            del compare_model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return
+
     print("[QuantDrift] HOTA is not implemented in this repo; summary will include TETA, IDF1, and MOTA.")
     print(
         f"[QuantDrift] Processing {frame_limit} frames in {len(sequence_ranges)} sequences "
@@ -728,14 +975,34 @@ def main(args) -> None:
         checkpoint_path=args.analysis_fp32_pretrain,
         quant_mode="none",
     )
+    quant_overrides = _manifest_quant_overrides(args.pretrained)
+    quant_model_mode = str(quant_overrides.get("quant_mode", args.quant_mode))
+    if quant_overrides:
+        print(f"[QuantDrift] Applying quant manifest overrides for target model: {quant_overrides}", flush=True)
     print("[QuantDrift] Loading quantized model", flush=True)
     quant_model = build_loaded_model(
         args,
         cfg,
         device,
         checkpoint_path=args.pretrained,
-        quant_mode=args.quant_mode,
+        quant_mode=quant_model_mode,
+        quant_overrides=quant_overrides,
     )
+    compare_specs = parse_compare_quant_specs(args.analysis_compare_quant)
+    compare_models = {}
+    if args.analysis_embedding_viz and compare_specs:
+        for label, checkpoint_path in compare_specs:
+            overrides = _manifest_quant_overrides(checkpoint_path)
+            compare_quant_mode = str(overrides.get("quant_mode", args.quant_mode))
+            print(f"[QuantDrift] Loading embedding comparison model '{label}' from {checkpoint_path}", flush=True)
+            compare_models[label] = build_loaded_model(
+                args,
+                cfg,
+                device,
+                checkpoint_path=checkpoint_path,
+                quant_mode=compare_quant_mode,
+                quant_overrides=overrides,
+            )
     boundary_recorder = None
     if args.analysis_record_quant_boundaries:
         boundary_recorder = QuantBoundaryRecorder(
@@ -746,6 +1013,9 @@ def main(args) -> None:
     fp32_result = empty_run_result("fp32_free")
     quant_free_result = empty_run_result("quant_free")
     quant_teacher_result = empty_run_result("quant_teacher_forced")
+    embedding_compare_results = {label: empty_run_result(label) for label in compare_models}
+    if args.analysis_embedding_viz and not compare_models:
+        embedding_compare_results["quant_free"] = empty_run_result("quant_free")
 
     for sequence_idx, (start, end) in enumerate(tqdm(sequence_ranges, desc="sequences"), start=1):
         sequence_loader = build_sequence_loader(dataset_val, start, end, args)
@@ -759,6 +1029,7 @@ def main(args) -> None:
             args=args,
             progress_desc=f"fp32_free {sequence_desc}",
             progress_leave=False,
+            collect_embedding_trace=args.analysis_embedding_viz,
         )
         fp32_trace = fp32_sequence_result.trace
         if fp32_trace is None:
@@ -774,6 +1045,7 @@ def main(args) -> None:
             boundary_recorder=boundary_recorder,
             progress_desc=f"quant_free {sequence_desc}",
             progress_leave=False,
+            collect_embedding_trace=args.analysis_embedding_viz and not compare_models,
         )
 
         quant_teacher_sequence_result = run_analysis_pass(
@@ -788,6 +1060,23 @@ def main(args) -> None:
             progress_desc=f"quant_teacher_forced {sequence_desc}",
             progress_leave=False,
         )
+
+        compare_sequence_results = {}
+        if args.analysis_embedding_viz and compare_models:
+            for label, compare_model in compare_models.items():
+                compare_sequence_results[label] = run_analysis_pass(
+                    run_mode=label,
+                    model=compare_model,
+                    data_loader=sequence_loader,
+                    device=device,
+                    args=args,
+                    fp32_trace=fp32_trace,
+                    progress_desc=f"{label} {sequence_desc}",
+                    progress_leave=False,
+                    collect_embedding_trace=True,
+                )
+        elif args.analysis_embedding_viz:
+            compare_sequence_results["quant_free"] = quant_free_sequence_result
 
         accumulation_gap_rows = build_accumulation_gap_rows(
             quant_free_sequence_result.track_metric_rows,
@@ -832,6 +1121,8 @@ def main(args) -> None:
         accumulate_run_result(fp32_result, fp32_sequence_result)
         accumulate_run_result(quant_free_result, quant_free_sequence_result)
         accumulate_run_result(quant_teacher_result, quant_teacher_sequence_result)
+        for label, compare_sequence_result in compare_sequence_results.items():
+            accumulate_run_result(embedding_compare_results[label], compare_sequence_result)
 
         del (
             sequence_loader,
@@ -839,13 +1130,38 @@ def main(args) -> None:
             fp32_sequence_result,
             quant_free_sequence_result,
             quant_teacher_sequence_result,
+            compare_sequence_results,
             accumulation_gap_rows,
         )
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    if args.analysis_embedding_viz:
+        embedding_summary = write_embedding_visualizations(
+            output_dir=output_dir,
+            fp32_result=fp32_result,
+            compare_results=embedding_compare_results,
+            class_names=CLASSES,
+            image_root=_analysis_image_root(dataset_val, cfg),
+            num_classes=args.analysis_embedding_num_classes,
+            score_topk=args.analysis_embedding_score_topk,
+            score_max_bars=args.analysis_embedding_score_max_bars,
+            max_regions_per_group=args.analysis_embedding_max_regions_per_group,
+            max_groups_per_class=args.analysis_embedding_max_groups_per_class,
+            max_examples_per_class=args.analysis_embedding_max_examples_per_class,
+            min_regions=args.analysis_embedding_min_regions,
+            score_temperature=args.analysis_embedding_score_temperature,
+        )
+        print(
+            f"[QuantDrift] Wrote embedding visualizations for "
+            f"{embedding_summary.get('generated_classes', 0)} classes",
+            flush=True,
+        )
+
     del fp32_model, quant_model
+    for compare_model in compare_models.values():
+        del compare_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
